@@ -46,7 +46,7 @@ jobs:
 
       # Reads the pnpm version from `packageManager` in package.json, so the
       # runner uses the same pnpm a contributor's Corepack fetches.
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -137,8 +137,34 @@ jobs:
       # header records the fail-open that makes this worth a step of its own:
       # an import the resolver cannot see is reported `allowed`, so a broken
       # gate looks exactly like a green one.
+      #
+      # `tools/check-arch-canary-extended.mjs` pins four more measured
+      # contracts the edge canaries do not reach: a coverage exemption cannot
+      # claim a project's own files (the load refuses), a tracked analyzable
+      # file no project owns is refused by name, a dynamic import site is a
+      # declared blind spot over a green verdict, and depConstraints tag
+      # matching is exact on both axes. Same runner shape, same rule: fix the
+      # gate, never the canary.
       - name: Check the boundary gate stays loud
-        run: pnpm arch:canary
+        run: |
+          pnpm arch:canary
+          pnpm arch:canary-extended
+
+      # The canaries above prove the gate still bites on synthetic trees
+      # judged by `archkeep check`. The contract gate proves something one
+      # layer out: `core/src/architecture.mjs` reads `archkeep delta`
+      # envelopes at runtime, against a protocol this repository froze in
+      # its design record — and that protocol is only as good as its
+      # agreement with the pinned tool. `tools/check-arch-contract.mjs`
+      # grows real git trees, runs the pinned devDependency's delta step
+      # against them (pass, findings, resolved, no-verdict, no-envelope,
+      # family-refused baseline), normalizes the answers over goldens in
+      # `tools/fixtures/arch-reports/`, and feeds the same bytes through the
+      # reader. A divergence means the tool and the frozen protocol drifted
+      # apart — re-measure and review, never absorb; re-pin only with
+      # `pnpm arch:contract:bless` beside the change that moved it.
+      - name: Check the runtime-evidence contract holds
+        run: pnpm arch:contract
 
       # The boundary canary above proves the gate still bites on a relative
       # cross-action import. The transport seam — an action never imports the
@@ -154,6 +180,31 @@ jobs:
       # tree as clean.
       - name: Check the transport seam stays closed
         run: pnpm arch:transport-seam
+
+      # Three structural monopolies, each judged by its own house gate with a
+      # canary fixture under tools/fixtures/ that proves the gate still
+      # refuses the tree it exists to refuse:
+      #
+      #   raw HTTP (I2) — `fetch` and the Request/Headers constructors exist
+      #   only in core/transport/, and no module imports a *.test.mjs. The
+      #   scan is lexical (tools/code-scan.mjs), so a comment naming fetch is
+      #   not a call and a regex containing :// is not a comment.
+      - name: Check the raw-HTTP monopoly
+        run: pnpm arch:http-monopoly
+
+      #   GitHub writes (I3) — non-GET verbs only in the forge, the provider
+      #   chat POST and the seam, and the forge's write surface frozen in
+      #   security/forge-ops.json, diffed in both directions in declaration
+      #   order. A new forge op without a manifest declaration fails here.
+      - name: Check the forge monopoly and its frozen surface
+        run: pnpm arch:forge-monopoly
+
+      #   action shape (I8) — no `dependencies` block in any package.json at
+      #   any depth, no dist/ directory anywhere, every action.yaml on
+      #   exactly node24. The no-build, no-runtime-dependencies law the
+      #   release gate does not see at this strictness.
+      - name: Check the action shape holds
+        run: pnpm arch:action-shape
 
       - run: pnpm test
 
@@ -180,6 +231,20 @@ jobs:
       # is a claim someone wrote down rather than a silent pass.
       - name: Check documented uses refs
         run: pnpm check-uses-refs
+
+      # Judges every pin the covered documents show — README.md, README.vi.md
+      # and the guides under docs/guides/ — against tools/action-pins.json in
+      # both directions: a document showing a pin the manifest does not
+      # declare (the drift that shipped stale @v0.10 examples until #450
+      # caught it by hand), and a declared pin no document shows. The gate
+      # this step runs resolves nothing against git — pure text against the
+      # manifest — so unlike check-uses-refs above it needs no tags in the
+      # checkout, which is also why it can run in pre-commit where
+      # check-uses-refs cannot. The direction this gate cannot see — a
+      # release moving the version to a line the pins do not describe — is
+      # release.yml's job, by design: see that workflow.
+      - name: Check documented action pins
+        run: pnpm check-action-pins
 
       # Holds every action.yaml and the code behind it to the same list of
       # inputs, in both directions. The runner enforces neither: an input a
@@ -212,6 +277,17 @@ jobs:
       # anchor fails CI instead of a reader's click.
       - name: Check documentation anchors
         run: pnpm check-anchors
+
+      # Judges the multilingual README set as a whole — the four facts the
+      # harmonise run can never see together: the configured languages, the
+      # documents on disk, the selector line inside every document's
+      # protected region, and the regions' byte-identity across translations.
+      # A language configured without its document, a twin nobody configured,
+      # or a "translation" that re-rendered the badges or the selector fails
+      # here rather than as a reader's dead link or a run that preserves the
+      # corruption.
+      - name: Check README language set
+        run: pnpm check-readme-langs
 
       # Resolves every docs reference the list above does not cover: markdown
       # link targets must exist and, for pages INSIDE docs/, land only within

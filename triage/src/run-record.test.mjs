@@ -1,0 +1,996 @@
+// Tests for the triage run record — the pure module. The builder is proven
+// byte-deterministic and fail-closed, the sanitiser passes are proven at the
+// build sites (the validator is shape, not repair), the outcome vocabulary is
+// pinned to the run contract's own words, and the filename rules are proven
+// to land inside the upload glob.
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  FINISH_REASON_CHARS,
+  MODEL_ATTEMPTS_MAX_ENTRIES,
+  NEEDS_MORE_INFO_CHARS,
+  NEEDS_MORE_INFO_MAX_ENTRIES,
+  REASON_CHARS,
+  REFUSAL_ENTRY_CHARS,
+  REFUSAL_MAX_ENTRIES,
+  TRIAGE_OUTCOMES,
+  buildTriageRecord,
+  isOpId,
+  isReasonDigest,
+  serialiseTriageRecord,
+  triageRecordFilename,
+  triageRecordSchemaVersion,
+  validateTriageRecord,
+  validateVerificationBlock,
+  VERIFICATION_VERDICTS,
+} from "./run-record.mjs";
+import {
+  judgeVerificationAnswer,
+  mintVerificationPlan,
+  reasonDigest,
+  verifyDecision,
+} from "./verify.mjs";
+
+const SHA = "c".repeat(40);
+const DIGEST = "b".repeat(64);
+const TRUNCATION_MARK = "…[truncated]";
+
+/**
+ * The decision a sheet-mode run reaches, with a signal carrying a related
+ * thread — the widest shape the record's decision section has.
+ *
+ * @param {Partial<import("./decision.mjs").Decision>} [over]
+ * @returns {import("./decision.mjs").Decision}
+ */
+function decisionFixture(over = {}) {
+  /** @type {import("./decision.mjs").Decision} */
+  const decision = {
+    kind: "labels",
+    add: ["bug", "priority: high"],
+    remove: [{ name: "needs triage", reason: "marker" }],
+    refusals: ["not-on-sheet"],
+    logs: [{ level: "info", text: "labels: +bug, +priority: high" }],
+    rationale: "The report names a crash on save, so it is a bug and urgent.",
+    comment: undefined,
+    signal: {
+      needsMoreInfo: ["steps to reproduce"],
+      modelJudgedQuality: false,
+      related: { number: 12, type: "duplicate", title: "Crash when\tthe file\n <!-- name -->" },
+    },
+  };
+  return Object.assign(decision, over);
+}
+
+/**
+ * @param {Partial<Parameters<typeof buildTriageRecord>[0]>} [over]
+ * @returns {import("./run-record.mjs").TriageRecord}
+ */
+function recordFixture(over = {}) {
+  return buildTriageRecord({
+    repository: "octocat/example",
+    eventName: "issues",
+    eventAction: "labeled",
+    threadType: "issue",
+    threadNumber: 41,
+    dryRun: false,
+    model: "triage",
+    policy: { basis: "base", branch: "main", sha: SHA },
+    decision: decisionFixture(),
+    outcome: "published",
+    reason: "labels decision: 2 to add, 1 to remove, 1 refused, 1 signal comment",
+    ...over,
+  });
+}
+
+/**
+ * A mutable copy of a valid record, for validator refusal tests: the built
+ * record is frozen, so the clone is what gets malformed. The decision
+ * section arrives pre-cast, since a clone's `decision` is unknown to the
+ * reader even when the record carries it.
+ *
+ * @param {(record: Record<string, unknown>, decision: Record<string, unknown>) => void} breakIt
+ * @returns {Record<string, unknown>}
+ */
+function malformed(breakIt) {
+  const clone = /** @type {Record<string, unknown>} */ (
+    JSON.parse(serialiseTriageRecord(recordFixture()))
+  );
+  breakIt(clone, /** @type {Record<string, unknown>} */ (clone["decision"]));
+  return clone;
+}
+
+/**
+ * The signal section of a built record, pre-cast for the assertions below —
+ * the builder's `signal` is unknown to the reader even when the record
+ * carries a decision.
+ *
+ * @param {import("./run-record.mjs").TriageRecord} record
+ * @returns {import("./run-record.mjs").RecordSignal}
+ */
+function signalOf(record) {
+  const decision = /** @type {import("./run-record.mjs").RecordDecision} */ (record.decision);
+  return /** @type {import("./run-record.mjs").RecordSignal} */ (decision.signal);
+}
+
+/**
+ * A signal with the given missing-required names and no related candidate —
+ * the shape the `needsMoreInfo` tests below ride on.
+ *
+ * @param {string[]} needsMoreInfo
+ * @returns {import("./decision.mjs").Decision}
+ */
+function decisionWithNames(needsMoreInfo) {
+  return decisionFixture({
+    signal: { needsMoreInfo, modelJudgedQuality: false, related: null },
+  });
+}
+
+describe("buildTriageRecord", () => {
+  it("builds the expected record from valid run facts", () => {
+    const record = recordFixture();
+    expect(record).toEqual({
+      schemaVersion: 2,
+      repository: "octocat/example",
+      event: { eventName: "issues", action: "labeled" },
+      thread: { type: "issue", number: 41 },
+      dryRun: false,
+      model: "triage",
+      modelAttempts: [],
+      policy: { basis: "base", branch: "main", sha: SHA },
+      decision: {
+        kind: "labels",
+        add: ["bug", "priority: high"],
+        remove: [{ name: "needs triage", reason: "marker" }],
+        refusals: ["not-on-sheet"],
+        rationale: "The report names a crash on save, so it is a bug and urgent.",
+        signal: {
+          needsMoreInfo: ["steps to reproduce"],
+          modelJudgedQuality: false,
+          related: { number: 12, type: "duplicate", title: "Crash when the file  name " },
+        },
+      },
+      outcome: "published",
+      reason: "labels decision: 2 to add, 1 to remove, 1 refused, 1 signal comment",
+      verification: { requested: false, answers: [], downgraded: [] },
+    });
+  });
+
+  it("omits the decision key when the run ended before decide()", () => {
+    const record = recordFixture({
+      decision: null,
+      outcome: "failed",
+      reason: "the pin did not resolve",
+    });
+    expect("decision" in record).toBe(false);
+    expect(record.outcome).toBe("failed");
+  });
+
+  it("carries an abandoned run: the superseded decision stays, the divergence reason rides as the reason", () => {
+    const reason = "the head is now bbbbbbbbbbbbbb, not the aaaaaaaaaaaaaaa this run read";
+    const record = recordFixture({ outcome: "abandoned", reason });
+    expect(record.outcome).toBe("abandoned");
+    expect(record.decision).toBeDefined();
+    expect(record.reason).toBe(reason);
+    // Byte-determinism holds for this outcome too: the same run facts build
+    // the same bytes, and the validator accepts the shape.
+    expect(serialiseTriageRecord(record)).toBe(
+      serialiseTriageRecord(recordFixture({ outcome: "abandoned", reason })),
+    );
+    expect(() => validateTriageRecord(JSON.parse(serialiseTriageRecord(record)))).not.toThrow();
+  });
+
+  it("carries a thread-less, policy-less record for a run that died before the payload parsed", () => {
+    const record = recordFixture({
+      eventAction: "",
+      threadType: null,
+      threadNumber: null,
+      policy: null,
+      decision: null,
+      outcome: "failed",
+      reason: "the event payload carries no 'issue' object",
+    });
+    expect(record.thread).toBeNull();
+    expect(record.policy).toBeNull();
+    expect(triageRecordFilename(record)).toBe("triage-record-issues.json");
+  });
+
+  it("carries the frozen verification block it is given", () => {
+    // The block is contract-consistent: every downgraded op is one the same
+    // block answers, and no answer it downgrades is `confirmed` — the shapes
+    // `validateVerificationBlock` holds the record to.
+    const record = recordFixture({
+      verification: {
+        requested: true,
+        answers: [
+          { opId: "add:bug", verdict: "confirmed", reasonDigest: DIGEST },
+          { opId: "remove:needs triage", verdict: "uncertain", reasonDigest: "a".repeat(64) },
+        ],
+        downgraded: ["remove:needs triage"],
+      },
+    });
+    expect(record.verification).toEqual({
+      requested: true,
+      answers: [
+        { opId: "add:bug", verdict: "confirmed", reasonDigest: DIGEST },
+        { opId: "remove:needs triage", verdict: "uncertain", reasonDigest: "a".repeat(64) },
+      ],
+      downgraded: ["remove:needs triage"],
+    });
+  });
+
+  it("a record with a filled verification block validates, and filling does not bump the schema", () => {
+    // The digest spelling `verify.mjs` computes is the digest shape the frozen
+    // block requires — the two modules cannot drift apart silently. The op
+    // ids cover the whole grammar, including a label that carries a colon and
+    // the bare comment op.
+    const record = recordFixture({
+      verification: {
+        requested: true,
+        answers: [
+          { opId: "add:bug", verdict: "confirmed", reasonDigest: reasonDigest("crash on save") },
+          { opId: "add:priority: high", verdict: "refuted", reasonDigest: DIGEST },
+          { opId: "remove:needs triage", verdict: "uncertain", reasonDigest: "a".repeat(64) },
+          { opId: "comment", verdict: "confirmed", reasonDigest: "f".repeat(64) },
+        ],
+        downgraded: ["add:priority: high", "remove:needs triage"],
+      },
+    });
+    expect(triageRecordSchemaVersion).toBe(2);
+    expect(record.schemaVersion).toBe(triageRecordSchemaVersion);
+    for (const answer of record.verification.answers) {
+      expect(isReasonDigest(answer.reasonDigest)).toBe(true);
+      expect(isOpId(answer.opId)).toBe(true);
+    }
+    expect(() => validateTriageRecord(JSON.parse(serialiseTriageRecord(record)))).not.toThrow();
+  });
+
+  it("is frozen — the code's record is not mutable by a consumer", () => {
+    expect(Object.isFrozen(recordFixture())).toBe(true);
+  });
+
+  it("serialises to byte-identical JSON across two builds — no wall-clock anywhere", () => {
+    const first = serialiseTriageRecord(recordFixture());
+    const second = serialiseTriageRecord(recordFixture());
+    expect(second).toBe(first);
+    // Compact: no whitespace outside strings, no trailing newline.
+    expect(first.endsWith("}")).toBe(true);
+    expect(first).not.toContain("\n");
+    expect(JSON.parse(first)).toEqual(recordFixture());
+  });
+
+  it("serialises with the keys sorted, so the byte order is the byte order", () => {
+    const keys = Object.keys(JSON.parse(serialiseTriageRecord(recordFixture())));
+    expect(keys).toEqual([...keys].sort());
+  });
+
+  it("round-trips validation — the serialiser validates before it writes bytes", () => {
+    expect(validateTriageRecord(JSON.parse(serialiseTriageRecord(recordFixture())))).toBeTruthy();
+  });
+
+  it("strips the non-whitespace control characters the one-line collapse cannot reach (#366)", () => {
+    // Minted, not typed: a literal control byte in the source would be the
+    // very byte this test refuses in the record. ESC, BEL and BS ride model
+    // answers and source filenames, and none of them — nor DEL — is
+    // whitespace, so the one-line collapse alone leaves them standing; the
+    // strip rule at this boundary is what removes them.
+    const esc = String.fromCharCode(0x1b);
+    const bel = String.fromCharCode(0x07);
+    const bs = String.fromCharCode(0x08);
+    const del = String.fromCharCode(0x7f);
+    const record = recordFixture({
+      reason: `refused${bel}while${esc}[31mred${bs}flag${del}end`,
+    });
+    // Each stripped byte became a space and the collapse tightened the run;
+    // the visible fragments survive in order.
+    expect(record.reason).toBe("refused while [31mred flag end");
+    for (const char of record.reason) {
+      const code = char.codePointAt(0) ?? 0;
+      expect(code <= 0x1f || code === 0x7f).toBe(false);
+    }
+  });
+
+  it("caps model text at the build site, visibly", () => {
+    const record = recordFixture({ reason: "r".repeat(REASON_CHARS + 200) });
+    expect(record.reason.length).toBe(REASON_CHARS);
+    expect(record.reason.endsWith(TRUNCATION_MARK)).toBe(true);
+  });
+
+  it("carries the model attempts the assessment collected, capping only the finish reason (#521)", () => {
+    /** @type {import("./assessment.mjs").ModelAttempt[]} */
+    const attempts = [
+      { outcome: "empty", status: 200, bytes: 6401, finishReason: "stop" },
+      { outcome: "empty", status: 200, bytes: 6401, finishReason: "stop" },
+    ];
+    const record = recordFixture({
+      decision: null,
+      outcome: "failed",
+      reason: "the model's answer was empty (after 2 attempts)",
+      modelAttempts: attempts,
+    });
+    expect(record.modelAttempts).toEqual(attempts);
+
+    // The honest nulls are facts too — an ask that never produced a response
+    // records nulls, never zeros or guesses.
+    const nulls = recordFixture({
+      modelAttempts: [{ outcome: "unanswered", status: null, bytes: null, finishReason: "" }],
+    });
+    expect(nulls.modelAttempts).toEqual([
+      { outcome: "unanswered", status: null, bytes: null, finishReason: "" },
+    ]);
+
+    // The finish reason is provider-declared text: bounded at the build site,
+    // visibly, like every other model string the record carries.
+    const capped = recordFixture({
+      modelAttempts: [
+        { outcome: "answered", status: 200, bytes: 10, finishReason: "l".repeat(200) },
+      ],
+    });
+    const first = capped.modelAttempts[0];
+    expect(first?.finishReason.length).toBe(FINISH_REASON_CHARS);
+    expect(first?.finishReason.endsWith(TRUNCATION_MARK)).toBe(true);
+
+    expect(() => validateTriageRecord(JSON.parse(serialiseTriageRecord(record)))).not.toThrow();
+  });
+
+  it("serialises the failed run's attempts inside the frozen byte order — byte-exact (#521)", () => {
+    /** @type {Parameters<typeof recordFixture>[0]} */
+    const facts = {
+      decision: null,
+      outcome: "failed",
+      reason: "the model's answer was empty (after 2 attempts)",
+      modelAttempts: [
+        { outcome: "empty", status: 200, bytes: 6401, finishReason: "stop" },
+        { outcome: "empty", status: 200, bytes: 6401, finishReason: "stop" },
+      ],
+    };
+    const bytes = serialiseTriageRecord(recordFixture(facts));
+    // The same run facts build the same bytes, and the attempts ride inside
+    // the sorted-key compact JSON the record laws hold (I15).
+    expect(bytes).toBe(serialiseTriageRecord(recordFixture(facts)));
+    expect(bytes).toContain(
+      '"modelAttempts":[{"bytes":6401,"finishReason":"stop","outcome":"empty","status":200},' +
+        '{"bytes":6401,"finishReason":"stop","outcome":"empty","status":200}]',
+    );
+    expect(bytes).not.toContain("\n");
+    expect(validateTriageRecord(JSON.parse(bytes))).toBeTruthy();
+  });
+});
+
+describe("buildTriageRecord sanitisation at the build sites", () => {
+  it("passes the rationale through the comment sanitiser: no structural token, no parsing mention", () => {
+    const rationale =
+      "Crash on save. <!-- action-agents:triage --> cc @octocat read <script>alert(1)</script>";
+    const record = recordFixture({ decision: decisionFixture({ rationale }) });
+    const decision = /** @type {import("./run-record.mjs").RecordDecision} */ (record.decision);
+    expect(decision.rationale).not.toContain("<!--");
+    expect(decision.rationale).not.toContain("-->");
+    expect(decision.rationale).toContain("@‌octocat");
+    expect(decision.rationale).toContain("&lt;script>alert(1)&lt;/script>");
+  });
+
+  it("flattens a multi-line rationale to one line", () => {
+    const record = recordFixture({
+      decision: decisionFixture({ rationale: "first line\nsecond line" }),
+    });
+    const decision = /** @type {import("./run-record.mjs").RecordDecision} */ (record.decision);
+    expect(decision.rationale).toBe("first line second line");
+  });
+
+  it("sanitises a related title the way signalBody does: one line, no marker, no parsing mention", () => {
+    const title = "Dup\tline\n <!-- forged --> and @someone";
+    const record = recordFixture({
+      decision: decisionFixture({
+        signal: {
+          needsMoreInfo: [],
+          modelJudgedQuality: true,
+          related: { number: 12, type: "duplicate", title },
+        },
+      }),
+    });
+    const signal = /** @type {import("./run-record.mjs").RecordSignal} */ (
+      /** @type {import("./run-record.mjs").RecordDecision} */ (record.decision).signal
+    );
+    const related = /** @type {NonNullable<import("./run-record.mjs").RecordSignal["related"]>} */ (
+      signal.related
+    );
+    expect(related.title).not.toContain("<!--");
+    expect(related.title).toContain("@‌someone");
+    expect(related.title.length).toBeLessThanOrEqual(80);
+    expect(related.title).toBe("Dup line  forged  and @‌someone");
+  });
+
+  it("sanitises and bounds each refusal entry, and bounds the array, visibly", () => {
+    const long = "x".repeat(100_000);
+    const refusals = [
+      "off-sheet",
+      `multi\tline\n <!-- forged --> ${long}`,
+      ...Array.from({ length: REFUSAL_MAX_ENTRIES + 5 }, (_, i) => `extra-${String(i)}`),
+    ];
+    const record = recordFixture({ decision: decisionFixture({ refusals }) });
+    const decision = /** @type {import("./run-record.mjs").RecordDecision} */ (record.decision);
+    expect(decision.refusals.length).toBe(REFUSAL_MAX_ENTRIES);
+    expect(decision.refusals[0]).toBe("off-sheet");
+    for (const entry of decision.refusals) {
+      expect(entry.length).toBeLessThanOrEqual(REFUSAL_ENTRY_CHARS);
+      expect(entry).not.toContain("\t");
+      expect(entry).not.toContain("<!--");
+    }
+  });
+});
+
+describe("buildTriageRecord sanitises signal.needsMoreInfo at the build site", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("escapes tag-shaped HTML in a missing-required name", () => {
+    const signal = signalOf(
+      recordFixture({ decision: decisionWithNames(['<script>alert("x")</script>']) }),
+    );
+    expect(signal.needsMoreInfo[0]).toBe('&lt;script>alert("x")&lt;/script>');
+  });
+
+  it("flattens a multi-line missing-required name to one line", () => {
+    const signal = signalOf(
+      recordFixture({ decision: decisionWithNames(["first line\nsecond line"]) }),
+    );
+    expect(signal.needsMoreInfo[0]).toBe("first line second line");
+  });
+
+  it("caps a long missing-required name at the declared width, visibly", () => {
+    const signal = signalOf(
+      recordFixture({ decision: decisionWithNames(["x".repeat(NEEDS_MORE_INFO_CHARS + 40)]) }),
+    );
+    const first = signal.needsMoreInfo[0];
+    expect(first).toBeDefined();
+    expect(first?.length).toBe(NEEDS_MORE_INFO_CHARS);
+    expect(first?.endsWith(TRUNCATION_MARK)).toBe(true);
+  });
+
+  it("caps the list at the declared count and logs what it dropped", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const entries = Array.from(
+      { length: NEEDS_MORE_INFO_MAX_ENTRIES + 5 },
+      (_, i) => `field-${String(i)}`,
+    );
+    const signal = signalOf(recordFixture({ decision: decisionWithNames(entries) }));
+    expect(signal.needsMoreInfo).toEqual(
+      Array.from({ length: NEEDS_MORE_INFO_MAX_ENTRIES }, (_, i) => `field-${String(i)}`),
+    );
+    expect(
+      log.mock.calls.some((call) =>
+        String(call[0]).includes("signal.needsMoreInfo capped at 10 entries; 5 dropped"),
+      ),
+    ).toBe(true);
+  });
+
+  it("collapses control characters in a missing-required name", () => {
+    const signal = signalOf(
+      recordFixture({ decision: decisionWithNames(["steps\tto\r\nreproduce"]) }),
+    );
+    expect(signal.needsMoreInfo[0]).toBe("steps to reproduce");
+    expect(signal.needsMoreInfo[0]).not.toContain("\t");
+    expect(signal.needsMoreInfo[0]).not.toContain("\n");
+  });
+});
+
+describe("validateTriageRecord refusals", () => {
+  it("refuses an unknown top-level key", () => {
+    expect(() => validateTriageRecord(malformed((r) => (r["extra"] = true)))).toThrow(
+      /unknown key 'extra'/u,
+    );
+  });
+
+  it("refuses a missing mandatory key", () => {
+    expect(() => validateTriageRecord(malformed((r) => delete r["reason"]))).toThrow(
+      /missing 'reason'/u,
+    );
+  });
+
+  it("refuses an outcome outside the run contract's terminal states", () => {
+    expect(() => validateTriageRecord(malformed((r) => (r["outcome"] = "succeeded")))).toThrow(
+      /outside the run contract's terminal states/u,
+    );
+  });
+
+  it("refuses a removal reason outside the declared vocabulary", () => {
+    expect(() =>
+      validateTriageRecord(
+        malformed((r, d) => {
+          d["remove"] = [{ name: "needs triage", reason: "because the model said so" }];
+        }),
+      ),
+    ).toThrow(/outside the frozen vocabulary 'size' \| 'marker' \| 'owned'/u);
+  });
+
+  it("refuses refusals entries past their declared caps", () => {
+    expect(() =>
+      validateTriageRecord(
+        malformed((r, d) => {
+          d["refusals"] = ["x".repeat(REFUSAL_ENTRY_CHARS + 1)];
+        }),
+      ),
+    ).toThrow(/carries an entry past its 300-character cap/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed((r, d) => {
+          d["refusals"] = Array.from({ length: REFUSAL_MAX_ENTRIES + 1 }, () => "x");
+        }),
+      ),
+    ).toThrow(/carries 21 entries, past its 20-entry cap/u);
+  });
+
+  it("refuses a wrong schemaVersion", () => {
+    expect(() => validateTriageRecord(malformed((r) => (r["schemaVersion"] = 1)))).toThrow(
+      /schemaVersion/u,
+    );
+    expect(() => validateTriageRecord(malformed((r) => (r["schemaVersion"] = 3)))).toThrow(
+      /schemaVersion/u,
+    );
+  });
+
+  it("refuses a model attempt outside the frozen shapes (#521)", () => {
+    // An outcome word the assessment never mints.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [{ outcome: "fumbled", status: 200, bytes: 10, finishReason: "" }];
+        }),
+      ),
+    ).toThrow(/outside the frozen vocabulary/u);
+    // Extra and missing keys.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [
+            { outcome: "empty", status: 200, bytes: 10, finishReason: "", latency: 5 },
+          ];
+        }),
+      ),
+    ).toThrow(/unknown key 'latency'/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [{ outcome: "empty", status: 200, bytes: 10 }];
+        }),
+      ),
+    ).toThrow(/missing 'finishReason'/u);
+    // A status that is neither an HTTP status nor the honest null.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [{ outcome: "empty", status: 24, bytes: 10, finishReason: "" }];
+        }),
+      ),
+    ).toThrow(/'status' is neither an HTTP status/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [{ outcome: "empty", status: "200", bytes: 10, finishReason: "" }];
+        }),
+      ),
+    ).toThrow(/'status' is neither an HTTP status/u);
+    // A byte count that is neither positive nor the honest null.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [{ outcome: "empty", status: 200, bytes: 0, finishReason: "" }];
+        }),
+      ),
+    ).toThrow(/'bytes' is neither a positive byte count/u);
+    // A finish reason past its cap.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = [
+            {
+              outcome: "empty",
+              status: 200,
+              bytes: 10,
+              finishReason: "x".repeat(FINISH_REASON_CHARS + 1),
+            },
+          ];
+        }),
+      ),
+    ).toThrow(/exceeds its 40-character cap/u);
+    // Past the retry contract's ceiling.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = Array.from({ length: MODEL_ATTEMPTS_MAX_ENTRIES + 1 }, () => ({
+            outcome: "empty",
+            status: 200,
+            bytes: 10,
+            finishReason: "",
+          }));
+        }),
+      ),
+    ).toThrow(/past the retry contract's 2-attempt ceiling/u);
+    // Not an array at all.
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          r["modelAttempts"] = { outcome: "empty" };
+        }),
+      ),
+    ).toThrow(/'modelAttempts'/u);
+  });
+
+  it("refuses an event that is not the two-key shape", () => {
+    expect(() =>
+      validateTriageRecord(malformed((r) => (r["event"] = { eventName: "issues" }))),
+    ).toThrow(/'event' is missing 'action'/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => {
+          const event = /** @type {Record<string, unknown>} */ (r["event"]);
+          event["action"] = 3;
+        }),
+      ),
+    ).toThrow(/'event.action' is not a string/u);
+  });
+
+  it("refuses a partial thread but accepts the honest null", () => {
+    expect(() => validateTriageRecord(malformed((r) => (r["thread"] = { type: "pr" })))).toThrow(
+      /'thread' is missing 'number'/u,
+    );
+    expect(() =>
+      validateTriageRecord(malformed((r) => (r["thread"] = { type: "note", number: 4 }))),
+    ).toThrow(/neither 'issue' nor 'pr'/u);
+    expect(() => validateTriageRecord(malformed((r) => (r["thread"] = null)))).not.toThrow();
+  });
+
+  it("refuses a policy pin whose sha is not 40 hex", () => {
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => (r["policy"] = { basis: "base", branch: "main", sha: "abc" })),
+      ),
+    ).toThrow(/not a 40-hex commit sha/u);
+  });
+
+  it("refuses a decision carrying an executor field — the log lines stay the log's", () => {
+    expect(() => validateTriageRecord(malformed((_r, d) => (d["logs"] = [])))).toThrow(
+      /unknown key 'logs'/u,
+    );
+  });
+
+  it("refuses a rationale over its cap", () => {
+    expect(() =>
+      validateTriageRecord(malformed((_r, d) => (d["rationale"] = "x".repeat(301)))),
+    ).toThrow(/exceeds its 300-character cap/u);
+  });
+
+  it("refuses a reason over its cap", () => {
+    expect(() =>
+      validateTriageRecord(malformed((r) => (r["reason"] = "x".repeat(REASON_CHARS + 1)))),
+    ).toThrow(/exceeds its 300-character cap/u);
+  });
+
+  it("validates the verification block it delegates to — good, extra key, bogus opId, bad verdict, bad digest", () => {
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => (r["verification"] = { requested: false, answers: [], downgraded: [] })),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateTriageRecord(
+        malformed((r) => (r["verification"] = { requested: false, answers: [], extra: 1 })),
+      ),
+    ).toThrow(/other than requested\/answers\/downgraded/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed(
+          (r) =>
+            (r["verification"] = {
+              requested: true,
+              answers: [{ opId: "add bug", verdict: "confirmed", reasonDigest: DIGEST }],
+              downgraded: [],
+            }),
+        ),
+      ),
+    ).toThrow(/opId is outside the code-minted vocabulary/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed(
+          (r) =>
+            (r["verification"] = {
+              requested: true,
+              answers: [{ opId: "add:bug", verdict: "sure", reasonDigest: DIGEST }],
+              downgraded: [],
+            }),
+        ),
+      ),
+    ).toThrow(/verdict is outside the closed vocabulary/u);
+    expect(() =>
+      validateTriageRecord(
+        malformed(
+          (r) =>
+            (r["verification"] = {
+              requested: true,
+              answers: [{ opId: "add:bug", verdict: "confirmed", reasonDigest: "zz" }],
+              downgraded: [],
+            }),
+        ),
+      ),
+    ).toThrow(/not a well-formed digest/u);
+  });
+});
+
+describe("validateVerificationBlock relations", () => {
+  /**
+   * A contract-consistent filled block — one answer per operation, downgrades
+   * a subset, none of them `confirmed` — the shapes the relations below
+   * break one at a time.
+   *
+   * @returns {Record<string, unknown>}
+   */
+  function consistentBlock() {
+    return {
+      requested: true,
+      answers: [
+        { opId: "add:bug", verdict: "confirmed", reasonDigest: DIGEST },
+        { opId: "add:priority: high", verdict: "refuted", reasonDigest: "a".repeat(64) },
+        { opId: "remove:needs triage", verdict: "uncertain", reasonDigest: "f".repeat(64) },
+      ],
+      downgraded: ["add:priority: high", "remove:needs triage"],
+    };
+  }
+
+  /**
+   * A mutable clone of a consistent block, for refusal tests: the frozen
+   * record the builder produces is not the input here — the block is.
+   *
+   * @template T
+   * @param {(block: Record<string, unknown>) => void} breakIt
+   * @returns {T}
+   */
+  function brokenBlock(breakIt) {
+    const block = structuredClone(consistentBlock());
+    breakIt(block);
+    return /** @type {T} */ (block);
+  }
+
+  it("passes a contract-consistent filled block — the relations hold, nothing to refuse", () => {
+    expect(() => validateVerificationBlock(consistentBlock())).not.toThrow();
+    expect(() =>
+      validateTriageRecord(malformed((r) => (r["verification"] = consistentBlock()))),
+    ).not.toThrow();
+  });
+
+  it("passes the empty block a run without the pass carries, and the empty plan's block", () => {
+    expect(() =>
+      validateVerificationBlock({ requested: false, answers: [], downgraded: [] }),
+    ).not.toThrow();
+    // The empty-plan shape `verifyDecision` mints: the pass ran, nothing was
+    // proposed, nothing to answer, nothing to downgrade.
+    expect(() =>
+      validateVerificationBlock({ requested: true, answers: [], downgraded: [] }),
+    ).not.toThrow();
+  });
+
+  it("refuses a duplicate answer — one entry per verified operation", () => {
+    expect(() =>
+      validateVerificationBlock(
+        brokenBlock((block) => {
+          block["answers"] = [
+            .../** @type {unknown[]} */ (block["answers"]),
+            { opId: "add:bug", verdict: "confirmed", reasonDigest: "e".repeat(64) },
+          ];
+        }),
+      ),
+    ).toThrow(/names 'add:bug' twice — one answer per verified operation/u);
+  });
+
+  it("refuses a duplicate downgrade — a plan holds each operation once", () => {
+    expect(() =>
+      validateVerificationBlock(
+        brokenBlock((block) => {
+          block["downgraded"] = [
+            .../** @type {string[]} */ (block["downgraded"]),
+            "add:priority: high",
+          ];
+        }),
+      ),
+    ).toThrow(/downgrades 'add:priority: high' twice — a plan holds each operation once/u);
+  });
+
+  it("refuses answers under 'requested: false' — evidence no pass produced", () => {
+    expect(() =>
+      validateVerificationBlock(
+        brokenBlock((block) => {
+          block["requested"] = false;
+        }),
+      ),
+    ).toThrow(/carries answers or downgrades under 'requested: false'/u);
+  });
+
+  it("refuses downgrades under 'requested: false' — evidence no pass produced", () => {
+    expect(() =>
+      validateVerificationBlock(
+        brokenBlock((block) => {
+          block["requested"] = false;
+          block["answers"] = [];
+        }),
+      ),
+    ).toThrow(/carries answers or downgrades under 'requested: false'/u);
+  });
+
+  it("refuses a downgrade of an operation no answer names", () => {
+    expect(() =>
+      validateVerificationBlock(
+        brokenBlock((block) => {
+          block["answers"] = /** @type {unknown[]} */ (block["answers"]).filter(
+            (answer) =>
+              /** @type {Record<string, unknown>} */ (answer)["opId"] !== "add:priority: high",
+          );
+        }),
+      ),
+    ).toThrow(/downgrades 'add:priority: high' without an answer for it/u);
+  });
+
+  it("refuses a downgrade of an operation the same block answers 'confirmed'", () => {
+    expect(() =>
+      validateVerificationBlock(
+        brokenBlock((block) => {
+          block["downgraded"] = ["add:bug", "add:priority: high"];
+        }),
+      ),
+    ).toThrow(/downgrades 'add:bug' whose answer is 'confirmed'/u);
+  });
+});
+
+describe("the record validates the real pass's blocks", () => {
+  it("a block `judgeVerificationAnswer` produces validates — builder and validator cannot drift", () => {
+    const plan = mintVerificationPlan(decisionFixture());
+    const answer = JSON.stringify([
+      { opId: "remove:needs triage", verdict: "confirmed", reason: "the marker names it" },
+      // An off-plan id, an off-vocabulary verdict and an over-cap reason are
+      // the deviations the pass disposes as `uncertain` — the block they
+      // produce still validates.
+      { opId: "add:not-in-plan", verdict: "confirmed", reason: "invented" },
+      { opId: "add:bug", verdict: "certainly", reason: "off vocabulary" },
+      {
+        opId: "add:priority: high",
+        verdict: "uncertain",
+        reason: "x".repeat(301),
+      },
+    ]);
+    const { block } = judgeVerificationAnswer(answer, plan);
+    expect(block.requested).toBe(true);
+    expect(() => validateVerificationBlock(block)).not.toThrow();
+  });
+
+  it("the block an unreachable verifier produces validates — the transport path is the same boundary", async () => {
+    const plan = mintVerificationPlan(decisionFixture());
+    const chat = {
+      complete: async () => {
+        throw new Error("connection reset by the provider");
+      },
+    };
+    const { block } = await verifyDecision({
+      plan,
+      thread: {
+        number: 41,
+        type: "issue",
+        state: "open",
+        title: "t",
+        body: "b",
+        labels: [],
+        createdAt: "2026-09-05T00:00:00Z",
+        creator: "octocat",
+      },
+      chat: /** @type {never} */ (chat),
+      model: "triage",
+    });
+    expect(() => validateVerificationBlock(block)).not.toThrow();
+  });
+});
+
+describe("validateTriageRecord needsMoreInfo caps", () => {
+  /**
+   * A clone whose missing-required list is replaced outright — the validator
+   * sees the replaced list, never a repaired one.
+   *
+   * @param {unknown} entries
+   * @returns {Record<string, unknown>}
+   */
+  function withNames(entries) {
+    return malformed((_r, d) => {
+      const signal = /** @type {Record<string, unknown>} */ (d["signal"]);
+      signal["needsMoreInfo"] = entries;
+    });
+  }
+
+  it("refuses a needsMoreInfo entry past its declared width — never repairs it", () => {
+    expect(() => validateTriageRecord(withNames(["x".repeat(NEEDS_MORE_INFO_CHARS + 1)]))).toThrow(
+      /needsMoreInfo.*exceeds its 80-character cap/u,
+    );
+  });
+
+  it("refuses a needsMoreInfo list past its declared entry count", () => {
+    expect(() =>
+      validateTriageRecord(
+        withNames(Array.from({ length: NEEDS_MORE_INFO_MAX_ENTRIES + 1 }, () => "x")),
+      ),
+    ).toThrow(/needsMoreInfo.*carries 11 entries, past its 10-entry cap/u);
+  });
+
+  it("refuses a needsMoreInfo entry that is not a string", () => {
+    expect(() => validateTriageRecord(withNames([7]))).toThrow(/needsMoreInfo.*is not a string/u);
+    expect(() => validateTriageRecord(withNames([{ name: "steps" }]))).toThrow(
+      /needsMoreInfo.*is not a string/u,
+    );
+  });
+
+  it("accepts a list at exactly its declared caps", () => {
+    const record = recordFixture({
+      decision: decisionWithNames(
+        Array.from({ length: NEEDS_MORE_INFO_MAX_ENTRIES }, () =>
+          "x".repeat(NEEDS_MORE_INFO_CHARS),
+        ),
+      ),
+    });
+    expect(() => validateTriageRecord(JSON.parse(serialiseTriageRecord(record)))).not.toThrow();
+    expect(signalOf(record).needsMoreInfo.length).toBe(NEEDS_MORE_INFO_MAX_ENTRIES);
+  });
+});
+
+describe("triageRecordFilename", () => {
+  it("names a thread's records after the thread, overwriting in place", () => {
+    expect(triageRecordFilename(recordFixture({ threadType: "issue", threadNumber: 41 }))).toBe(
+      "triage-record-issue-41.json",
+    );
+    expect(triageRecordFilename(recordFixture({ threadType: "pr", threadNumber: 7 }))).toBe(
+      "triage-record-pr-7.json",
+    );
+  });
+
+  it("names a pre-thread record after the event", () => {
+    expect(triageRecordFilename(recordFixture({ threadType: null, threadNumber: null }))).toBe(
+      "triage-record-issues.json",
+    );
+  });
+
+  it("flattens an unsafe event name into the upload glob, never out of the directory", () => {
+    const file = triageRecordFilename(
+      recordFixture({ eventName: "weird/../name", threadType: null, threadNumber: null }),
+    );
+    expect(file).toBe("triage-record-weird-..-name.json");
+    expect(file).toMatch(/^triage-record-.*\.json$/u);
+    expect(file).not.toContain("/");
+  });
+
+  it("keeps every name inside the workflow's upload glob", () => {
+    const records = [
+      recordFixture(),
+      recordFixture({ threadType: "pr", threadNumber: 7 }),
+      recordFixture({ threadType: null, threadNumber: null, eventName: "pull_request" }),
+      recordFixture({ threadType: null, threadNumber: null, eventName: "workflow run" }),
+    ];
+    for (const record of records) {
+      expect(triageRecordFilename(record)).toMatch(/^triage-record-.*\.json$/u);
+    }
+  });
+});
+
+describe("the record's vocabulary is the run contract's", () => {
+  it("carries the six terminal states, whole and in the contract's order", () => {
+    expect([...TRIAGE_OUTCOMES]).toEqual([
+      "published",
+      "partial",
+      "refused",
+      "abandoned",
+      "skip",
+      "failed",
+    ]);
+  });
+
+  it("pins the schema version the docs state", () => {
+    expect(triageRecordSchemaVersion).toBe(2);
+  });
+
+  it("keeps the verification verdicts the frozen list issue #274 froze", () => {
+    expect([...VERIFICATION_VERDICTS]).toEqual(["confirmed", "refuted", "uncertain"]);
+  });
+});

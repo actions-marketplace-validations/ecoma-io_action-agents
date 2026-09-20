@@ -11,19 +11,37 @@ import {
   ArtifactError,
   applicabilityArtifactSchemaVersion,
   applicabilitySection,
+  architectureApplicabilityArtifactSchemaVersion,
+  architectureArtifactSchemaVersion,
+  architectureSection,
+  asArchitectureSection,
   assertFreshArtifact,
+  buildAbandonedArtifact,
   buildArtifact,
+  buildDryRunArtifact,
+  buildRedArtifact,
   buildSkippedArtifact,
+  buildSkipRecord,
+  RED_REASON_CHARS,
   reviewArtifactSchemaVersion,
   serialiseArtifact,
   withCommentId,
 } from "./artifact.mjs";
 import { utf8Compare } from "./order.mjs";
 import { MESSAGE_CHARS, renderComment } from "./render.mjs";
-import { VERDICT_REASON_CHARS } from "./verify.mjs";
+import { EVIDENCE_EXCERPT_CHARS, VERDICT_REASON_CHARS } from "./verify.mjs";
 
 const HEAD = "0".repeat(40);
 const OTHER_HEAD = "f".repeat(40);
+const DIGEST = "b".repeat(64);
+const BAD_DIGEST = "not-a-digest";
+const POLICY_SOURCE = /** @type {const} */ ({
+  strictness: "high",
+  strategy: "adversarial",
+  basis: "base",
+  branch: "main",
+  sha: HEAD,
+});
 
 /**
  * @param {Partial<import("./artifact.mjs").RunFacts>} [over]
@@ -35,7 +53,13 @@ function facts(over = {}) {
     pullRequest: 7,
     headRef: HEAD,
     outcome: { classification: "published", reason: "Complete review published (2 findings)" },
-    policy: { strictness: "high", strategy: "adversarial" },
+    policy: {
+      strictness: "high",
+      strategy: "adversarial",
+      basis: "base",
+      branch: "main",
+      sha: HEAD,
+    },
     risk: [
       { path: "src/a.mjs", risk: "medium", lane: "standard" },
       { path: "src/b.mjs", risk: "low", lane: "skim" },
@@ -47,17 +71,19 @@ function facts(over = {}) {
         verdict: "confirmed",
         reason: "the captured bounds check the index",
         severity: "concern",
+        kind: "correctness",
         file: "src/a.mjs",
         line: 2,
         message: "off-by-one",
-        provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+        provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
       },
       {
         severity: "nit",
+        kind: "style",
         file: "src/b.mjs",
         line: 9,
         message: "typo",
-        provenance: { path: "src/b.mjs", startLine: 9, endLine: 9 },
+        provenance: { path: "src/b.mjs", startLine: 9, endLine: 9, digest: DIGEST },
       },
     ],
     verification: { gate: { passed: true } },
@@ -99,7 +125,7 @@ describe("buildArtifact", () => {
   it("builds the expected artifact from valid facts", () => {
     const artifact = buildArtifact(facts());
     expect(artifact.schemaVersion).toBe(reviewArtifactSchemaVersion);
-    expect(artifact.schemaVersion).toBe(2);
+    expect(artifact.schemaVersion).toBe(5);
     expect(artifact.repository).toBe("octocat/example");
     expect(artifact.pullRequest).toBe(7);
     expect(artifact.headRef).toBe(HEAD);
@@ -107,7 +133,13 @@ describe("buildArtifact", () => {
       classification: "published",
       reason: "Complete review published (2 findings)",
     });
-    expect(artifact.policy).toEqual({ strictness: "high", strategy: "adversarial" });
+    expect(artifact.policy).toEqual({
+      strictness: "high",
+      strategy: "adversarial",
+      basis: "base",
+      branch: "main",
+      sha: HEAD,
+    });
     expect(artifact.risk).toEqual(facts().risk);
     expect(artifact.gates).toEqual(facts().gates);
     expect(artifact.findings).toHaveLength(2);
@@ -121,13 +153,14 @@ describe("buildArtifact", () => {
         message: "off-by-one",
       }),
       severity: "concern",
+      kind: "correctness",
       file: "src/a.mjs",
       line: 2,
       message: "off-by-one",
       lifecycle: "confirmed",
       verdict: "confirmed",
       reason: "the captured bounds check the index",
-      provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+      provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
     });
     expect(second.identity).toBe(
       findingIdentity({ severity: "nit", file: "src/b.mjs", line: 9, message: "typo" }),
@@ -176,10 +209,11 @@ describe("buildArtifact", () => {
           lifecycle: "unresolved",
           reason: "the read that covered it was quarantined",
           severity: "concern",
+          kind: "correctness",
           file: "src/a.mjs",
           line: 2,
           message: "off-by-one",
-          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
         },
       ],
       verification: { gate: { passed: true } },
@@ -199,10 +233,11 @@ describe("buildArtifact", () => {
           verdict: "uncertain",
           reason: "the evidence was ambiguous",
           severity: "concern",
+          kind: "correctness",
           file: "src/a.mjs",
           line: 2,
           message: "off-by-one",
-          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
         },
       ],
     });
@@ -237,17 +272,19 @@ describe("buildArtifact", () => {
       findings: [
         {
           severity: "nit",
+          kind: "style",
           file: "src/z.mjs",
           line: 1,
           message: "zzz",
-          provenance: { path: "src/z.mjs", startLine: 1, endLine: 1 },
+          provenance: { path: "src/z.mjs", startLine: 1, endLine: 1, digest: DIGEST },
         },
         {
           severity: "concern",
+          kind: "correctness",
           file: "src/a.mjs",
           line: 1,
           message: "aaa",
-          provenance: { path: "src/a.mjs", startLine: 1, endLine: 2 },
+          provenance: { path: "src/a.mjs", startLine: 1, endLine: 2, digest: DIGEST },
         },
       ],
     });
@@ -451,6 +488,42 @@ describe("buildArtifact refusals", () => {
     expect(() => buildArtifact(facts({ headRef: "" }))).toThrow(ArtifactError);
   });
 
+  it("refuses a policy pin missing its basis, branch or sha", () => {
+    for (const key of ["basis", "branch", "sha"]) {
+      expect(() =>
+        buildArtifact(
+          tampered((f) => {
+            delete f.policy[key];
+          }),
+        ),
+      ).toThrow(/run facts\.policy is missing/);
+    }
+  });
+
+  it("refuses a policy pin sha that is not a 40-char hex commit sha", () => {
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          f.policy.sha = "main";
+        }),
+      ),
+    ).toThrow(/run facts\.policy\.sha must be a 40-char hex commit sha/);
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          f.policy.sha = "";
+        }),
+      ),
+    ).toThrow(ArtifactError);
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          f.policy.sha = "A".repeat(40);
+        }),
+      ),
+    ).toThrow(/run facts\.policy\.sha must be a 40-char hex commit sha/);
+  });
+
   it("refuses a non-positive pull request number", () => {
     expect(() => buildArtifact(facts({ pullRequest: 0 }))).toThrow(ArtifactError);
   });
@@ -472,6 +545,12 @@ describe("buildArtifact refusals", () => {
       "strategy",
       (/** @type {any} */ f) => {
         f.policy.strategy = "aggressive";
+      },
+    ],
+    [
+      "policy basis",
+      (/** @type {any} */ f) => {
+        f.policy.basis = "guessed";
       },
     ],
     [
@@ -568,10 +647,11 @@ describe("buildArtifact refusals", () => {
           verdict: "confirmed",
           reason: "ok",
           severity: "concern",
+          kind: "correctness",
           file: "src/a.mjs",
           line: 2,
           message: "x".repeat(MESSAGE_CHARS + 1),
-          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
         },
       ],
     });
@@ -584,10 +664,11 @@ describe("buildArtifact refusals", () => {
           verdict: "confirmed",
           reason: "ok",
           severity: "concern",
+          kind: "correctness",
           file: "src/a.mjs",
           line: 2,
           message: "x".repeat(MESSAGE_CHARS),
-          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
         },
       ],
     });
@@ -603,10 +684,11 @@ describe("buildArtifact refusals", () => {
           verdict: "confirmed",
           reason: "y".repeat(VERDICT_REASON_CHARS + 1),
           severity: "concern",
+          kind: "correctness",
           file: "src/a.mjs",
           line: 2,
           message: "off-by-one",
-          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3 },
+          provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
         },
       ],
     });
@@ -707,6 +789,30 @@ describe("buildArtifact refusals", () => {
     ).toThrow(ArtifactError);
   });
 
+  it("refuses a finding provenance whose digest is missing or not sha256 hex", () => {
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          delete f.findings[0].provenance.digest;
+        }),
+      ),
+    ).toThrow(/provenance is missing 'digest'/);
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          f.findings[0].provenance.digest = BAD_DIGEST;
+        }),
+      ),
+    ).toThrow(/provenance\.digest is not a well-formed sha256 hex string/);
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          f.findings[0].provenance.digest = "B".repeat(64);
+        }),
+      ),
+    ).toThrow(/provenance\.digest is not a well-formed sha256 hex string/);
+  });
+
   it("refuses a lifecycle without its reason, or a reason without a lifecycle", () => {
     expect(() =>
       buildArtifact(
@@ -798,6 +904,98 @@ describe("buildArtifact refusals", () => {
     ).toThrow(ArtifactError);
   });
 
+  it("carries a bound verdict's evidence onto the finding and its verdict entry", () => {
+    const evidence = { digest: DIGEST, excerpt: "if (i > length) throw" };
+    const artifact = buildArtifact(
+      facts({
+        findings: [
+          {
+            id: "1",
+            lifecycle: "confirmed",
+            verdict: "confirmed",
+            reason: "the captured bounds check the index",
+            severity: "concern",
+            kind: "correctness",
+            file: "src/a.mjs",
+            line: 2,
+            message: "off-by-one",
+            provenance: { path: "src/a.mjs", startLine: 1, endLine: 3, digest: DIGEST },
+            evidence,
+          },
+        ],
+      }),
+    );
+    expect(artifact.findings[0]?.evidence).toEqual(evidence);
+    expect(artifact.verification.verdicts[0]?.evidence).toEqual(evidence);
+  });
+
+  it("leaves a finding with no bound verdict carrying no evidence — even if it could", () => {
+    const artifact = buildArtifact(facts());
+    expect(artifact.findings[1]).not.toHaveProperty("evidence");
+    expect(artifact.verification.verdicts).toHaveLength(1);
+  });
+
+  it("validates a bound verdict's evidence fail-closed", () => {
+    /** @param {(f: any) => void} mutate */
+    const withEvidence = (mutate) => {
+      const f = tampered((fact) => {
+        fact.findings[0].evidence = { digest: DIGEST, excerpt: "if (i > length) throw" };
+      });
+      mutate(f);
+      return f;
+    };
+    expect(() =>
+      buildArtifact(
+        withEvidence((f) => {
+          f.findings[0].evidence.digest = BAD_DIGEST;
+        }),
+      ),
+    ).toThrow(/evidence\.digest is not a well-formed sha256 hex string/);
+    expect(() =>
+      buildArtifact(
+        withEvidence((f) => {
+          f.findings[0].evidence.excerpt = "";
+        }),
+      ),
+    ).toThrow(ArtifactError);
+    expect(() =>
+      buildArtifact(
+        withEvidence((f) => {
+          f.findings[0].evidence.excerpt = "x".repeat(EVIDENCE_EXCERPT_CHARS + 1);
+        }),
+      ),
+    ).toThrow(ArtifactError);
+    expect(() =>
+      buildArtifact(
+        withEvidence((f) => {
+          f.findings[0].evidence.excerpt = "x".repeat(EVIDENCE_EXCERPT_CHARS);
+        }),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      buildArtifact(
+        withEvidence((f) => {
+          f.findings[0].evidence.source = "the model's own words";
+        }),
+      ),
+    ).toThrow(/evidence has an unknown key/);
+    expect(() =>
+      buildArtifact(
+        withEvidence((f) => {
+          delete f.findings[0].evidence.digest;
+        }),
+      ),
+    ).toThrow(ArtifactError);
+    expect(() =>
+      buildArtifact(
+        tampered((f) => {
+          f.findings[0].evidence = { digest: DIGEST, excerpt: "bounded" };
+          f.findings[1].evidence = { digest: DIGEST, excerpt: "bounded" };
+        }),
+      ),
+    ).toThrow(/carries evidence without a bound verdict/);
+  });
+
   it("refuses a non-planned lifecycle above unresolved — only a skip survives without an id", () => {
     expect(() =>
       buildArtifact(
@@ -815,10 +1013,11 @@ describe("buildArtifact refusals", () => {
           lifecycle: "unresolved",
           reason: "the finding's file was gone from the workspace",
           severity: "concern",
+          kind: "correctness",
           file: "src/gone.mjs",
           line: 4,
           message: "unreachable",
-          provenance: { path: "src/gone.mjs", startLine: 1, endLine: 4 },
+          provenance: { path: "src/gone.mjs", startLine: 1, endLine: 4, digest: DIGEST },
         },
       ],
     });
@@ -833,10 +1032,11 @@ describe("buildArtifact refusals", () => {
       findings: [
         {
           severity: "nit",
+          kind: "style",
           file: "src/b.mjs",
           line: 9,
           message: "typo",
-          provenance: { path: "src/b.mjs", startLine: 9, endLine: 9 },
+          provenance: { path: "src/b.mjs", startLine: 9, endLine: 9, digest: DIGEST },
         },
       ],
     });
@@ -1176,7 +1376,7 @@ describe("serialiseArtifact", () => {
   });
 
   it("includes the schema version", () => {
-    expect(serialiseArtifact(buildArtifact(facts()))).toContain('"schemaVersion":2');
+    expect(serialiseArtifact(buildArtifact(facts()))).toContain('"schemaVersion":5');
   });
 
   it("serialises to valid JSON that parses back to the artifact", () => {
@@ -1208,17 +1408,25 @@ describe("serialiseArtifact", () => {
         line: f.line,
         file: f.file,
         severity: f.severity,
+        kind: f.kind,
         provenance: {
           endLine: f.provenance.endLine,
           startLine: f.provenance.startLine,
           path: f.provenance.path,
+          digest: f.provenance.digest,
         },
         ...(f.id === undefined ? {} : { id: f.id }),
         ...(f.lifecycle === undefined ? {} : { lifecycle: f.lifecycle }),
         ...(f.verdict === undefined ? {} : { verdict: f.verdict }),
         ...(f.reason === undefined ? {} : { reason: f.reason }),
       })),
-      policy: { strategy: ordered.policy.strategy, strictness: ordered.policy.strictness },
+      policy: {
+        strategy: ordered.policy.strategy,
+        strictness: ordered.policy.strictness,
+        basis: ordered.policy.basis,
+        branch: ordered.policy.branch,
+        sha: ordered.policy.sha,
+      },
       outcome: { reason: ordered.outcome.reason, classification: ordered.outcome.classification },
       headRef: ordered.headRef,
       pullRequest: ordered.pullRequest,
@@ -1270,6 +1478,78 @@ describe("serialiseArtifact", () => {
     const withUndefined = /** @type {any} */ (structuredClone(buildArtifact(facts())));
     withUndefined.findings[0].message = undefined;
     expect(() => serialiseArtifact(withUndefined)).toThrow(ArtifactError);
+  });
+
+  it("serialises every reduced shape this version declares", () => {
+    const withProvenance = buildAbandonedArtifact({
+      repository: "ecoma-io/ecoma",
+      pullRequest: 12,
+      headRef: HEAD,
+      reason: "the head moved while the run was in flight",
+      commentId: 101,
+    });
+    const withApplicability = buildDryRunArtifact({
+      repository: "ecoma-io/ecoma",
+      pullRequest: 12,
+      headRef: HEAD,
+      reason: "dry run — the model was called, nothing was written",
+      applicability: "automation",
+    });
+    expect(() => serialiseArtifact(withProvenance)).not.toThrow();
+    expect(() => serialiseArtifact(withApplicability)).not.toThrow();
+    expect(JSON.parse(serialiseArtifact(withProvenance))).toStrictEqual(withProvenance);
+    expect(JSON.parse(serialiseArtifact(withApplicability))).toStrictEqual(withApplicability);
+  });
+
+  it("refuses a reduced shape that grew an unknown key — the exact sets are closed", () => {
+    for (const built of [
+      buildAbandonedArtifact({
+        repository: "ecoma-io/ecoma",
+        pullRequest: 12,
+        headRef: HEAD,
+        reason: "the head moved while the run was in flight",
+      }),
+      buildDryRunArtifact({
+        repository: "ecoma-io/ecoma",
+        pullRequest: 12,
+        headRef: HEAD,
+        reason: "dry run — the model was called, nothing was written",
+      }),
+    ]) {
+      for (const grownKey of ["policy", "findings", "risk", "kind"]) {
+        const grown = /** @type {any} */ (structuredClone(built));
+        grown[grownKey] = grownKey === "findings" || grownKey === "risk" ? [] : {};
+        expect(() => serialiseArtifact(grown)).toThrow(ArtifactError);
+      }
+    }
+  });
+
+  it("refuses a record stamped with a schema version either family has retired", () => {
+    // The bare family moved 4 → 5 and the applicability family 5 → 6, in
+    // lockstep, when the red-terminal shapes joined the bare family (#355).
+    // A full-shape record still wearing the retired bare-family number 4
+    // names no schema this module emits; the applicability family's shape
+    // wearing its own retired 5 — the bare family's live number now — fails
+    // that version's key sets instead, which is exactly the collision the
+    // lockstep move exists to prevent — both refused.
+    expect(() =>
+      serialiseArtifact(/** @type {any} */ ({ ...buildArtifact(facts()), schemaVersion: 4 })),
+    ).toThrow(/does not match a schema this module emits/);
+    const withApplicability = buildArtifact(
+      facts({
+        applicability: applicabilitySection({
+          context: "automation",
+          applicable: true,
+          posture: "automation",
+          matchedRule: "release-prs",
+          basis: "rule",
+          inputs: { association: "NONE", head: "same-repo", authorType: "bot-allowlisted" },
+        }),
+      }),
+    );
+    expect(() =>
+      serialiseArtifact(/** @type {any} */ ({ ...withApplicability, schemaVersion: 5 })),
+    ).toThrow(/fit no schema of this version/);
   });
 });
 
@@ -1338,7 +1618,7 @@ describe("the applicability fact and the skipped-run record", () => {
       inputs: { association: "MEMBER", head: "same-repo", authorType: "human" },
     });
 
-  it("carries the applicability fact on schema version 3, exact keys", () => {
+  it("carries the applicability fact on its own schema version, exact keys", () => {
     const bytes = serialiseArtifact(buildArtifact(facts({ applicability: ruleSection() })));
     const round = JSON.parse(bytes);
     expect(round.schemaVersion).toBe(applicabilityArtifactSchemaVersion);
@@ -1371,7 +1651,7 @@ describe("the applicability fact and the skipped-run record", () => {
     });
   });
 
-  it("keeps schema version 2 byte-for-byte when no applicability fact is present", () => {
+  it("keeps the bare family's schema version byte-for-byte when no applicability fact is present", () => {
     const bytes = serialiseArtifact(buildArtifact(facts()));
     expect(JSON.parse(bytes).schemaVersion).toBe(reviewArtifactSchemaVersion);
     expect(bytes).not.toContain("applicability");
@@ -1384,14 +1664,25 @@ describe("the applicability fact and the skipped-run record", () => {
       pullRequest: 192,
       headRef: HEAD,
       reason,
+      policy: POLICY_SOURCE,
       applicability: ruleSection(),
     });
     expect(artifact.schemaVersion).toBe(applicabilityArtifactSchemaVersion);
-    expect(artifact.outcome).toEqual({ classification: "skipped", reason });
+    expect(artifact.outcome).toEqual({ classification: "skip", reason });
+    expect(artifact.policy).toEqual(POLICY_SOURCE);
     const round = JSON.parse(serialiseArtifact(artifact));
     expect(Object.keys(round).sort()).toEqual(
-      ["applicability", "headRef", "outcome", "pullRequest", "repository", "schemaVersion"].sort(),
+      [
+        "applicability",
+        "headRef",
+        "outcome",
+        "policy",
+        "pullRequest",
+        "repository",
+        "schemaVersion",
+      ].sort(),
     );
+    expect(round.policy).toEqual(POLICY_SOURCE);
   });
 
   it("builds the reduced skipped-run record — state basis, no matched rule", () => {
@@ -1400,6 +1691,7 @@ describe("the applicability fact and the skipped-run record", () => {
       pullRequest: 7,
       headRef: HEAD,
       reason: "#7 is a draft — not ready means not reviewed",
+      policy: POLICY_SOURCE,
       applicability: stateSection(),
     });
     expect(JSON.parse(serialiseArtifact(artifact)).applicability.basis).toBe("state");
@@ -1415,6 +1707,7 @@ describe("the applicability fact and the skipped-run record", () => {
         pullRequest: 7,
         headRef: HEAD,
         reason: "r",
+        policy: POLICY_SOURCE,
         applicability: applicabilitySection({
           context: "maintainer",
           applicable: false,
@@ -1434,6 +1727,7 @@ describe("the applicability fact and the skipped-run record", () => {
         pullRequest: 7,
         headRef: HEAD,
         reason: "r",
+        policy: POLICY_SOURCE,
         applicability: applicabilitySection({
           context: "automation",
           applicable: true,
@@ -1444,6 +1738,19 @@ describe("the applicability fact and the skipped-run record", () => {
         }),
       }),
     ).toThrow(/must record applicable: false/);
+  });
+
+  it("refuses a skipped record whose policy pin sha is not a 40-char hex commit sha", () => {
+    expect(() =>
+      buildSkippedArtifact({
+        repository: "acme/widgets",
+        pullRequest: 7,
+        headRef: HEAD,
+        reason: "r",
+        policy: /** @type {any} */ ({ ...POLICY_SOURCE, sha: "main" }),
+        applicability: ruleSection(),
+      }),
+    ).toThrow(/skipped run\.policy\.sha must be a 40-char hex commit sha/);
   });
 
   it("refuses an unknown intensity key — the section's shape stays exact", () => {
@@ -1511,6 +1818,7 @@ describe("the applicability fact and the skipped-run record", () => {
           pullRequest: 192,
           headRef: HEAD,
           reason: "r",
+          policy: POLICY_SOURCE,
           applicability: ruleSection(),
         }),
       ),
@@ -1566,6 +1874,7 @@ describe("the applicability fact and the skipped-run record", () => {
         pullRequest: 192,
         headRef: HEAD,
         reason: "r",
+        policy: POLICY_SOURCE,
         applicability: { ...ruleSection(), posture: "automation" },
       }),
     ).toThrow(/a skipped run took no posture/);
@@ -1582,5 +1891,791 @@ describe("the applicability fact and the skipped-run record", () => {
         inputs: { association: "MEMBER", head: "same-repo", authorType: "human" },
       }),
     ).toThrow(/outside the vocabulary/);
+  });
+});
+
+describe("buildSkipRecord", () => {
+  /** A valid state-skip record's inputs — the shape run.mjs hands over. */
+  const recordInput = (over = {}) => ({
+    repository: "acme/widgets",
+    pullRequest: 7,
+    headRef: HEAD,
+    reason: "#7 is a draft — not ready means not reviewed",
+    kind: /** @type {"state" | "nothing-to-review"} */ ("state"),
+    policy: POLICY_SOURCE,
+    ...over,
+  });
+
+  it("builds the reduced record for both skip kinds — applicability version, exact keys", () => {
+    for (const kind of /** @type {const} */ (["state", "nothing-to-review"])) {
+      const record = buildSkipRecord(recordInput({ kind }));
+      expect(record.schemaVersion).toBe(applicabilityArtifactSchemaVersion);
+      expect(record.kind).toBe(kind);
+      expect(record.outcome).toEqual({
+        classification: "skip",
+        reason: "#7 is a draft — not ready means not reviewed",
+      });
+      const round = JSON.parse(serialiseArtifact(record));
+      expect(Object.keys(round).sort()).toEqual(
+        [
+          "headRef",
+          "kind",
+          "outcome",
+          "policy",
+          "pullRequest",
+          "repository",
+          "schemaVersion",
+        ].sort(),
+      );
+    }
+  });
+
+  it("serialises byte-deterministically — same inputs, identical bytes", () => {
+    const first = serialiseArtifact(buildSkipRecord(recordInput()));
+    const second = serialiseArtifact(buildSkipRecord(recordInput()));
+    expect(first).toBe(second);
+    const shuffled = buildSkipRecord(recordInput({ headRef: HEAD, kind: "state", pullRequest: 7 }));
+    expect(serialiseArtifact(shuffled)).toBe(first);
+  });
+
+  it("refuses an unknown kind, a bad head sha and empty text — fail-closed", () => {
+    expect(() => buildSkipRecord(recordInput({ kind: /** @type {any} */ ("other") }))).toThrow(
+      /outside the vocabulary/,
+    );
+    expect(() => buildSkipRecord(recordInput({ headRef: "main" }))).toThrow(
+      /skip record\.headRef must be a 40-char hex commit sha/,
+    );
+    expect(() => buildSkipRecord(recordInput({ repository: "" }))).toThrow(ArtifactError);
+    expect(() => buildSkipRecord(recordInput({ reason: "" }))).toThrow(ArtifactError);
+    expect(() => buildSkipRecord(recordInput({ pullRequest: 0 }))).toThrow(ArtifactError);
+  });
+
+  it("carries the policy pin — round-trips basis, branch and sha", () => {
+    const record = buildSkipRecord(recordInput());
+    expect(record.policy).toEqual({
+      strictness: "high",
+      strategy: "adversarial",
+      basis: "base",
+      branch: "main",
+      sha: HEAD,
+    });
+    const round = JSON.parse(serialiseArtifact(record));
+    expect(round.policy).toEqual(record.policy);
+  });
+
+  it("refuses a policy pin sha that is not a 40-char hex commit sha", () => {
+    expect(() =>
+      buildSkipRecord(
+        recordInput({
+          policy: /** @type {any} */ ({ ...POLICY_SOURCE, sha: "main" }),
+        }),
+      ),
+    ).toThrow(/skip record\.policy\.sha must be a 40-char hex commit sha/);
+    expect(() => buildSkipRecord(recordInput({ policy: /** @type {any} */ (undefined) }))).toThrow(
+      ArtifactError,
+    );
+  });
+
+  it("refuses a policy pin outside the vocabulary", () => {
+    expect(() =>
+      buildSkipRecord(
+        recordInput({
+          policy: /** @type {any} */ ({ ...POLICY_SOURCE, basis: "guessed" }),
+        }),
+      ),
+    ).toThrow(/skip record\.policy\.basis 'guessed' is outside the vocabulary/);
+  });
+
+  it("names a delivery file inside the artifact upload glob", () => {
+    for (const kind of /** @type {const} */ (["state", "nothing-to-review"])) {
+      const record = buildSkipRecord(recordInput({ kind }));
+      const name = `review-artifact-skip-${record.headRef}.json`;
+      expect(name).toMatch(/^review-artifact-.*\.json$/);
+      expect(name).toContain(record.kind === "state" ? "skip" : "skip");
+    }
+  });
+});
+
+describe("a historic merge-group skip record still serialises (parse tolerance)", () => {
+  /**
+   * The exact shape buildMergeGroupSkipRecord wrote before the gate's
+   * retirement (ADR 006) — hand-built because nothing builds it any more.
+   * The schema keeps the key set so an artifact file already on a
+   * consumer's runs stays validatable; no schemaVersion was bumped
+   * (nothing about the surviving shapes changed).
+   *
+   * @returns {Record<string, unknown>}
+   */
+  const historicMergeGroupRecord = () => ({
+    schemaVersion: applicabilityArtifactSchemaVersion,
+    kind: "merge-group",
+    repository: "acme/widgets",
+    headRef: HEAD,
+    outcome: {
+      classification: "skip",
+      reason:
+        "merge-group head — the merge queue's re-verification surface; " +
+        "each member pull request was reviewed on its own head",
+    },
+  });
+
+  it("a pre-retirement record passes the serialiser unchanged", () => {
+    const bytes = serialiseArtifact(/** @type {any} */ (historicMergeGroupRecord()));
+    const round = JSON.parse(bytes);
+    expect(round.kind).toBe("merge-group");
+    expect(Object.keys(round).sort()).toEqual(
+      ["headRef", "kind", "outcome", "repository", "schemaVersion"].sort(),
+    );
+  });
+
+  it("the same record serialises byte-deterministically", () => {
+    expect(serialiseArtifact(/** @type {any} */ (historicMergeGroupRecord()))).toBe(
+      serialiseArtifact(/** @type {any} */ (historicMergeGroupRecord())),
+    );
+  });
+});
+
+describe("buildAbandonedArtifact", () => {
+  /** A valid abandonment's inputs — the shape run.mjs hands over. */
+  const abandonedInput = (over = {}) => ({
+    repository: "acme/widgets",
+    pullRequest: 7,
+    headRef: HEAD,
+    reason: "#7 moved while it was being reviewed — nothing written",
+    ...over,
+  });
+
+  it("builds the reduced shape — review version, exact keys, no policy or findings", () => {
+    const record = buildAbandonedArtifact(abandonedInput());
+    expect(record.schemaVersion).toBe(reviewArtifactSchemaVersion);
+    expect(record.outcome).toEqual({
+      classification: "abandoned",
+      reason: "#7 moved while it was being reviewed — nothing written",
+    });
+    const round = JSON.parse(serialiseArtifact(record));
+    expect(Object.keys(round).sort()).toEqual(
+      ["headRef", "outcome", "pullRequest", "repository", "schemaVersion"].sort(),
+    );
+  });
+
+  it("carries the comment id when a comment was published before the head moved", () => {
+    const record = buildAbandonedArtifact(abandonedInput({ commentId: 101 }));
+    const round = JSON.parse(serialiseArtifact(record));
+    expect(round.provenance).toEqual({ commentId: 101 });
+    expect(Object.keys(round).sort()).toEqual(
+      ["headRef", "outcome", "provenance", "pullRequest", "repository", "schemaVersion"].sort(),
+    );
+  });
+
+  it("carries the applicability context when the policy was active", () => {
+    const record = buildAbandonedArtifact(abandonedInput({ applicability: "automation" }));
+    const round = JSON.parse(serialiseArtifact(record));
+    expect(round.applicability).toBe("automation");
+    expect(
+      buildAbandonedArtifact(abandonedInput({ commentId: 101, applicability: "automation" })),
+    ).toBeDefined();
+    const both = JSON.parse(
+      serialiseArtifact(
+        buildAbandonedArtifact(abandonedInput({ commentId: 9, applicability: "maintainer" })),
+      ),
+    );
+    expect(both.provenance).toEqual({ commentId: 9 });
+    expect(both.applicability).toBe("maintainer");
+  });
+
+  it("serialises byte-deterministically — same inputs, identical bytes", () => {
+    const first = serialiseArtifact(buildAbandonedArtifact(abandonedInput()));
+    const second = serialiseArtifact(buildAbandonedArtifact(abandonedInput()));
+    expect(first).toBe(second);
+    const shuffled = buildAbandonedArtifact(abandonedInput({ headRef: HEAD, pullRequest: 7 }));
+    expect(serialiseArtifact(shuffled)).toBe(first);
+  });
+
+  it("refuses a bad head sha and empty text — fail-closed", () => {
+    expect(() => buildAbandonedArtifact(abandonedInput({ headRef: "main" }))).toThrow(
+      /abandoned run\.headRef must be a 40-char hex commit sha/,
+    );
+    expect(() => buildAbandonedArtifact(abandonedInput({ repository: "" }))).toThrow(ArtifactError);
+    expect(() => buildAbandonedArtifact(abandonedInput({ reason: "" }))).toThrow(ArtifactError);
+    expect(() => buildAbandonedArtifact(abandonedInput({ pullRequest: 0 }))).toThrow(ArtifactError);
+    expect(() =>
+      buildAbandonedArtifact(abandonedInput({ commentId: /** @type {any} */ (0) })),
+    ).toThrow(ArtifactError);
+    expect(() =>
+      buildAbandonedArtifact(abandonedInput({ applicability: /** @type {any} */ ("enterprise") })),
+    ).toThrow(/outside the vocabulary/);
+  });
+});
+
+describe("buildDryRunArtifact", () => {
+  /** A valid dry-run's inputs — the shape run.mjs hands over. */
+  const dryInput = (over = {}) => ({
+    repository: "acme/widgets",
+    pullRequest: 7,
+    headRef: HEAD,
+    reason: "dry run: nothing written",
+    ...over,
+  });
+
+  it("builds the reduced shape — review version, exact keys, no policy or findings", () => {
+    const record = buildDryRunArtifact(dryInput());
+    expect(record.schemaVersion).toBe(reviewArtifactSchemaVersion);
+    expect(record.outcome).toEqual({
+      classification: "dry-run",
+      reason: "dry run: nothing written",
+    });
+    const round = JSON.parse(serialiseArtifact(record));
+    expect(Object.keys(round).sort()).toEqual(
+      ["headRef", "outcome", "pullRequest", "repository", "schemaVersion"].sort(),
+    );
+  });
+
+  it("carries the applicability context when the policy was active", () => {
+    const round = JSON.parse(
+      serialiseArtifact(buildDryRunArtifact(dryInput({ applicability: "automation" }))),
+    );
+    expect(round.applicability).toBe("automation");
+  });
+
+  it("serialises byte-deterministically — same inputs, identical bytes", () => {
+    const first = serialiseArtifact(buildDryRunArtifact(dryInput()));
+    const second = serialiseArtifact(buildDryRunArtifact(dryInput()));
+    expect(first).toBe(second);
+  });
+
+  it("refuses a bad head sha and empty text — fail-closed", () => {
+    expect(() => buildDryRunArtifact(dryInput({ headRef: "main" }))).toThrow(
+      /dry run\.headRef must be a 40-char hex commit sha/,
+    );
+    expect(() => buildDryRunArtifact(dryInput({ repository: "" }))).toThrow(ArtifactError);
+    expect(() => buildDryRunArtifact(dryInput({ reason: "" }))).toThrow(ArtifactError);
+    expect(() => buildDryRunArtifact(dryInput({ pullRequest: 0 }))).toThrow(ArtifactError);
+    expect(() =>
+      buildDryRunArtifact(dryInput({ applicability: /** @type {any} */ ("enterprise") })),
+    ).toThrow(/outside the vocabulary/);
+  });
+});
+
+describe("buildRedArtifact", () => {
+  /** A red-terminal record's inputs — the shape the boundary writer hands over. */
+  const redInput = (over = {}) => ({
+    repository: "acme/widgets",
+    pullRequest: 41,
+    headRef: HEAD,
+    outcome: /** @type {"refused" | "failed"} */ ("refused"),
+    reason: "the final answer failed the output contract twice: the answer was empty",
+    ...over,
+  });
+
+  it("builds the refused shape — the bare family's version, exact keys, no policy or findings", () => {
+    const record = buildRedArtifact(redInput());
+    expect(record.schemaVersion).toBe(reviewArtifactSchemaVersion);
+    expect(record.schemaVersion).toBe(5);
+    expect(record.headRef).toBe(HEAD);
+    expect(record.outcome).toEqual({
+      classification: "refused",
+      reason: "the final answer failed the output contract twice: the answer was empty",
+    });
+    const round = JSON.parse(serialiseArtifact(record));
+    expect(Object.keys(round).sort()).toEqual(
+      ["headRef", "outcome", "pullRequest", "repository", "schemaVersion"].sort(),
+    );
+  });
+
+  it("builds the failed shape — the other word of the boundary's two", () => {
+    const record = buildRedArtifact(
+      redInput({ outcome: "failed", reason: "request to https://api.github.com failed: reset" }),
+    );
+    expect(record.outcome.classification).toBe("failed");
+    expect(serialiseArtifact(record)).toContain('"classification":"failed"');
+  });
+
+  it("carries the honest null head of a run that died before the snapshot read", () => {
+    const record = buildRedArtifact(redInput({ headRef: null }));
+    expect(record.headRef).toBeNull();
+    expect(JSON.parse(serialiseArtifact(record)).headRef).toBeNull();
+  });
+
+  it("carries the comment id when one landed before the run died red — failed records only", () => {
+    const round = JSON.parse(
+      serialiseArtifact(buildRedArtifact(redInput({ outcome: "failed", commentId: 101 }))),
+    );
+    expect(round.provenance).toEqual({ commentId: 101 });
+    expect(Object.keys(round).sort()).toEqual(
+      ["headRef", "outcome", "provenance", "pullRequest", "repository", "schemaVersion"].sort(),
+    );
+  });
+
+  it("refuses a comment id on a refused classification — the law the docs state, encoded here", () => {
+    expect(() => buildRedArtifact(redInput({ commentId: 101 }))).toThrow(
+      /a refused record cannot name a comment/,
+    );
+    // The failed classification keeps the id — the asymmetry is the law.
+    expect(buildRedArtifact(redInput({ outcome: "failed", commentId: 101 })).provenance).toEqual({
+      commentId: 101,
+    });
+  });
+
+  it("carries the applicability context when the classification ran", () => {
+    const round = JSON.parse(
+      serialiseArtifact(buildRedArtifact(redInput({ applicability: "automation" }))),
+    );
+    expect(round.applicability).toBe("automation");
+    const both = JSON.parse(
+      serialiseArtifact(
+        buildRedArtifact(
+          redInput({ outcome: "failed", commentId: 9, applicability: "maintainer" }),
+        ),
+      ),
+    );
+    expect(both.provenance).toEqual({ commentId: 9 });
+    expect(both.applicability).toBe("maintainer");
+    expect(Object.keys(both).sort()).toEqual(
+      [
+        "applicability",
+        "headRef",
+        "outcome",
+        "provenance",
+        "pullRequest",
+        "repository",
+        "schemaVersion",
+      ].sort(),
+    );
+  });
+
+  it("serialises byte-deterministically — same inputs, identical bytes", () => {
+    const first = serialiseArtifact(buildRedArtifact(redInput()));
+    const second = serialiseArtifact(buildRedArtifact(redInput()));
+    expect(first).toBe(second);
+  });
+
+  it("refuses a foreign classification, a bad head sha and out-of-cap text — fail-closed", () => {
+    expect(() => buildRedArtifact(redInput({ outcome: /** @type {any} */ ("published") }))).toThrow(
+      /outside the vocabulary/,
+    );
+    expect(() => buildRedArtifact(redInput({ headRef: "main" }))).toThrow(
+      /red run\.headRef must be a 40-char hex commit sha/,
+    );
+    expect(() => buildRedArtifact(redInput({ repository: "" }))).toThrow(ArtifactError);
+    expect(() => buildRedArtifact(redInput({ pullRequest: 0 }))).toThrow(ArtifactError);
+    expect(() => buildRedArtifact(redInput({ reason: "x".repeat(RED_REASON_CHARS + 1) }))).toThrow(
+      /exceeds/,
+    );
+    expect(() =>
+      buildRedArtifact(redInput({ applicability: /** @type {any} */ ("enterprise") })),
+    ).toThrow(/outside the vocabulary/);
+  });
+
+  it("refuses a red record grown past its key sets — the serialiser holds the family's line", () => {
+    const built = buildRedArtifact(redInput());
+    for (const grownKey of ["policy", "findings", "risk", "kind"]) {
+      const grown = /** @type {any} */ (structuredClone(built));
+      grown[grownKey] = grownKey === "findings" || grownKey === "risk" ? [] : {};
+      expect(() => serialiseArtifact(grown)).toThrow(ArtifactError);
+    }
+  });
+});
+
+describe("the architecture family (7/8)", () => {
+  /** A valid established section — the reduction of a pinned, judged report. */
+  const section = (over = {}) =>
+    /** @type {import("./artifact.mjs").ArchitectureSection} */ (
+      structuredClone({
+        verdict: "pass",
+        stale: false,
+        unknownReason: null,
+        coverage: { complete: true, analyzedFiles: 2, notAnalyzedCount: 0, blindSpotCount: 0 },
+        policyChanged: false,
+        toolVersion: "0.29.0",
+        reportDigest: DIGEST,
+        provenance: { head: { commit: HEAD }, base: { commit: OTHER_HEAD } },
+        policyFingerprints: { head: `sha256:${"1".repeat(64)}`, base: `sha256:${"1".repeat(64)}` },
+        counts: {
+          introduced: 0,
+          introducedWaived: 0,
+          resolved: 0,
+          unchanged: 0,
+          unresolvable: { introduced: 0, resolved: 0, unchanged: 0, unknown: 0 },
+        },
+        introduced: [],
+        resolved: [],
+        renamePairs: [],
+        customRules: null,
+        occurrencesReduced: 0,
+        ...over,
+      })
+    );
+
+  /** A section with a withheld verdict — stale bytes pinned to a foreign head. */
+  const staleSection = () =>
+    section({
+      verdict: "unknown",
+      stale: true,
+      unknownReason: "stale",
+      provenance: { head: { commit: OTHER_HEAD }, base: { commit: OTHER_HEAD } },
+    });
+
+  /**
+   * The six-gate table the aware family's facts carry, architecture last —
+   * typed so the literal `gate` arms narrow to the closed `GateName`.
+   *
+   * @param {boolean} [architecturePassed]
+   * @returns {import("./gates.mjs").GateResult[]}
+   */
+  const sixGates = (architecturePassed = true) => [
+    { gate: "conclusion", passed: true },
+    { gate: "bound", passed: true },
+    { gate: "coverage", passed: true },
+    { gate: "provenance", passed: true },
+    { gate: "verification", passed: true },
+    {
+      gate: "architecture",
+      ...(architecturePassed
+        ? { passed: true }
+        : {
+            passed: false,
+            reason:
+              "the architecture evidence is stale — it pins a head other than the one this review judged, so its verdict is withheld as unknown",
+          }),
+    },
+  ];
+
+  it("stamps 7 bare and 8 with an applicability fact — the lockstep law's next pair", () => {
+    const bare = buildArtifact(facts({ architecture: section(), gates: sixGates() }));
+    expect(bare.schemaVersion).toBe(7);
+    expect(bare.schemaVersion).toBe(architectureArtifactSchemaVersion);
+    const withApplicability = buildArtifact(
+      facts({
+        architecture: section(),
+        gates: sixGates(),
+        applicability: applicabilitySection({
+          context: "automation",
+          applicable: true,
+          posture: "automation",
+          matchedRule: "release-prs",
+          basis: "rule",
+          inputs: { association: "NONE", head: "same-repo", authorType: "bot-allowlisted" },
+        }),
+      }),
+    );
+    expect(withApplicability.schemaVersion).toBe(8);
+    expect(withApplicability.schemaVersion).toBe(architectureApplicabilityArtifactSchemaVersion);
+    // And the blind families are untouched — the same facts, no section,
+    // keep today's numbers.
+    expect(buildArtifact(facts()).schemaVersion).toBe(5);
+    expect(
+      buildArtifact(
+        facts({
+          applicability: applicabilitySection({
+            context: "automation",
+            applicable: true,
+            posture: "automation",
+            matchedRule: "release-prs",
+            basis: "rule",
+            inputs: { association: "NONE", head: "same-repo", authorType: "bot-allowlisted" },
+          }),
+        }),
+      ).schemaVersion,
+    ).toBe(6);
+  });
+
+  it("the section selects the six-gate table — a five-entry table beside a section is refused", () => {
+    expect(buildArtifact(facts({ architecture: section(), gates: sixGates() })).gates).toHaveLength(
+      6,
+    );
+    expect(() => buildArtifact(facts({ architecture: section() }))).toThrow(
+      /run facts\.gates holds 5 entries, the declared set is 6/,
+    );
+  });
+
+  it("the gate entry must agree with the section's own basis — both directions", () => {
+    // An established section beside a failed gate row: two truths, one fact.
+    expect(() => buildArtifact(facts({ architecture: section(), gates: sixGates(false) }))).toThrow(
+      /architecture entry disagrees with the section/,
+    );
+    // A withheld section beside a passing gate row: the same disagreement.
+    expect(() =>
+      buildArtifact(facts({ architecture: staleSection(), gates: sixGates(true) })),
+    ).toThrow(/architecture entry disagrees with the section/);
+    // The agreeing withheld pair builds, gate failed, reason carried.
+    const withheld = buildArtifact(facts({ architecture: staleSection(), gates: sixGates(false) }));
+    expect(withheld.schemaVersion).toBe(7);
+    expect(withheld.gates.at(-1)).toMatchObject({ gate: "architecture", passed: false });
+  });
+
+  it("serialises round-trip with exact keys and byte determinism", () => {
+    const artifact = buildArtifact(facts({ architecture: section(), gates: sixGates() }));
+    const bytes = serialiseArtifact(artifact);
+    const round = JSON.parse(bytes);
+    expect(Object.keys(round).sort()).toEqual(
+      [
+        "architecture",
+        "coverage",
+        "findings",
+        "gates",
+        "headRef",
+        "outcome",
+        "phases",
+        "policy",
+        "provenance",
+        "pullRequest",
+        "repository",
+        "risk",
+        "schemaVersion",
+        "verification",
+      ].sort(),
+    );
+    expect(Object.keys(round.architecture).sort()).toEqual(
+      [
+        "coverage",
+        "counts",
+        "customRules",
+        "introduced",
+        "occurrencesReduced",
+        "policyChanged",
+        "policyFingerprints",
+        "provenance",
+        "renamePairs",
+        "reportDigest",
+        "resolved",
+        "stale",
+        "toolVersion",
+        "unknownReason",
+        "verdict",
+      ].sort(),
+    );
+    expect(serialiseArtifact(artifact)).toBe(bytes);
+    expect(JSON.parse(serialiseArtifact(/** @type {any} */ (structuredClone(artifact))))).toEqual(
+      round,
+    );
+  });
+
+  it("refuses a section the validator rejects — shape, vocabularies, caps, arithmetic", () => {
+    /** @param {(s: any) => any} mutate */
+    const build = (mutate) =>
+      buildArtifact(
+        facts({
+          architecture: mutate(section()),
+          gates: sixGates(),
+        }),
+      );
+    expect(() => build((s) => ((s.verdict = "maybe"), s))).toThrow(/verdict/);
+    expect(() => build((s) => ((s.extra = 1), s))).toThrow(/run facts\.architecture/);
+    expect(() => build((s) => ((s.unknownReason = "stale"), s))).toThrow(
+      /beside an unknown reason/,
+    );
+    expect(() => build((s) => ((s.verdict = "unknown"), s))).toThrow(/without saying which kind/);
+    expect(() => build((s) => ((s.reportDigest = BAD_DIGEST), s))).toThrow(/sha256/);
+    expect(() => build((s) => ((s.counts = { ...s.counts, introducedWaived: 1 }), s))).toThrow(
+      /more waivers than violations/,
+    );
+    expect(() =>
+      build(
+        (s) => (
+          (s.introduced = [
+            {
+              messageId: "m",
+              sourceProject: "a",
+              target: "b",
+              waived: true,
+              headCount: 1,
+              decisionRef: null,
+            },
+          ]),
+          s
+        ),
+      ),
+    ).toThrow(/introduced lists 1 waived items against a count of 0/);
+    expect(() =>
+      build((s) => ((s.introduced = Array.from({ length: 33 }, () => s.introduced[0])), s)),
+    ).toThrow(/identity cap/);
+    expect(() => build((s) => ((s.introduced = [{ messageId: "m" }]), s))).toThrow(
+      /introduced\[0\]/,
+    );
+    expect(() =>
+      build(
+        (s) => (
+          (s.customRules = {
+            findings: {
+              introduced: { count: 1, ruleIds: Array.from({ length: 17 }, () => "r") },
+              resolved: { count: 0, ruleIds: [] },
+              unchanged: { count: 0, ruleIds: [] },
+              unknown: { count: 0, ruleIds: [] },
+            },
+          }),
+          s
+        ),
+      ),
+    ).toThrow(/16-id cap/);
+    expect(() => build((s) => ((s.toolVersion = "x".repeat(201)), s))).toThrow(/documented cap/);
+  });
+
+  it("buildRedArtifact carries the section and joins the aware red family", () => {
+    const redInput = (over = {}) => ({
+      repository: "acme/widgets",
+      pullRequest: 41,
+      headRef: HEAD,
+      outcome: /** @type {"refused" | "failed"} */ ("failed"),
+      reason: "request to https://api.github.com failed: reset",
+      ...over,
+    });
+    // The outage rule: evidence that landed before the run died red rides
+    // the record, and the record joins the family its facts select.
+    const withSection = buildRedArtifact(redInput({ architecture: section() }));
+    expect(withSection.schemaVersion).toBe(7);
+    const both = buildRedArtifact(
+      redInput({ architecture: section(), applicability: "automation" }),
+    );
+    expect(both.schemaVersion).toBe(8);
+    expect(JSON.parse(serialiseArtifact(withSection)).architecture.verdict).toBe("pass");
+    // Without a section the red shapes keep today's 5 — a run that died
+    // before its evidence read is not architecture-aware.
+    expect(buildRedArtifact(redInput()).schemaVersion).toBe(5);
+    // And a malformed section refuses the red record too.
+    expect(() =>
+      buildRedArtifact(redInput({ architecture: section({ verdict: "maybe" }) })),
+    ).toThrow(ArtifactError);
+  });
+
+  it("architectureSection reduces the frozen evidence — identity and counts persist, caps applied", () => {
+    const evidence = /** @type {import("#core/architecture.mjs").ArchitectureEvidence} */ (
+      structuredClone({
+        verdict: "fail",
+        stale: false,
+        incompleteness: null,
+        provenance: {
+          head: { commit: HEAD, dirty: false },
+          base: { commit: OTHER_HEAD, dirty: true },
+        },
+        policyChanged: true,
+        provider: "node-workspace",
+        toolVersion: "0.29.0",
+        policyFingerprints: { head: `sha256:${"1".repeat(64)}`, base: `sha256:${"2".repeat(64)}` },
+        reportSha256: DIGEST,
+        introduced: [
+          {
+            messageId: "module-boundary",
+            sourceProject: "widgets-a",
+            target: "widgets-b/src/index.mjs",
+            targetIsSpecifier: false,
+            constraint: { decisionRef: "0009-share-through-facades", description: "no" },
+            waived: false,
+            waivedBy: null,
+            baseCount: 0,
+            headCount: 2,
+            baseSites: [],
+            headSites: [{ file: "src/a.mjs", line: 2, column: 1 }],
+            reason: null,
+            note: null,
+          },
+          {
+            messageId: "module-boundary",
+            sourceProject: "widgets-c",
+            target: "widgets-d/src/index.mjs",
+            targetIsSpecifier: false,
+            constraint: null,
+            waived: true,
+            waivedBy: {
+              path: "widgets-c/**",
+              messageId: "module-boundary",
+              reason: "split landing",
+              expiresAt: "2999-01-01",
+            },
+            baseCount: 0,
+            headCount: 1,
+            baseSites: [],
+            headSites: [{ file: "src/c.mjs", line: 4, column: 1 }],
+            reason: null,
+            note: null,
+          },
+        ],
+        resolved: [
+          {
+            messageId: "module-boundary",
+            sourceProject: "widgets-old",
+            target: "widgets-e/src/index.mjs",
+            targetIsSpecifier: false,
+            constraint: null,
+            waived: false,
+            waivedBy: null,
+            baseCount: 1,
+            headCount: 0,
+            baseSites: [{ file: "src/old.mjs", line: 1, column: 1 }],
+            headSites: [],
+            reason: null,
+            note: null,
+          },
+        ],
+        unchangedCount: 3,
+        introducedWaived: 1,
+        renamePairs: [],
+        customRules: null,
+        unresolvable: { introduced: 0, resolved: 0, unchanged: 0, unknown: 1 },
+        occurrencesReduced: [
+          {
+            messageId: "module-boundary",
+            sourceProject: "widgets-f",
+            target: "widgets-g/src/index.mjs",
+            note: "4 at base, 2 at head",
+          },
+        ],
+        coverage: {
+          complete: false,
+          analyzedFiles: 9,
+          notAnalyzedCount: 2,
+          blindSpotCount: 1,
+          notes: [],
+        },
+      })
+    );
+    const reduced = architectureSection(evidence);
+    expect(reduced.verdict).toBe("fail");
+    expect(reduced.policyChanged).toBe(true);
+    expect(reduced.counts).toEqual({
+      introduced: 2,
+      introducedWaived: 1,
+      resolved: 1,
+      unchanged: 3,
+      unresolvable: { introduced: 0, resolved: 0, unchanged: 0, unknown: 1 },
+    });
+    expect(reduced.introduced).toEqual([
+      {
+        messageId: "module-boundary",
+        sourceProject: "widgets-a",
+        target: "widgets-b/src/index.mjs",
+        waived: false,
+        headCount: 2,
+        decisionRef: "0009-share-through-facades",
+      },
+      {
+        messageId: "module-boundary",
+        sourceProject: "widgets-c",
+        target: "widgets-d/src/index.mjs",
+        waived: true,
+        headCount: 1,
+        decisionRef: null,
+      },
+    ]);
+    expect(reduced.resolved).toEqual([
+      {
+        messageId: "module-boundary",
+        sourceProject: "widgets-old",
+        target: "widgets-e/src/index.mjs",
+      },
+    ]);
+    expect(reduced.occurrencesReduced).toBe(1);
+    expect(Object.keys(reduced.counts)).not.toContain("unknown");
+    // The reduction is idempotent through the validator — the section the
+    // builder emits is the section the validator accepts, exactly.
+    expect(asArchitectureSection(JSON.parse(JSON.stringify(reduced)), "test")).toEqual(reduced);
+    // Producer over-long identity truncates deterministically, never refuses.
+    const firstEvidence = /** @type {import("#core/architecture.mjs").EvidenceItem} */ (
+      evidence.introduced[0]
+    );
+    const long = architectureSection({
+      ...evidence,
+      introduced: [{ ...firstEvidence, messageId: "x".repeat(500) }],
+    });
+    expect(long.introduced[0]?.messageId).toHaveLength(200);
   });
 });

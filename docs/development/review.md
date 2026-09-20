@@ -45,6 +45,13 @@ missing or wrong gets the same red refusal as one that triggered on the
 wrong event name, not a silent success. The same posture as `triage`'s
 thread reader.
 
+There is no `merge_group` trigger and no merge-group path
+([ADR 006](../adr/006-code-scanning-merge-enforcement.md)): review runs for
+the pull request, not for the queue. The event gate refuses any event name
+other than `pull_request` — a `merge_group` event that still reaches the
+action, because a calling workflow added the trigger back, gets the same red
+refusal as any unsupported event and writes nothing: no comment, no record.
+
 Permissions: `contents: read` and `pull-requests: write` — a comment is the
 whole write surface.
 
@@ -78,8 +85,16 @@ The review target is a pair of commits: the pull request's head SHA and its
 base SHA, both taken from a single `GET /pulls/{number}` read at the start of
 the run. Everything the review consumes belongs to that snapshot: the pull
 request's metadata, the changed-file inventory, the per-file diff patches, and
-every workspace read. Nothing is re-read from a moving branch; the head SHA is
-pinned once and compared again once, before publication (see
+every workspace read. Evidence is never re-read from a moving branch — but the
+pinned head is never trusted to still be the head. Publication is guarded by
+three live re-reads of the pull request. The first, before anything is
+written, must still find the pull request open, not a draft, and at the pinned
+head SHA, or the run abandons with nothing written. The second is taken before
+the comment exists, and the built artifact is validated against it — a refusal
+there refuses a run that has written nothing. The third is taken at the write
+itself, after the comment exists, so a push landing inside the publication
+window ends in no artifact — the comment left standing — never in an artifact
+describing a head the pull request has already left (see
 [Pull request state](#pull-request-state)).
 
 Under `pull_request` the checked-out tree is the merge preview — head merged
@@ -139,6 +154,14 @@ not heuristics: absent an `applicability` key the classification never runs
 and behaviour is byte-for-byte the pre-axis behaviour. Design and landing
 sequence: [the applicability policy](applicability-policy.md).
 
+Eligibility, not scope. This axis answers one question — _should this pull
+request consume a review run at all?_ The scope layer answers a different
+one — _what should the reviewer inspect once it does?_ (`ignore`, the
+`maxDiffLines` budget, path-scoped rules). The two never borrow each
+other's semantics: a size condition here (`when.changes`) reads the whole
+pre-ignore change, and the budget there reads the post-ignore universe; a
+scope refusal stays a refusal and an eligibility skip stays a skip.
+
 ### The context
 
 Three contexts, derived in order, first match wins:
@@ -165,9 +188,15 @@ The `applicability` key carries `bots` (the allowlist) and `rules`, evaluated
 in config order, first match wins — never reordered, scored or merged. A rule
 names itself (`id`, unique, the audit record's name), may pin a context
 (absent matches every context), carries conjunctive `when` conditions —
-`title` and `branch` as regular-expression sources, `paths` as globs in the
-one configuration dialect over the post-ignore inventory — and a `run`
-boolean (default true). On a rule that pins a non-`external` context and
+`title`, `branch` and `base` as regular-expression sources (title, head ref
+and base ref), `paths` as globs in the one configuration dialect over
+the post-ignore inventory, `labels` as exact case-sensitive names matched
+any-of, `author` as author facts (`isBot` — the GitHub-attested
+`user.type`, declared only as `true`; `equals` — exact case-sensitive
+logins), `changes` as size guards over the **pre-ignore** totals of the
+whole change (`lines` — additions plus deletions across every changed
+file; `files` — the changed-file count; `gt` the one comparator, a whole
+number ≥ 0) — and a `run` boolean (default true). On a rule that pins a non-`external` context and
 runs, a [`posture`](#the-posture-axis) with its instruction document; on any
 running rule, an [`intensity`](#the-intensity-axis) strictness override,
 under the lower-gates. Nothing matching is the defaults: review runs, and
@@ -175,10 +204,24 @@ the record says so with basis `default`.
 
 Four laws the validator enforces rather than asks reviewers to remember:
 
-- `run: false` must declare a pinned context — a rule built from title,
-  branch or paths conventions never governs alone;
-- that context is never `external` — the external context is frozen; full
-  review is what an untrusted contribution is for;
+- a `run: false` rule is anchored by exactly one of three anchors: a pinned
+  non-`external` context; `when.author.isBot: true` — bot-ness is a GitHub
+  attestation (`user.type`), nobody but GitHub can mint it, the attestation
+  may not be negated (`isBot` accepts only `true`; `equals` narrows, it
+  never anchors); or `when.changes` — the one author-writable anchor. A size
+  rule is an _explicit eligibility decision_ narrowing who consumes a review
+  run, and it reads the pre-ignore totals by design. It is never a way to
+  reclassify the scope layer's `maxDiffLines` refusal into a green skip: a
+  diff past that budget is refused (red) as capacity, and a size rule that
+  would have swallowed that outcome is exactly the conflation the run
+  contract freezes against (the eligibility and capacity axes are
+  independent — [the semantics are frozen](../run-contract.md#the-semantics-are-frozen)).
+  A convention — title, branch, base, paths, labels — never governs alone;
+- the pinned context, when one is named on a `run: false` rule, is never
+  `external` — the external context is frozen; full review is what an
+  untrusted contribution is for, and the new anchors do not open it: a
+  size rule on a non-`external` context skips only the pull requests it
+  explicitly names; a rule that names `external` skips nothing;
 - a non-standard posture declares its mode-scoped instruction document, and
   neither it nor its document rides a `run: false` skip — a skipped run took
   no posture ([the posture axis](#the-posture-axis)); and
@@ -244,16 +287,28 @@ re-deriving either.
 ### What a skip leaves behind
 
 A rule matching with `run: false` ends the run before the changed-file
-listing is even fetched (a `paths` rule fetches it once, exactly), before
-budget accounting, before the model: the run is green, writes no comment, and
-publishes a **skipped-run record** where a full run would write its artifact —
-the same repository/head/pull-request facts, `outcome: skipped` with the
-reason naming the rule (`#N matched applicability rule '<id>' — review
-intentionally not run`), and the applicability fact with `applicable: false`,
-posture `standard`, and the deciding rule's id. A pull request already skipped by its draft or
+listing is even fetched (a `paths` **or `changes`** rule fetches it once,
+exactly — the trigger is policy-wide, so a policy with a `changes` rule
+anywhere lists every pull request it evaluates, even one a bot rule would
+have skipped), before budget accounting, before the model: the run is
+green, writes no comment, and publishes a **skipped-run record** where a
+full run would write its artifact — the same repository/head/pull-request
+facts, `outcome: skipped` with the reason naming the rule (`#N matched
+applicability rule '<id>' — review intentionally not run`; when the
+deciding rule carries `when.changes` and the totals exist, a measured
+parenthetical rides along — `#3 matched applicability rule
+'no-large-external' (9000 changed lines across 1 file) — review
+intentionally not run` —
+numbers only, never title or login text), and the applicability fact with
+`applicable: false`, posture `standard`, and the deciding rule's id. (The
+repository's own policy ships no size anchor — see the sample config below —
+so this id is illustrative of the general shape, not the dogfood rule.) A pull request already skipped by its draft or
 closed state writes the same reduced record **when the policy is on**, with
 basis `state` — under a policy, a skip is recorded honestly rather than only
-logged; without one, today's log line alone, unchanged. The log carries one
+logged; without one, a **skip record** still leaves the run: the
+repository/head/pull-request facts, `outcome: skipped`, a `kind` of `state`
+(or `nothing-to-review`, for an empty universe) and no applicability fact.
+The log carries one
 audit line whenever the policy is in play:
 
 ```text
@@ -261,24 +316,26 @@ policy source: event=pull_request basis=base branch=main sha=<sha> path=.github/
 ```
 
 Dry run suppresses every skip record: absolute zero mutation means zero.
-The artifact schema moves to `schemaVersion: 3` only when a run has an
-applicability fact to carry; a policy-less run still writes `2`, and the two
-shapes never mix in one record.
+The artifact schema moves to `schemaVersion: 6` only when a run has an
+applicability fact to carry; skip records ride the applicability family's
+`schemaVersion` with a `kind` field, and the shapes never mix in
+one record. The bare family's own `schemaVersion` is `5` — it moved there
+from `4` when the red-terminal artifacts joined it (#355).
 
 ## Inputs
 
-| Input                | Meaning                                                                                                                                                                                                          |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `github-token`       | the token the action writes with — the workflow's `permissions:` block is the real bound                                                                                                                         |
-| `api-url`            | base URL of an OpenAI-compatible endpoint                                                                                                                                                                        |
-| `api-key`            | key for that endpoint; empty is a supported keyless configuration                                                                                                                                                |
-| `model`              | model id to ask                                                                                                                                                                                                  |
-| `request-timeout-ms` | per-attempt timeout in milliseconds for one provider call — the attempt must complete the whole completion; raise it for endpoints that legitimately take longer than 30 seconds; default 30000, floored at 1000 |
-| `config-path`        | overrides `.github/action-agents/review/review.json5` / `.json` — see the configuration page                                                                                                                     |
-| `max-turns`          | ceiling on agent turns — reaching it ends the review and says so; the default is 30                                                                                                                              |
-| `context-window`     | the configured model's token budget — the agent compacts before reaching it; default 128000                                                                                                                      |
-| `dry-run`            | review and log, comment nothing — default false, because the comment is the action's only output                                                                                                                 |
-| `artifact-path`      | where inside the workspace the machine-readable run record lands — see [The run artifact](#the-run-artifact); default `.review-artifact`                                                                         |
+| Input                | Meaning                                                                                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `github-token`       | the token the action writes with — the workflow's `permissions:` block is the real bound                                                                                                                           |
+| `api-url`            | base URL of an OpenAI-compatible endpoint                                                                                                                                                                          |
+| `api-key`            | key for that endpoint; empty is a supported keyless configuration                                                                                                                                                  |
+| `model`              | model id to ask                                                                                                                                                                                                    |
+| `request-timeout-ms` | per-attempt timeout in milliseconds for one provider call — the attempt must complete the whole completion; raise it for endpoints that legitimately take longer than two minutes; default 120000, floored at 1000 |
+| `config-path`        | overrides `.github/action-agents/review/review.json5` / `.json` — see the configuration page                                                                                                                       |
+| `max-turns`          | ceiling on agent turns — reaching it ends the review and says so; the default is 30                                                                                                                                |
+| `context-window`     | the configured model's token budget — the agent compacts before reaching it; default 128000                                                                                                                        |
+| `dry-run`            | review and log, comment nothing — default false, because the comment is the action's only output                                                                                                                   |
+| `artifact-path`      | where inside the workspace the machine-readable run record lands — see [The run artifact](#the-run-artifact); default `.review-artifact`                                                                           |
 
 Timeouts come in two layers. `request-timeout-ms` bounds one provider attempt; retries,
 backoff, `Retry-After` and the attempt limit are `core/transport/http.mjs` policy, not inputs.
@@ -297,67 +354,121 @@ file alone.
 
 ## The config file
 
-`.github/action-agents/review/review.json5`, in full:
+`.github/action-agents/review/review.json5` in this repository, in full:
+
+```json5
+{
+  // This repository's own policy for its own reviewer.
+  //
+  // strictness stays at the default on purpose: concerns plus collapsed
+  // nits is the bar a maintainer actually reads. language follows the
+  // repository's English-first convention for public artifacts.
+  //
+  // The ignore set is a universe filter, not a suggestion: ignored paths
+  // cost nothing against maxDiffLines, are invisible to rule matching, and
+  // cannot be reached by the tools either.
+  ignore: [
+    "pnpm-lock.yaml",
+    "coverage/**",
+    "dist/**",
+    ".claude/**",
+    ".agents/**",
+    ".codex/**",
+    ".opencode/**",
+  ],
+
+  // A resource budget, not a PR-size rule. The count is additions plus
+  // deletions over the post-ignore universe; a diff past it is refused
+  // outright (red, recorded `refused`) rather than half-reviewed.
+  // No eligibility rule reclassifies that outcome — never skipped green.
+  maxDiffLines: 3000,
+
+  // The eligibility axis — whether a pull request consumes a review run at
+  // all. Every skip here is anchored by one of the three anchors the
+  // validator enforces: a pinned context, GitHub's bot attestation, or a
+  // measurement. Title, branch, path and label conventions never anchor a
+  // skip; they only narrow rules the anchor already governs.
+  applicability: {
+    // GitHub-attested bots classified as `automation`. Exact logins.
+    bots: ["ecoma-io[bot]"],
+    rules: [
+      {
+        // Release pull requests contain no hand-written code. Pinned
+        // context anchors the skip; the title and branch narrow it to
+        // actual release pull requests.
+        id: "release-prs",
+        context: "automation",
+        when: {
+          title: "^chore\\(workspace\\): release",
+          branch: "^release-please--",
+        },
+        run: false,
+      },
+      {
+        // Every other GitHub-attested bot. `user.type` is GitHub's own
+        // attestation: nobody but GitHub can mint it.
+        id: "unlisted-bots",
+        when: { author: { isBot: true } },
+        run: false,
+      },
+    ],
+  },
+
+  // Path-scoped rubrics. Every document here must exist on the default
+  // branch — a declared rule with no file is a startup error, not dormancy.
+  rules: [
+    {
+      include: ["core/src/**/*.mjs", "*/src/**/*.mjs"],
+      instruction: ".github/action-agents/review/rules/runtime-mjs.md",
+    },
+    {
+      include: ["docs/**/*.md"],
+      instruction: ".github/action-agents/review/rules/docs.md",
+    },
+  ],
+}
+```
+
+An **illustrative consumer configuration**, exercising the keys this
+repository's own config does not use — a size anchor (a `run: false` rule
+over the pre-ignore totals: an explicit eligibility decision, never a
+reclassification of the budget), a posture with an instruction document, and
+an `intensity` strictness override. The numbers are the consumer's own; this
+repository ships **no size anchor** in its dogfood policy:
 
 ```json5
 {
   // The inclusion bar for findings — one dial, not a wall of toggles.
-  //   low     concerns only
-  //   medium  concerns and nits, nits collapsed   (the default)
-  //   high    everything, nothing collapsed — style observations as nits
-  // Strictness is not tone: how findings are worded lives in the
-  // instruction document, not here.
   strictness: "medium",
 
-  // The review's strategy, orthogonal to strictness. "standard" (the
-  // default) reviews normally; "adversarial" tells the reviewer to treat
-  // its candidate findings as hypotheses pending verification. It shapes
-  // how the model reviews — never what the contract enforces.
-  strategy: "standard",
+  // Paths the reviewer never reads — and never counts.
+  ignore: ["dist/**", "**/*.min.js"],
 
-  // The language findings are written in, as a BCP-47 tag.
-  language: "en",
-
-  // Paths the reviewer never reads, never comments on — and never counts:
-  // ignored files are dropped from the maxDiffLines basis too. The guard
-  // exists to bound reading effort, and an ignored file costs none.
-  ignore: ["pnpm-lock.yaml", "dist/**", "**/*.min.js"],
-
-  // A diff with more than this many counted lines is refused outright.
-  // A half-reviewed monster presented as a complete review is the worse
-  // failure, and this is how it is made impossible.
+  // A resource budget, not a PR-size rule. The count is additions plus
+  // deletions over the post-ignore universe; a diff past it is refused
+  // outright — red, recorded `refused`.
   maxDiffLines: 5000,
 
   // Path-scoped rubrics. `include` takes globs, and `!` negates within them.
-  // A rule's document is its name in the log, and it must exist on the
-  // resolved policy source — declaring a rule and leaving its file absent is
-  // a startup error. Only the convention paths under `instructions` are
-  // optional; a declared rule is required.
   rules: [
     {
       include: ["src/**/*.ts", "!src/generated/**"],
-      instruction: ".github/action-agents/review/rules/typescript.md",
+      instruction: "rules/typescript.md",
     },
   ],
 
-  // Whether review applies to a pull request at all — the applicability
-  // axis. Absent, the key is off entirely and nothing else changes. `bots`
-  // allowlists the logins that classify as automation (exact bytes);
-  // `rules` are first-match-wins: pin a context, declare conjunctive
-  // `when` conditions, and whether review runs. `run: false` must pin a
-  // context and that context is never `external`. A rule may also declare
-  // a non-standard `posture` with its instruction document — a
-  // non-`external` context only — and an `intensity` strictness override:
-  // lowering anchors to a non-`external` context, deepening is free. See
-  // [the applicability axis](#the-applicability-axis), [the posture
-  // axis](#the-posture-axis) and [the intensity axis](#the-intensity-axis).
   applicability: {
-    bots: ["ecoma-io", "renovate[bot]"],
+    bots: ["renovate[bot]"],
     rules: [
       {
-        id: "release-prs",
-        context: "automation",
-        when: { title: "^chore\\(release\\)", branch: "^release/" },
+        // An explicit eligibility decision, never a reclassification of
+        // the budget: this consumer intentionally will not review pull
+        // requests past this many pre-ignore changed lines. It reads the
+        // pre-ignore totals; the budget counts the post-ignore universe.
+        // A diff past the budget that this rule does not catch is refused
+        // (red) as capacity — never silently skipped.
+        id: "no-large-external",
+        when: { changes: { lines: { gt: 8000 } } },
         run: false,
       },
       {
@@ -365,14 +476,15 @@ file alone.
         context: "maintainer",
         when: { paths: ["docs/**"] },
         posture: "maintainer",
-        instruction: ".github/action-agents/review/postures/docs.md",
+        instruction: "postures/docs.md",
         intensity: { strictness: "low" },
+      },
     ],
   },
 
   // Prose, pointed at rather than embedded; this path is the default.
   instructions: {
-    instruction: ".github/action-agents/review/instruction.md",
+    instruction: "instruction.md",
   },
 }
 ```
@@ -442,8 +554,9 @@ naming the counted total and the excluded remainder. The split is
 deterministic: files accumulate in ascending path order — byte-wise, UTF-8
 byte order, the only collation this document means wherever it says "sorted" —
 until the budget breaks; that file and everything after it in that order is
-the remainder. A half-reviewed diff presented as a complete review is
-refused, not truncated.
+the remainder. The refusal happens before any file is read — nothing is
+half-reviewed, and the refusal is never reclassified into an eligibility
+skip (see [the semantics are frozen](../run-contract.md#the-semantics-are-frozen)).
 
 Each non-ignored changed file's patch enters the prompt as its own evidence
 block, capped at 64 KiB like any tool result. Where GitHub supplies no patch —
@@ -538,6 +651,7 @@ a ceiling an input could raise is a preference, not a ceiling:
 | findings per review             | 50                      | the answer declares more                                             |
 | message length                  | 1000 chars              | sanitiser truncation, visible                                        |
 | summary length                  | 300 chars               | sanitiser truncation, visible                                        |
+| pull request description        | 8 KiB                   | the description's evidence block is cut, marked (#527)               |
 | initial prompt budget           | half the context window | the assembled prompt would exceed it                                 |
 | verifier tool calls per finding | 40                      | the verifier's own loop has executed 40 calls for one finding        |
 | verifier evidence per finding   | 128 KiB                 | one finding's wrapped verifier results have carried 128 KiB in total |
@@ -548,7 +662,10 @@ counts it. Before the first model call, the fully assembled messages are
 estimated (see [the loop](#the-loop-and-the-prompt) for the estimator) and a
 prompt past half the configured window is refused, red, with the estimate
 named — a review that cannot fit is refused, not silently truncated into a
-smaller-looking one.
+smaller-looking one. The estimate counts what the run sends and nothing
+else: the documents, the diff patches, the title and the description's
+bounded excerpt. It is a function of the review's subject — the thread's
+comments never enter it (#527).
 
 Reaching the tool-call or cumulative-evidence ceiling ends the reading phase
 exactly as reaching `max-turns` does: the loop makes one finalisation request
@@ -567,8 +684,9 @@ Assembled in one order, then extended as the loop runs:
 2  custom    the instruction document, if it exists
 3  rules     every rule whose include matches a changed file, its document,
              in config order
-4  evidence  the pull request's title and body, the per-file diff patches,
-             then, as the loop runs, each tool result
+4  evidence  the pull request's title, its description cut and marked past
+             8 KiB (#527), the per-file diff patches, then, as the loop
+             runs, each tool result
 ```
 
 The tiers map onto the protocol's three roles exactly once, so no implementer
@@ -599,6 +717,14 @@ instruction tier — not in the system message, however convenient that would
 be. The repository's name and description are maintainer-set configuration and
 stay in the system message.
 
+The description is bounded on top of that, because it is conversation, not
+the review's subject (#527): it rides whole up to 8 KiB — the same ceiling an
+instruction document lives under — and past that it is cut and marked inside
+its evidence block. A thread that grows cannot grow the fit estimate; the
+diff and the documents decide fit. The thread's comments never enter any
+prompt at all — the only comment bytes a run reads are the marker's own
+record block, after the loop, for reconciliation.
+
 One turn is one model response, and the accounting is exact:
 
 - a response carrying tool calls is a reading turn; executing its calls never
@@ -611,15 +737,38 @@ One turn is one model response, and the accounting is exact:
   partial, bound named;
 - the same finalisation request ends the loop when the tool-call or evidence
   ceiling fires first;
-- a response carrying no tool calls while reading turns remain is a natural
-  stop: its content is the final-answer candidate, and the review will be
-  complete if the candidate validates and — at strictness `high` — the
-  coverage ledger shows every changed file read;
+- a response carrying no tool calls while changed files are still unread is
+  heard once before it is accepted: the loop sends **one** corrective user
+  message — the uncovered list the coverage ledger computed over the expected
+  set, never the model's self-report, paths only — with the phase's tools
+  offered again for another round. A single once-guard fires it at most one
+  time per run; a second natural stop is accepted wherever coverage then
+  stands; a bound exit never reaches this arm, so a budget-ended run ends
+  incomplete exactly as before. The message is effort, not verdict: a run
+  still incomplete after it records `fail`
+  ([Coverage accounting](#coverage-accounting));
+- a response carrying no tool calls while reading turns remain — the notice
+  above having had its one hearing, or coverage standing complete — is a
+  natural stop: its content is the final-answer candidate, and the review
+  will be complete if the candidate validates and — at strictness `high` —
+  the coverage ledger shows every changed file read;
 - a structurally invalid candidate on the natural-stop path gets **one**
   re-ask — same transcript, corrective instruction, tools withheld, logged.
   The re-ask is not a reading turn and cannot itself call tools; failing it is
   red. No re-ask follows a bound-driven finalisation — that request already
-  was the second chance.
+  was the second chance. Exactly one defect class earns one ask beyond that
+  (#516): a re-asked answer whose defect is still that it holds no JSON
+  object — no object to judge, not an object the run then disagreed with — is
+  asked once more behind a 20-second backoff (`UNUSABLE_ANSWER_BACKOFF_MS`,
+  slept through the injected `io.sleep`, a recorded no-op in tests), because
+  the class is empirically a transient provider flake a job re-run has always
+  recovered, and the run recovers it itself instead of billing a human the
+  re-run. A shaped defect — a missing key, a wrong shape — is deliberately
+  not retried: a third ask does not teach the model the contract, so the
+  first re-ask stays the shaped classes' whole corrective budget. The refusal
+  names its own count — three times on the retried path, twice otherwise —
+  and only the no-JSON refusal raises the `UnusableAnswerRefusalError`
+  subclass, which [the red boundary](#the-red-boundary) reads.
 
 The transcript is compacted before `context-window` is reached — when the
 token estimate crosses 80% of the window — deterministically, in code: the
@@ -683,7 +832,8 @@ cannot claim it examined — at `high` the coverage gate refuses.
 and uncovered; nothing the model wrote — summary, findings, self-assessment
 — enters the computation.
 
-The verdict is strictness's to set, and strictness is the maintainer's:
+The complete-or-partial posture is strictness's to set, and strictness is
+the maintainer's:
 
 - at `high`, the expectation is the whole diff. Any unread changed file ends
   the review **PARTIAL**, the banner naming the gap ("N of M changed files
@@ -693,6 +843,14 @@ The verdict is strictness's to set, and strictness is the maintainer's:
 - at `low` and `medium`, coverage never blocks completion. The accounting
   still runs, and the count line rides in the comment, so a maintainer can
   see how much of the diff the reviewer actually opened.
+
+Whatever the strictness, the published record's verdict is code law:
+`mayPublish && coverageComplete` — a review that publishes with unread files
+records `fail`, whatever posture its comment carries. The verdict is a
+recording, never an enforcement
+([ADR 006](../adr/006-code-scanning-merge-enforcement.md)): it lands in the
+canonical record, the comment's record block and the run artifact, and no
+surface of review blocks a merge with it.
 
 A bound and a coverage gap compose the way everything else here does: the
 bound ends the review partial as before, and the examination count in the
@@ -791,7 +949,9 @@ rendering, on the defanged copy.
 
 If the final answer is structurally invalid — unparsable, wrong shape, unknown
 keys — the loop follows the re-ask rule of [the loop](#the-loop-and-the-prompt):
-one corrective request, tools withheld, logged; failing it, red. A provider
+one corrective request, tools withheld, logged — and, when the defect is that
+the answer holds no JSON object at all, the one bounded retry behind backoff
+(#516); failing those, red. A provider
 that keeps failing the contract is not something to hide behind a green check.
 
 ## Evidence provenance
@@ -974,9 +1134,11 @@ Every run ends in exactly one of three states:
 - **FAILED** — provider failure, invalid configuration, a pull request past
   the changed-file ceiling, a prompt past the initial budget, a broken
   conversation protocol, or a persistently malformed final answer — any
-  unrecoverable error. Write nothing. The previous complete review, if one
-  exists, stays exactly as it is — a failed re-review must never destroy the
-  last known-good record.
+  unrecoverable error. Write nothing to the repository. The previous complete
+  review, if one exists, stays exactly as it is — a failed re-review must
+  never destroy the last known-good record. The run's own account still
+  lands: a red exit leaves its one artifact behind (see
+  [the red boundary](#the-red-boundary)).
 
 One window exists where a published review can end without its artifact: the
 artifact file is written after the comment is upserted, and a write that
@@ -999,7 +1161,8 @@ two racing runs cannot clobber each other, and the loser walks away.
 Identity rules for that upsert, stated because a naive reading of "find my
 comment" deletes other people's words: a candidate is a comment carrying this
 action's marker **and** authored by the identity the workflow's token writes
-as — resolved from the API (`GET /user`) at the moment of writing, which is
+as — resolved from the API at the moment of writing (`GET /user`, or the
+GraphQL viewer for the installation tokens the endpoint refuses), which is
 `github-actions[bot]` under `GITHUB_TOKEN` and the app's bot login under an
 App token, never the triggering user. A maintainer who quotes the review copies the marker
 into their own comment; that quote is never updated and never deleted — it is
@@ -1074,8 +1237,8 @@ contract a human reads; both are projections of the same final facts, and
 neither can drift from the other, because both are built from the same
 values in the same pass.
 
-The schema is versioned (`schemaVersion: 2`; `3` once a run carries an
-applicability fact, and the two never mix in one record) and the builder is
+The schema is versioned (`schemaVersion: 5`; `6` once a run carries an
+applicability fact, and the shapes never mix in one record) and the builder is
 fail-closed:
 a fact outside the declared key sets, a vocabulary word the code does not
 declare (`severity`, `verdict`, lifecycle state, gate name, risk level,
@@ -1083,19 +1246,19 @@ attention lane, phase name), a gate table that is not the declared gates in
 the declared order, or a verdict whose lifecycle does not follow from it is
 a typed `ArtifactError`, never a coerced field. The fields:
 
-| Field                                  | Carries                                                                                                                                                                                  |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `repository`, `pullRequest`, `headRef` | what was reviewed, the head as a 40-character hex sha                                                                                                                                    |
-| `outcome`                              | `published` and the same reason string the run logs                                                                                                                                      |
-| `policy`                               | the strictness and strategy the run ran under                                                                                                                                            |
-| `risk`                                 | the per-file risk table, byte-wise sorted, one row per changed file                                                                                                                      |
-| `findings`                             | the published set — each with its identity, anchor line, and `provenance` naming the recorded read that covers it                                                                        |
-| `verification`                         | the gate's outcome plus one entry per bound verdict, derived from the findings — a separate verdict list that could disagree does not exist                                              |
-| `gates`                                | every declared gate's result, in the declared order, a reason iff it failed                                                                                                              |
-| `coverage`                             | the read/unread partition of the expected set, byte-wise sorted                                                                                                                          |
-| `phases`                               | the loop's phase transitions, in order                                                                                                                                                   |
-| `provenance`                           | the marker comment's id — nothing else, no timestamp, no run id                                                                                                                          |
-| `applicability`                        | schema version 3 only — the derived context, its inputs, the decision and what decided it, the posture and the resolved intensity; see [the applicability axis](#the-applicability-axis) |
+| Field                                  | Carries                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `repository`, `pullRequest`, `headRef` | what was reviewed, the head as a 40-character hex sha                                                                                                                                                                                                                                                                                      |
+| `outcome`                              | `published` and the same reason string the run logs                                                                                                                                                                                                                                                                                        |
+| `policy`                               | the strictness and strategy the run ran under                                                                                                                                                                                                                                                                                              |
+| `risk`                                 | the per-file risk table, byte-wise sorted, one row per changed file                                                                                                                                                                                                                                                                        |
+| `findings`                             | the published set — each with its identity, anchor line, and `provenance` naming the recorded read that covers it, its sha256 carrying the content those coordinates held                                                                                                                                                                  |
+| `verification`                         | the gate's outcome plus one entry per bound verdict, derived from the findings — each bound verdict also carries `evidence: {digest, excerpt}`, the sha256 of the exact window the verifier judged plus its retention excerpt, sanitiser-stripped and capped at 300 characters; a separate verdict list that could disagree does not exist |
+| `gates`                                | every declared gate's result, in the declared order, a reason iff it failed                                                                                                                                                                                                                                                                |
+| `coverage`                             | the read/unread partition of the expected set, byte-wise sorted                                                                                                                                                                                                                                                                            |
+| `phases`                               | the loop's phase transitions, in order                                                                                                                                                                                                                                                                                                     |
+| `provenance`                           | the marker comment's id and, when the policy was active, the execution context — no timestamp, no run id                                                                                                                                                                                                                                   |
+| `applicability`                        | schema version 6 only, the applicability family's version — the derived context, its inputs, the decision and what decided it, the posture and the resolved intensity; see [the applicability axis](#the-applicability-axis)                                                                                                               |
 
 Byte-determinism is a property, not a style: identical facts serialise to
 identical bytes (`serialiseArtifact`), so two runs of the same review differ
@@ -1109,11 +1272,16 @@ strategy's threshold was never a candidate and publishes without a
 lifecycle, byte for byte as it arrived. A skipped candidate is unresolved
 with no id — the one state a finding can hold without one.
 
-Publication-only, and stale-refusing twice. A run that publishes nothing —
-`nothing-to-review`, an abandonment, a dry run — writes no artifact; a skip
-writes nothing but its log line when no policy is present, and the reduced
-skipped-run record when one is (see [the applicability
-axis](#the-applicability-axis)), the newer-head rule extends to the record:
+Every returning run leaves its record, and the build is stale-refusing twice.
+Publication writes the full artifact; an abandonment and a dry run write
+their reduced artifacts — the run identity and the outcome sentence, plus the
+comment id when a comment stands; a skip always leaves a record (see
+[what a skip leaves behind](#what-a-skip-leaves-behind)): the reduced
+skipped-run record when a policy is present, a `kind`-carrying skip record
+otherwise; and a run that ends red leaves its one artifact at the boundary
+rather than the builder's (see [the red boundary](#the-red-boundary)) —
+the two carve-outs below are the only exits that write nothing. The newer-head
+rule extends to every declared record:
 `assertFreshArtifact` compares
 the artifact's head against a forge read taken before the comment exists, so
 a refusal there writes nothing at all, and again against a second read taken
@@ -1125,11 +1293,80 @@ pull request has already left.
 The write is confined like every read. The `artifact-path` input (default
 `.review-artifact`) is resolved inside `GITHUB_WORKSPACE` or refused; `.git`
 is refused outright; a symlinked branch of the tree cannot carry the write
-out. The file is named `review-artifact-<head sha>.json`. The shipped
-workflow uploads it with `actions/upload-artifact` after the review step,
-`if: always()` so a failed comment step still leaves its record, and
-`if-no-files-found: ignore` because an unpublished run has no file — the
-upload notifies nobody and grants nothing.
+out. The file is named `review-artifact-<head sha>.json`; a skip record is
+named `review-artifact-skip-<head sha>.json`; the abandonment, dry-run and
+red terminals carry their own prefixes — `review-artifact-abandoned-`,
+`review-artifact-dry-run-`, `review-artifact-refused-`,
+`review-artifact-failed-` — so a consumer reading the directory knows the
+outcome before opening a file, and a red run that died before the snapshot
+read writes `no-head` in the sha's place. The shipped workflow uploads
+the exact file the run declared — the `artifact-file` output, set on every
+declared write, a red run's refused/failed record included — never a glob —
+with `actions/upload-artifact` after the review step,
+`if: always() && steps.review.outputs.artifact-file != ''` — `always()` so a
+failed comment step still leaves its record, the non-empty check so a
+terminal that declares no record skips the upload silently instead of
+failing on an empty path — `include-hidden-files: true`
+because the record directory is hidden by design and upload-artifact prunes
+hidden files by default (#378), and `if-no-files-found: warn` because the
+carve-outs — a death before the run holds the facts an artifact is built
+from, and a failed artifact write itself — leave no file, and a declared
+write that lands nowhere must be loud, not green over nothing. The upload
+notifies nobody and grants nothing.
+
+### The red boundary
+
+The twin of harmonise's boundary (#347, #355): a run that ends red — any
+throw out of `reviewPullRequest` — still leaves its one artifact, and then
+the original error still fails the step; the record never masks the throw it
+records. `run` in `src/index.mjs` holds the boundary, and it writes exactly
+one of two shapes:
+
+- `refused` — the throw carries the typed `DeterministicRefusalError`
+  (`src/refusal.mjs`), the class of the run's own ceilings declining to act:
+  a config that does not validate (F-02), the diff-line budget and the
+  prompt-headroom ceiling (F-11), and the failed output contract (F-09) —
+  twice-failed on a shaped defect, three-times-failed on the no-JSON class
+  after its one bounded retry (#516). Every one of these fires before the
+  first repository write, so a
+  `refused` record can never name a comment. One refusal publishes a
+  caller-facing cue beside its record (#516): a throw carrying the
+  `UnusableAnswerRefusalError` subclass — the provider's final answer held
+  no JSON object on every attempt, the transient class a job re-run
+  recovers — sets the `refusal-class` output to `model-output-unusable`, so
+  a consumer branches on the step output to re-run mechanically instead of
+  reading run logs; the output is unset on every other terminal, green or
+  red, so an empty value never reads as a lost record.
+- `failed` — every other undeclared throw: transport and auth, a policy
+  resolution that fails (F-03), a reader-level config refusal, an absent or
+  oversized posture document (the loader's own plain error — the posture
+  failures a consumer actually sees), and the loop's coverage-accounting and
+  gate-table invariants. The orchestrator's map-miss guard beside the loader
+  ("a posture document that did not survive loading") is not a reachable
+  refusal: the loader reads every declared posture instruction as required,
+  so the guard stands as an internal invariant in F-15's tier, kept for the
+  day a code path breaks that promise. The boundary pins F-15 — an internal
+  unknown is recorded as itself, never smoothed into a refusal.
+
+The record is the reduced family's shape with an `outcome` of
+`{ classification, reason }`. The reason is the thrown error's own sentence,
+flattened to one line and passed through the comment sanitiser under the
+red record's declared cap of 300 characters — the one review reason that
+interpolates a thrown message, and a thrown message can interpolate
+repository text, so it enters the record only through the sanitiser (I14,
+I16). The facts the boundary can still name it does: the head when the
+snapshot read landed (null, `no-head`, when it did not), the comment id when
+the comment was already published — only a `failed` record carries one, and
+the run's account then says so — and the applicability context when it was
+derived. The boundary never re-reads the forge to check freshness: it records
+the run as the run died, from the facts it died holding.
+
+Two carve-outs stay unrecorded, both deliberately. A throw before the
+boundary — the event read — is a death before the run holds any fact an
+artifact is built from, and inventing them would be worse than the silence.
+And a failure of the record write itself is a logged loss, never a
+replacement error: the red run stays red for its own reason (F-14 — the
+write site's tier, not the boundary's to overrule).
 
 ## Dry run
 
@@ -1144,8 +1381,8 @@ side: the same snapshot checks, the same ceilings, the same validation.
 - a pull request with zero changed files, or every changed file ignored →
   the model is never invoked; an existing marker comment is updated to a
   deterministic "Nothing to review." body so stale findings do not outlive
-  their own relevance, and with no marker present it is a green run and a log
-  line;
+  their own relevance, and with no marker present it is a green run, a log
+  line and a `nothing-to-review` skip record;
 - `maxDiffLines` exceeded, or the assembled prompt past its budget → a red
   refusal naming the counted total, or the estimate;
 - more changed files than GitHub's 3000-file listing ceiling → red refusal,
@@ -1164,7 +1401,9 @@ a config that does not validate — red, not green-on-nothing. Startup
 validation precedes the first model call. A finding refused for being
 off-vocabulary or off-snapshot is logged with the finding that produced it. A
 failed run never deletes and never overwrites: the last complete review
-survives every failure that comes after it.
+survives every failure that comes after it. And a red exit still leaves its
+one artifact behind — `refused` or `failed`, at
+[the red boundary](#the-red-boundary) — before the error fails the step.
 
 ## What `review` never does
 

@@ -9,8 +9,11 @@ import { tmpdir } from "node:os";
 import * as p from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { reviewPullRequest } from "./run.mjs";
 import { applicabilityArtifactSchemaVersion, serialiseArtifact } from "./artifact.mjs";
+import { reviewPullRequest, UNUSABLE_ANSWER_BACKOFF_MS } from "./run.mjs";
+import { contentDigest } from "./digest.mjs";
+import { OwnLoginsError } from "#core/comment.mjs";
+import { ChatError } from "#core/chat.mjs";
 import {
   DOGFOOD_CONFIG,
   DOGFOOD_INTENSITY_CONFIG,
@@ -22,10 +25,15 @@ import {
   RELEASE_AUTOMATION,
 } from "./applicability.fixtures.mjs";
 import { findingIdentity } from "./answer.mjs";
+import { createCanonicalResult } from "./canonical.mjs";
+import { embedRecordBlock, parseRecordBlock } from "./record.mjs";
+import { toSarif } from "./sarif.mjs";
 import { VERIFIER_MAX_EVIDENCE_BYTES, VERIFIER_MAX_TOOL_CALLS } from "./verify.mjs";
 
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
+/** The captured bytes of `src/a.mjs` as the workspace fixture writes them. */
+const A_CONTENT = "line1\nline2\nline3\n";
 
 /** A real checked-out-looking root: anchors count lines against this copy. */
 /** @type {string} */
@@ -34,7 +42,7 @@ let wsRoot;
 beforeAll(() => {
   wsRoot = mkdtempSync(p.join(tmpdir(), "run-test-ws-"));
   mkdirSync(p.join(wsRoot, "src"));
-  writeFileSync(p.join(wsRoot, "src", "a.mjs"), "line1\nline2\nline3\n");
+  writeFileSync(p.join(wsRoot, "src", "a.mjs"), A_CONTENT);
   writeFileSync(p.join(wsRoot, "src", "b.mjs"), "b1\nb2\nb3\n");
   mkdirSync(p.join(wsRoot, "lib"));
   writeFileSync(p.join(wsRoot, "lib", "new.mjs"), "moved\n");
@@ -54,6 +62,7 @@ function snapshot(over = {}) {
     body: "",
     mergeable: true,
     mergeableState: "clean",
+    labels: [],
     head: { ref: "feature", sha: HEAD },
     base: { ref: "main", sha: BASE },
     ...over,
@@ -89,7 +98,6 @@ function forgeStub(options = {}) {
       if (branch !== "main") throw new Error(`unexpected ref lookup '${branch}'`);
       return { sha: "7".repeat(40) };
     },
-    /** @param {string} path */
     /** @param {string} path @returns {Promise<{ content: string } | null>} */
     async getContents(path) {
       if (options.documents !== undefined && options.documents[path] !== undefined) {
@@ -149,7 +157,7 @@ function chatStub(finalAnswer) {
       return {
         content:
           finalAnswer ??
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
         toolCalls: [],
         finishReason: "stop",
       };
@@ -206,13 +214,15 @@ function capturingChat(finalAnswer) {
 /**
  * @param {import("./run.mjs").ReviewForge} forge
  * @param {import("#core/chat.mjs").Chat} [chat]
+ * @param {(ms: number) => Promise<void>} [sleep] records the backoff fact; never a real timer (the e2e law: no sleeps)
  * @returns {import("./run.mjs").Io}
  */
-function io(forge, chat = chatStub()) {
+function io(forge, chat = chatStub(), sleep = async () => {}) {
   return {
     forge,
     chat,
     now: () => 1_000,
+    sleep,
     info: () => undefined,
   };
 }
@@ -223,6 +233,7 @@ const INPUTS = {
   contextWindow: 128_000,
   dryRun: false,
   configPath: "",
+  architectureReport: "",
 };
 const CONTEXT = { owner: "acme", repo: "widgets", workspace: "" }; // set in beforeAll
 
@@ -286,6 +297,16 @@ describe("the universe and the budget", () => {
     expect(cleared.outcome).toBe("nothing-to-review");
     expect(withMarker.calls.upserts[0]?.id).toBe(55);
     expect(withMarker.calls.upserts[0]?.body).toContain("Nothing to review");
+    // The clearing upsert is a guarded one: it records the head it read so a
+    // concurrent run at a newer head refuses rather than overwrites it.
+    expect(withMarker.calls.upserts[0]?.body).toContain(`head=${HEAD}`);
+    const clearedRecord = JSON.parse(serialiseArtifact(/** @type {any} */ (cleared.artifact)));
+    expect(clearedRecord.kind).toBe("nothing-to-review");
+    expect(clearedRecord.schemaVersion).toBe(applicabilityArtifactSchemaVersion);
+    expect(clearedRecord.outcome).toEqual({
+      classification: "skip",
+      reason: "universe empty — marker cleared",
+    });
 
     const bare = forgeStub({ files: [] });
     const skipped = await reviewPullRequest({
@@ -299,6 +320,51 @@ describe("the universe and the budget", () => {
     expect(skipped.outcome).toBe("skip");
     expect(skipped.reason).toBe("universe empty and no prior review comment — nothing to do");
     expect(bare.calls.upserts).toHaveLength(0);
+    const skippedRecord = JSON.parse(serialiseArtifact(/** @type {any} */ (skipped.artifact)));
+    expect(skippedRecord.kind).toBe("nothing-to-review");
+    expect(skippedRecord.outcome.classification).toBe("skip");
+  });
+
+  it("suppresses a nothing-to-review record under dry-run — the dry-run artifact is the record", async () => {
+    const withMarker = forgeStub({ files: [] });
+    withMarker.listComments = async () => [
+      {
+        id: 55,
+        body: `<!-- action-agents:review:0badcafe -->old findings`,
+        user: { login: "github-actions[bot]" },
+        created_at: "",
+        updated_at: "",
+      },
+    ];
+    const dryCleared = await reviewPullRequest({
+      inputs: { ...INPUTS, dryRun: true },
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(withMarker),
+    });
+    expect(dryCleared.outcome).toBe("dry-run");
+    // The skip record is suppressed — the clearing update never happens —
+    // but the dry-run artifact is the run's whole record: it names the head
+    // and the outcome without the skip record's kind.
+    const dryClearedRecord = JSON.parse(
+      serialiseArtifact(/** @type {any} */ (dryCleared.artifact)),
+    );
+    expect(dryClearedRecord.outcome.classification).toBe("dry-run");
+    expect(dryClearedRecord.kind).toBeUndefined();
+
+    const bare = forgeStub({ files: [] });
+    const drySkipped = await reviewPullRequest({
+      inputs: { ...INPUTS, dryRun: true },
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(bare),
+    });
+    expect(drySkipped.outcome).toBe("skip");
+    expect(drySkipped.artifact).toBeUndefined();
   });
 
   it("abandons a nothing-to-review run when the pull request moved — no comment written", async () => {
@@ -319,6 +385,43 @@ describe("the universe and the budget", () => {
     expect(result.outcome).toBe("abandoned");
     expect(result.reason).toBe("#7 moved while it was being reviewed — nothing written");
     expect(forge.calls.upserts).toHaveLength(0);
+  });
+
+  it("abandons when the clearing write loses the newer-head race — no marker-cleared record", async () => {
+    const withMarker = forgeStub({ files: [] });
+    withMarker.listComments = async () => [
+      {
+        id: 55,
+        body: `<!-- action-agents:review:0badcafe:head=${"c".repeat(40)} -->raced findings`,
+        user: { login: "github-actions[bot]" },
+        created_at: "2026-07-01T00:00:00Z",
+        updated_at: "2026-07-01T12:00:00Z",
+      },
+    ];
+    const raced = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(withMarker),
+    });
+    // A concurrent run recorded a newer head after this run started: the
+    // clearing write is refused, and the run ends abandoned — never a
+    // "marker cleared" skip, because the marker stands, owned by the run
+    // that won the thread.
+    expect(raced.outcome).toBe("abandoned");
+    expect(raced.reason).toContain("concurrent");
+    expect(raced.reason).not.toContain("marker cleared");
+    expect(withMarker.calls.upserts).toHaveLength(0);
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (raced.artifact)));
+    expect(record.outcome.classification).toBe("abandoned");
+    // No skip record: the clearing never landed, so the record is the
+    // abandoned shape and carries no skip kind.
+    expect(record.kind).toBeUndefined();
+    // Pre-write abandonment: a foreign comment stands on the thread, and
+    // the provenance still names none of them.
+    expect(record.provenance).toBeUndefined();
   });
 
   it("refuses diffs past the budget, red, naming both numbers — before any model call", async () => {
@@ -352,7 +455,7 @@ describe("publication", () => {
       },
       {
         content:
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
       },
     ]);
     const result = await reviewPullRequest({
@@ -426,7 +529,13 @@ describe("dry run", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat: chatStub(), now: () => 0, info: (m) => logged.push(m) },
+      io: {
+        sleep: async () => {},
+        forge,
+        chat: chatStub(),
+        now: () => 0,
+        info: (m) => logged.push(m),
+      },
     });
     expect(result.outcome).toBe("dry-run");
     expect(forge.calls.upserts).toHaveLength(0);
@@ -436,8 +545,8 @@ describe("dry run", () => {
 
 describe("strictness policy and strategy", () => {
   const MIXED_ANSWER =
-    '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
-    '{"severity":"nit","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"mixed"}';
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
+    '{"severity":"nit","kind":"style","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"mixed"}';
 
   it("at low, nits leave the published set: concerns only, each drop logged", async () => {
     /** @type {string[]} */
@@ -456,7 +565,7 @@ describe("strictness policy and strategy", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     const body = forge.calls.upserts[0]?.body ?? "";
@@ -467,6 +576,54 @@ describe("strictness policy and strategy", () => {
     // The drop log names the finding it dropped, not just the fact of a
     // drop: dropping the wrong nit must fail here.
     expect(logged).toContain("review: nit dropped at low strictness — src/a.mjs:1 style nit");
+  });
+
+  it("flattens control characters on the drop log, so a raw message cannot forge a runner workflow command", async () => {
+    // A hostile message embeds a line break so the `::add-mask::` would land
+    // on its own log line, where the runner would interpret it as a command
+    // this repository never wrote. The oneLine collapse turns the whole
+    // message into a single uninterpretable line.
+    const forgedMessage = "lurking\n::add-mask::5up3rs3cr3t";
+    const chat = readingChat([
+      {
+        content: "",
+        toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
+      },
+      {
+        content: JSON.stringify({
+          findings: [
+            { severity: "nit", kind: "style", file: "src/a.mjs", line: 1, message: "style nit" },
+            {
+              severity: "nit",
+              kind: "style",
+              file: "src/a.mjs",
+              line: 1,
+              message: forgedMessage,
+            },
+          ],
+          summary: "two nits",
+        }),
+      },
+    ]);
+    /** @type {string[]} */
+    const logged = [];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: {
+        sleep: async () => {},
+        forge: forgeStub({ config: '{ strictness: "low" }' }),
+        chat,
+        now: () => 0,
+        info: (m) => logged.push(m),
+      },
+    });
+    expect(result.outcome).toBe("published");
+    expect(logged.some((line) => line.startsWith("::add-mask::"))).toBe(false);
+    expect(logged).not.toContain("::add-mask::5up3rs3cr3t");
   });
 
   it("at medium the same answer keeps its nit, and absent strategy equals explicit standard byte for byte", async () => {
@@ -531,18 +688,21 @@ describe("strictness policy and strategy", () => {
       io: io(forgeStub({ config: '{ strictness: "high", strategy: "adversarial" }' }), chat),
     });
     expect(result.outcome).toBe("published");
-    expect(requests).toHaveLength(1);
+    // The answer-at-once stop left the changed file unread, so the loop sent
+    // its one notice and asked again — the system message is requests[0] either way.
+    expect(requests).toHaveLength(2);
     const system = requests[0]?.messages?.find((message) => message.role === "system")?.content;
     expect(system).toContain('strictness "high"');
     expect(system).toContain('Review strategy — "adversarial"');
     expect(system).toContain("hypotheses pending");
   });
 });
-
 describe("failure posture", () => {
-  it("fails red on a twice-invalid final answer and writes nothing", async () => {
+  it("fails red on a thrice-invalid no-JSON final answer, backoff once, and writes nothing", async () => {
     const forge = forgeStub();
     const bad = chatStub("this is prose, not JSON");
+    /** @type {number[]} */
+    const backoffs = [];
     await expect(
       reviewPullRequest({
         inputs: INPUTS,
@@ -550,10 +710,92 @@ describe("failure posture", () => {
         pullRequestNumber: 7,
         eventName: "pull_request",
         event: EVENT,
-        io: io(forge, bad),
+        io: io(forge, bad, async (ms) => void backoffs.push(ms)),
+      }),
+    ).rejects.toThrow(/failed the output contract three times/);
+    // The bounded retry fired exactly once, with the run's own constant —
+    // a second backoff would mean the retry policy is unbounded (#516).
+    expect(backoffs).toEqual([UNUSABLE_ANSWER_BACKOFF_MS]);
+    expect(forge.calls.upserts).toHaveLength(0);
+  });
+
+  it("recovers a transient no-JSON final answer on the bounded retry and publishes", async () => {
+    const forge = forgeStub();
+    const flaky = readingChat([
+      { content: "this is prose, not JSON" },
+      { content: "still no JSON object here" },
+      { content: "and the re-ask held no JSON object either" },
+      {
+        content:
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
+      },
+    ]);
+    /** @type {number[]} */
+    const backoffs = [];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge, flaky, async (ms) => void backoffs.push(ms)),
+    });
+    expect(result.outcome).toBe("published");
+    expect(backoffs).toEqual([UNUSABLE_ANSWER_BACKOFF_MS]);
+    expect(forge.calls.upserts).toHaveLength(1);
+  });
+
+  it("does not spend a second re-ask on a shaped-but-invalid answer", async () => {
+    const forge = forgeStub();
+    // The finding holds no `kind` — the contract failed on a shape, not on
+    // the absence of an object. One re-ask is the whole corrective budget.
+    const shaped = chatStub(
+      '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"no kind"}],"summary":"shapeless"}',
+    );
+    /** @type {number[]} */
+    const backoffs = [];
+    await expect(
+      reviewPullRequest({
+        inputs: INPUTS,
+        context: CONTEXT,
+        pullRequestNumber: 7,
+        eventName: "pull_request",
+        event: EVENT,
+        io: io(forge, shaped, async (ms) => void backoffs.push(ms)),
       }),
     ).rejects.toThrow(/failed the output contract twice/);
+    expect(backoffs).toEqual([]);
     expect(forge.calls.upserts).toHaveLength(0);
+  });
+
+  it("drops an anchor past the file's last line individually — logged, never fatal", async () => {
+    const forge = forgeStub();
+    /** @type {string[]} */
+    const logged = [];
+    const bad = chatStub(
+      '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":999,' +
+        '"message":"off-by-one"}],"summary":"past the end"}',
+    );
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: { sleep: async () => {}, forge, chat: bad, now: () => 0, info: (m) => logged.push(m) },
+    });
+    // The answer contract's own law: an invalid finding drops individually,
+    // named in the log with the line that does not exist — the run itself
+    // survives and publishes the empty surviving set. No refusal: the
+    // capture boundary never even sees an anchor validation has rejected.
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings).toEqual([]);
+    expect(
+      logged.some(
+        (line) => line.includes("finding rejected") && line.includes("line 999 does not exist"),
+      ),
+    ).toBe(true);
+    expect(forge.calls.upserts).toHaveLength(1);
   });
 
   it("fails red when the prompt cannot fit half the window", async () => {
@@ -579,6 +821,74 @@ describe("failure posture", () => {
     expect(forge.calls.upserts).toHaveLength(0);
   });
 
+  it("keeps a fitting diff reviewable when the description grows past the window (#527)", async () => {
+    // The description is the one conversation input the assembled prompt
+    // carries; grown without bound it flipped a same-diff review from
+    // reviewable to refused. The bound (MAX_PR_BODY_BYTES) holds the
+    // estimate to the bounded body the run actually sends, so the diff —
+    // the review's subject — decides fit again. Same diff, same window,
+    // a grown description: reviewable.
+    const forge = forgeStub({
+      snapshotOverride: snapshot({ body: "review context line\n".repeat(9_000) }),
+    });
+    const result = await reviewPullRequest({
+      inputs: { ...INPUTS, contextWindow: 20_000 },
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge),
+    });
+    expect(result.outcome).toBe("published");
+    expect(forge.calls.upserts).toHaveLength(1);
+  });
+
+  it("a grown comment thread never moves the fit estimate (#527)", async () => {
+    // Comments are read once after the loop, for reconciliation, gated by
+    // the marker's own laws — no prompt byte ever carries them. A thread
+    // grown huge cannot flip a fitting diff into a refusal, and the
+    // bounded reconciliation read still happens (the own marker's record
+    // stays the load-bearing comment input).
+    const forge = forgeStub();
+    forge.listComments = async () => [
+      {
+        id: 91,
+        user: { login: "someone-else" },
+        created_at: "2026-09-12T16:00:00Z",
+        updated_at: "2026-09-12T16:00:00Z",
+        body: "foreign prose\n".repeat(20_000),
+      },
+      {
+        id: 92,
+        user: { login: "github-actions[bot]" },
+        created_at: "2026-09-12T16:30:00Z",
+        updated_at: "2026-09-12T16:30:00Z",
+        body: "an own comment with no marker — not this run's history",
+      },
+    ];
+    /** @type {string[]} */
+    const commentReads = [];
+    const listComments = forge.listComments.bind(forge);
+    forge.listComments = async (number) => {
+      commentReads.push(String(number));
+      return listComments(number);
+    };
+    const result = await reviewPullRequest({
+      inputs: { ...INPUTS, contextWindow: 20_000 },
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge),
+    });
+    expect(result.outcome).toBe("published");
+    // The thread is read post-loop only: once for reconciliation, once more
+    // inside the upsert's own marker search — never for the prompt.
+    expect(commentReads.length).toBeGreaterThanOrEqual(1);
+    expect(commentReads.every((read) => read === "7")).toBe(true);
+    expect(forge.calls.upserts).toHaveLength(1);
+  });
+
   it("re-asks once after a natural stop, then accepts the corrected answer", async () => {
     let asks = 0;
     const forge = forgeStub();
@@ -598,7 +908,13 @@ describe("failure posture", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat: /** @type {any} */ (chatty), now: () => 0, info: () => undefined },
+      io: {
+        sleep: async () => {},
+        forge,
+        chat: /** @type {any} */ (chatty),
+        now: () => 0,
+        info: () => undefined,
+      },
     });
     expect(asks).toBe(2);
     expect(result.outcome).toBe("published");
@@ -631,9 +947,7 @@ describe("comment identity", () => {
     expect(forge.calls.upserts[0]?.id).toBe(55);
   });
 
-  it("falls back to github-actions[bot] when the identity read fails and leaves the foreign marker alone", async () => {
-    /** @type {string[]} */
-    const logged = [];
+  it("red-runs when the identity read fails — an assumed identity would mis-claim the thread", async () => {
     const forge = forgeStub({ whoamiError: new Error("the token's identity read failed") });
     forge.listComments = async () => [
       {
@@ -645,20 +959,27 @@ describe("comment identity", () => {
       },
     ];
 
-    const result = await reviewPullRequest({
-      inputs: INPUTS,
-      context: CONTEXT,
-      pullRequestNumber: 7,
-      eventName: "pull_request",
-      event: EVENT,
-      io: { forge, chat: chatStub(), now: () => 1_000, info: (m) => logged.push(m) },
-    });
-
-    expect(result.outcome).toBe("published");
-    // Created fresh — the docs-bot comment is foreign under the fallback
-    // identity, and the upsert never claims what it did not author.
-    expect(forge.calls.upserts[0]?.id).toBeUndefined();
-    expect(logged.some((line) => line.includes("assuming github-actions[bot]"))).toBe(true);
+    // A guessed identity silently changes the write surface — under an App
+    // token the fallback read the action's own comment as somebody else's
+    // and duplicated it. The refusal is the bounded outcome, before any
+    // write; nothing is published on an identity the run could not establish.
+    await expect(
+      reviewPullRequest({
+        inputs: INPUTS,
+        context: CONTEXT,
+        pullRequestNumber: 7,
+        eventName: "pull_request",
+        event: EVENT,
+        io: {
+          sleep: async () => {},
+          forge,
+          chat: chatStub(),
+          now: () => 1_000,
+          info: () => undefined,
+        },
+      }),
+    ).rejects.toThrow(OwnLoginsError);
+    expect(forge.calls.upserts).toEqual([]);
   });
 });
 
@@ -744,6 +1065,9 @@ describe("coverage accounting and strict partial reviews", () => {
         ],
       },
       { content: '{"findings":[],"summary":"read both"}' },
+      // The notice's second stop: src/vanish.mjs is still unread, and the
+      // run ends partial exactly as the first stop would have ended it.
+      { content: '{"findings":[],"summary":"read both"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -758,6 +1082,57 @@ describe("coverage accounting and strict partial reviews", () => {
     expect(body).toContain("This review is partial");
     expect(body).toContain("1 of 2 changed files were never read: src/vanish.mjs.");
     expect(body).toContain("Changed files examined: 1/2.");
+  });
+
+  it("after the loop's uncovered-files notice, a still-incomplete run records verdict fail — never pass", async () => {
+    // #424 end to end: the notice names the unread file, the model stops
+    // anyway, and the verdict law is untouched — the incompleteness rides
+    // the verdict as fail, whatever the loop said along the way.
+    const forge = forgeStub({ files: TWO_FILES, config: '{ strictness: "high" }' });
+    let completeCalls = 0;
+    const chat = {
+      async complete() {
+        completeCalls++;
+        if (completeCalls === 1) {
+          return {
+            content: "",
+            toolCalls: [{ id: "c1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
+            finishReason: "tool_calls",
+          };
+        }
+        if (completeCalls === 2) {
+          return {
+            content: '{"findings":[],"summary":"stopped after one"}',
+            toolCalls: [],
+            finishReason: "stop",
+          };
+        }
+        return {
+          content: '{"findings":[],"summary":"still incomplete"}',
+          toolCalls: [],
+          finishReason: "stop",
+        };
+      },
+    };
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge, /** @type {any} */ (chat)),
+    });
+    expect(result.outcome).toBe("published");
+    // Three calls: the read turn, the first stop, and the notice's one
+    // re-ask with the tools back — then the stop was accepted.
+    expect(completeCalls).toBe(3);
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).toContain("This review is partial");
+    expect(body).toContain("1 of 2 changed files were never read: src/b.mjs.");
+    // The verdict law through the new path: incomplete coverage never
+    // records a pass, nudge or no nudge.
+    expect(result.canonical?.run).toMatchObject({ state: "published", verdict: "fail" });
+    expect(result.canonical?.run.verdict).not.toBe("pass");
   });
 
   it("a quarantine-only review never reads as clean — the withheld count rides instead", async () => {
@@ -1092,7 +1467,7 @@ describe("risk lanes", () => {
 
 describe("adversarial verification pass", () => {
   const CONCERN_ANSWER =
-    '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
   const READ =
     /** @type {{ content: string, toolCalls: { id: string, name: string, arguments: string }[] }} */ ({
       content: "",
@@ -1136,7 +1511,7 @@ describe("adversarial verification pass", () => {
   function answerWith(message, summary = "one concern") {
     return {
       content:
-        `{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":` +
+        `{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":` +
         `"${message}"}],"summary":"${summary}"}`,
     };
   }
@@ -1178,7 +1553,7 @@ describe("adversarial verification pass", () => {
     const chat = scriptedChat([
       READ,
       { content: CONCERN_ANSWER },
-      { content: '{"verdict":"refuted","reason":"the line is correct"}' },
+      { content: '{"verdict":"refuted","kind":"correctness","reason":"the line is correct"}' },
     ]);
     /** @type {string[]} */
     const logged = [];
@@ -1188,7 +1563,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     // A refuted finding still counts — it published, as refuted.
@@ -1211,13 +1586,151 @@ describe("adversarial verification pass", () => {
     expect(user?.content).toContain("[evidence:");
   });
 
+  it("binds the canonical record and a PASS verdict when only a refuted finding stands", async () => {
+    const forge = forgeStub();
+    const chat = scriptedChat([
+      READ,
+      { content: CONCERN_ANSWER },
+      { content: '{"verdict":"refuted","kind":"correctness","reason":"the line is correct"}' },
+    ]);
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => undefined },
+    });
+    expect(result.outcome).toBe("published");
+    const row = result.canonical?.findings[0];
+    expect(result.canonical?.head).toBe(HEAD);
+    expect(result.canonical?.run).toEqual({
+      state: "published",
+      verdict: "pass",
+      publication: "created",
+    });
+    expect(row).toMatchObject({
+      kind: "correctness",
+      file: "src/a.mjs",
+      line: 2,
+      lifecycle: "refuted",
+      subject: "line2",
+    });
+    expect(row?.evidence?.digest).toBe(contentDigest("line2"));
+    // Refuted findings stand in the record but never lower the verdict:
+    // the code law reads coverage and publication, not refutations.
+    expect(result.canonical?.run.verdict).toBe("pass");
+  });
+
+  it("a confirmed finding is the SARIF projection's input under the all-kinds default policy", async () => {
+    const forge = forgeStub();
+    const chat = scriptedChat([
+      READ,
+      { content: CONCERN_ANSWER },
+      { content: '{"verdict":"confirmed","kind":"correctness","reason":"the guard is real"}' },
+    ]);
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => undefined },
+    });
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings[0]).toMatchObject({ lifecycle: "confirmed" });
+    // A confirmed finding never moves the verdict — coverage and publication
+    // own it — but it is exactly what the SARIF projection reports, and the
+    // SARIF alert is the merge consequence's input now (ADR 006).
+    expect(result.canonical?.run.verdict).toBe("pass");
+    expect(toSarif(/** @type {any} */ (result).canonical).runs[0]?.results).toHaveLength(1);
+  });
+
+  it("an unresolved finding stays unresolved without moving the verdict — enforcement is not the run's", async () => {
+    const forge = forgeStub();
+    const chat = scriptedChat([
+      READ,
+      { content: CONCERN_ANSWER },
+      {
+        content:
+          '{"verdict":"uncertain","kind":"correctness","reason":"the excerpt alone cannot decide"}',
+      },
+    ]);
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => undefined },
+    });
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings[0]).toMatchObject({ lifecycle: "unresolved" });
+    // An unresolved finding stands in the record and the comment, never in
+    // the SARIF projection (results carry confirmed findings only) — and
+    // the verdict stays coverage-owned, never finding-owned.
+    expect(result.canonical?.run.verdict).toBe("pass");
+    expect(toSarif(/** @type {any} */ (result).canonical).runs[0]?.results ?? []).toEqual([]);
+  });
+
+  it("captures at the span gate — a checkout that shrinks during verification publishes the bytes the gate held", async () => {
+    const forge = forgeStub();
+    /** @type {import("#core/chat.mjs").ChatMessage[][]} */
+    const calls = [];
+    let turn = 0;
+    const chat = /** @type {import("#core/chat.mjs").Chat} */ ({
+      async complete() {
+        calls.push([]);
+        turn++;
+        // The checkout shrinks during the verification pass — after the
+        // span gate has already held the anchor's bytes. The capture
+        // boundary moved before verification (#479): the record carries
+        // the bytes the gate read, and the run is not refused.
+        if (turn === 3) {
+          writeFileSync(p.join(wsRoot, "src", "a.mjs"), "line1\n");
+        }
+        if (turn === 1) {
+          return { content: "", toolCalls: READ.toolCalls, finishReason: "tool_calls" };
+        }
+        if (turn === 2) {
+          return { content: CONCERN_ANSWER, toolCalls: [], finishReason: "stop" };
+        }
+        return {
+          content: '{"verdict":"confirmed","kind":"correctness","reason":"holds"}',
+          toolCalls: [],
+          finishReason: "stop",
+        };
+      },
+    });
+    let result;
+    try {
+      result = await reviewPullRequest({
+        inputs: INPUTS,
+        context: CONTEXT,
+        pullRequestNumber: 7,
+        eventName: "pull_request",
+        event: EVENT,
+        io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => undefined },
+      });
+    } finally {
+      writeFileSync(p.join(wsRoot, "src", "a.mjs"), A_CONTENT);
+    }
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings[0]).toMatchObject({
+      file: "src/a.mjs",
+      line: 2,
+      subject: "line2",
+      lifecycle: "confirmed",
+    });
+  });
+
   it("verifies only planned findings — a skim-lane nit at standard strategy never reaches a verdict call", async () => {
     const forge = forgeStub();
     const chat = scriptedChat([
       READ,
       {
         content:
-          '{"findings":[{"severity":"nit","file":"src/a.mjs","line":2,"message":"a nit"}],"summary":"one nit"}',
+          '{"findings":[{"severity":"nit","kind":"style","file":"src/a.mjs","line":2,"message":"a nit"}],"summary":"one nit"}',
       },
     ]);
     const result = await reviewPullRequest({
@@ -1244,7 +1757,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     expect(chat.calls).toHaveLength(3);
@@ -1257,7 +1770,7 @@ describe("adversarial verification pass", () => {
     const chat = scriptedChat([
       READ,
       { content: CONCERN_ANSWER },
-      { content: '{"verdict":"confirmed","reason":"ok","extra":1}' },
+      { content: '{"verdict":"confirmed","kind":"correctness","reason":"ok","extra":1}' },
     ]);
     /** @type {string[]} */
     const logged = [];
@@ -1267,7 +1780,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     expect(forge.calls.upserts[0]?.body).toContain("off-by-one");
@@ -1280,10 +1793,10 @@ describe("adversarial verification pass", () => {
       READ,
       {
         content:
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"},{"severity":"nit","file":"src/a.mjs","line":3,"message":"a nit"}],"summary":"two"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},{"severity":"nit","kind":"style","file":"src/a.mjs","line":3,"message":"a nit"}],"summary":"two"}',
       },
-      { content: '{"verdict":"uncertain","reason":"insufficient"}' },
-      { content: '{"verdict":"uncertain","reason":"insufficient"}' },
+      { content: '{"verdict":"uncertain","kind":"correctness","reason":"insufficient"}' },
+      { content: '{"verdict":"uncertain","kind":"style","reason":"insufficient"}' },
     ]);
     /** @type {string[]} */
     const logged = [];
@@ -1293,7 +1806,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     // Adversarial + high: every finding planned, one call each.
@@ -1318,7 +1831,7 @@ describe("adversarial verification pass", () => {
       READ,
       {
         content:
-          '{"findings":[{"severity":"nit","file":"src/a.mjs","line":2,"message":"a nit"}],"summary":"one nit"}',
+          '{"findings":[{"severity":"nit","kind":"style","file":"src/a.mjs","line":2,"message":"a nit"}],"summary":"one nit"}',
       },
     ]);
     /** @type {string[]} */
@@ -1329,7 +1842,13 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat: readChat, now: () => 0, info: (m) => logged.push(m) },
+      io: {
+        sleep: async () => {},
+        forge,
+        chat: readChat,
+        now: () => 0,
+        info: (m) => logged.push(m),
+      },
     });
     expect(result.outcome).toBe("published");
     // Read turn, final answer — the unplannable nit never earns a call.
@@ -1346,7 +1865,10 @@ describe("adversarial verification pass", () => {
       READ,
       answerWith("guard() is never called anywhere in the repository"),
       { toolCalls: [{ id: "v1", name: "search", arguments: '{"query":"guard("}' }] },
-      { content: '{"verdict":"confirmed","reason":"search finds the definition and no call"}' },
+      {
+        content:
+          '{"verdict":"confirmed","kind":"correctness","reason":"search finds the definition and no call"}',
+      },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -1354,7 +1876,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => {} },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => {} },
     });
     expect(result.outcome).toBe("published");
     // A confirmed finding publishes.
@@ -1381,7 +1903,10 @@ describe("adversarial verification pass", () => {
       answerWith("there is no guard() definition anywhere in the workspace"),
       { toolCalls: [{ id: "v1", name: "search", arguments: '{"query":"guard("}' }] },
       { toolCalls: [verifyRead("v2", "src/helper.mjs")] },
-      { content: '{"verdict":"refuted","reason":"the definition exists in src/helper.mjs"}' },
+      {
+        content:
+          '{"verdict":"refuted","kind":"correctness","reason":"the definition exists in src/helper.mjs"}',
+      },
     ]);
     /** @type {string[]} */
     const logged = [];
@@ -1391,7 +1916,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     expect(forge.calls.upserts[0]?.body).toContain("no guard() definition");
@@ -1409,7 +1934,10 @@ describe("adversarial verification pass", () => {
     const chat = scriptedChat([
       READ,
       answerWith("off-by-one"),
-      { content: '{"verdict":"uncertain","reason":"the excerpt alone cannot decide"}' },
+      {
+        content:
+          '{"verdict":"uncertain","kind":"correctness","reason":"the excerpt alone cannot decide"}',
+      },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -1417,7 +1945,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => {} },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => {} },
     });
     expect(result.outcome).toBe("published");
     // Uncertain publishes as unresolved — marked unverified in place, never dropped.
@@ -1436,7 +1964,9 @@ describe("adversarial verification pass", () => {
     // The last turn asks twice: the first executes, the second is answered
     // unexecuted — the conversation stays well-formed past the ceiling.
     script.push({ toolCalls: [verifyRead("v-last-1"), verifyRead("v-last-2")] });
-    script.push({ content: '{"verdict":"uncertain","reason":"the budget was spent"}' });
+    script.push({
+      content: '{"verdict":"uncertain","kind":"correctness","reason":"the budget was spent"}',
+    });
     const chat = scriptedChat(script);
     /** @type {string[]} */
     const logged = [];
@@ -1446,7 +1976,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     // Read turn, final answer, 40 investigation turns, one final ask.
@@ -1470,7 +2000,10 @@ describe("adversarial verification pass", () => {
       answerWith("off-by-one"),
       { toolCalls: [verifyRead("v1", "big.txt")] },
       { toolCalls: [verifyRead("v2", "big.txt")] },
-      { content: '{"verdict":"confirmed","reason":"the evidence settled it before the cut"}' },
+      {
+        content:
+          '{"verdict":"confirmed","kind":"correctness","reason":"the evidence settled it before the cut"}',
+      },
     ]);
     /** @type {string[]} */
     const logged = [];
@@ -1480,7 +2013,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     // Read, answer, two investigation turns, one final ask.
@@ -1561,7 +2094,8 @@ describe("adversarial verification pass", () => {
     writeFileSync(p.join(wsRoot, "measure.txt"), MEASURE);
     const forge = forgeStub();
     const chat = exactEvidenceChat(VERIFIER_MAX_EVIDENCE_BYTES - 1, {
-      content: '{"verdict":"refuted","reason":"settled with the last byte below the ceiling"}',
+      content:
+        '{"verdict":"refuted","kind":"correctness","reason":"settled with the last byte below the ceiling"}',
     });
     /** @type {string[]} */
     const logged = [];
@@ -1571,7 +2105,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     const deciding = chat.calls[6] ?? [];
@@ -1594,7 +2128,7 @@ describe("adversarial verification pass", () => {
     writeFileSync(p.join(wsRoot, "measure.txt"), MEASURE);
     const forge = forgeStub();
     const chat = exactEvidenceChat(VERIFIER_MAX_EVIDENCE_BYTES, {
-      content: '{"verdict":"uncertain","reason":"the budget was spent"}',
+      content: '{"verdict":"uncertain","kind":"correctness","reason":"the budget was spent"}',
     });
     /** @type {string[]} */
     const logged = [];
@@ -1604,7 +2138,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     // Read, answer, measure turn, three pad turns, the final ask.
@@ -1636,7 +2170,10 @@ describe("adversarial verification pass", () => {
           verifyRead("d4", "ignored.log"),
         ],
       },
-      { content: '{"verdict":"confirmed","reason":"the refusals say the claim holds"}' },
+      {
+        content:
+          '{"verdict":"confirmed","kind":"correctness","reason":"the refusals say the claim holds"}',
+      },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -1644,7 +2181,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => {} },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => {} },
     });
     expect(result.outcome).toBe("published");
     const refusals = (chat.calls[3] ?? []).map((message) => message.content ?? "");
@@ -1667,7 +2204,7 @@ describe("adversarial verification pass", () => {
         toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
       },
       answerWith("off-by-one", "SECRET-SUMMARY musings"),
-      { content: '{"verdict":"confirmed","reason":"the claim holds"}' },
+      { content: '{"verdict":"confirmed","kind":"correctness","reason":"the claim holds"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -1675,7 +2212,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => {} },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => {} },
     });
     expect(result.outcome).toBe("published");
     const verdict = JSON.stringify(chat.calls[2] ?? []);
@@ -1703,7 +2240,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     expect(forge.calls.upserts[0]?.body).toContain("off-by-one");
@@ -1735,7 +2272,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
     expect(result.outcome).toBe("published");
     expect(logged.some((line) => line.includes("broke the wire contract"))).toBe(true);
@@ -1748,15 +2285,18 @@ describe("adversarial verification pass", () => {
       READ,
       {
         content:
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"first problem"},' +
-          '{"severity":"concern","file":"src/a.mjs","line":3,"message":"second problem"}],"summary":"two"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"first problem"},' +
+          '{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":3,"message":"second problem"}],"summary":"two"}',
       },
       // Finding 1's verifier reaches outside the root: refused, corrected.
       { toolCalls: [verifyRead("v1", "../outside.txt")] },
-      { content: '{"verdict":"uncertain","reason":"the refusal was the answer"}' },
+      {
+        content:
+          '{"verdict":"uncertain","kind":"correctness","reason":"the refusal was the answer"}',
+      },
       // Finding 2's verifier reads and confirms.
       { toolCalls: [verifyRead("v2", "src/helper.mjs")] },
-      { content: '{"verdict":"confirmed","reason":"the read settled it"}' },
+      { content: '{"verdict":"confirmed","kind":"correctness","reason":"the read settled it"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -1764,7 +2304,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => {} },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => {} },
     });
     expect(result.outcome).toBe("published");
     // The refusal rode back as a tool error result the verifier saw.
@@ -1781,7 +2321,10 @@ describe("adversarial verification pass", () => {
       READ,
       answerWith("off-by-one"),
       { toolCalls: [{ id: "v1", name: "delete_file", arguments: '{"path":"src/a.mjs"}' }] },
-      { content: '{"verdict":"refuted","reason":"corrected after the refused call"}' },
+      {
+        content:
+          '{"verdict":"refuted","kind":"correctness","reason":"corrected after the refused call"}',
+      },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -1789,7 +2332,7 @@ describe("adversarial verification pass", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => {} },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => {} },
     });
     expect(result.outcome).toBe("published");
     expect(JSON.stringify(chat.calls[3] ?? [])).toContain("unknown tool 'delete_file'");
@@ -1810,7 +2353,13 @@ describe("evidence provenance", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat: chatStub(), now: () => 0, info: (m) => logged.push(m) },
+      io: {
+        sleep: async () => {},
+        forge,
+        chat: chatStub(),
+        now: () => 0,
+        info: (m) => logged.push(m),
+      },
     });
     expect(result.outcome).toBe("published");
     const body = forge.calls.upserts[0]?.body ?? "";
@@ -1837,10 +2386,11 @@ describe("evidence provenance", () => {
       eventName: "pull_request",
       event: EVENT,
       io: {
+        sleep: async () => {},
         forge,
         chat: chatStub(
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
-            '{"severity":"nit","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"two findings"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
+            '{"severity":"nit","kind":"style","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"two findings"}',
         ),
         now: () => 0,
         info: (m) => logged.push(m),
@@ -1879,7 +2429,7 @@ describe("run gates", () => {
    * @param {(line: string) => void} info
    */
   function loggingIo(forge, chat, info) {
-    return { forge, chat, now: () => 0, info };
+    return { forge, chat, sleep: async () => {}, now: () => 0, info };
   }
 
   it("attributes a strict-coverage refusal to the coverage gate and still publishes partial", async () => {
@@ -1976,8 +2526,7 @@ describe("run gates", () => {
     const body = forge.calls.upserts[0]?.body ?? "";
     expect(body).toContain("**Review** — Complete");
   });
-
-  it("attributes a twice-invalid answer to the conclusion gate before any verification spend", async () => {
+  it("attributes a thrice-invalid answer to the conclusion gate before any verification spend", async () => {
     /** @type {string[]} */
     const logged = [];
     let completeCalls = 0;
@@ -1997,11 +2546,13 @@ describe("run gates", () => {
         event: EVENT,
         io: loggingIo(forge, /** @type {any} */ (chat), (line) => logged.push(line)),
       }),
-    ).rejects.toThrow(/failed the output contract twice/);
+    ).rejects.toThrow(/failed the output contract three times/);
     expect(logged).toContain("review: gate conclusion failed — the answer holds no JSON object");
-    // Exactly the first ask and the one re-ask: the conclusion gate's refusal
-    // fires before validation, verification or publication spend a call.
-    expect(completeCalls).toBe(2);
+    // The loop's first ask and its one notice ask, then the conclusion
+    // gate's two re-asks — the second bounded and behind backoff (#516):
+    // the refusal fires before validation, verification or publication
+    // spend a call.
+    expect(completeCalls).toBe(4);
   });
 
   it("judges the post-drop set: at low strictness the gate sees the concern alone and the run completes", async () => {
@@ -2019,10 +2570,17 @@ describe("run gates", () => {
       },
       {
         content:
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
-          '{"severity":"nit","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"mixed"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
+          '{"severity":"nit","kind":"style","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"mixed"}',
       },
-      { content: '{"verdict":"confirmed","reason":"visible in the read"}' },
+      // The notice's second stop answers the same — src/b.mjs stays unread
+      // and the run completes under the standard arm exactly as before.
+      {
+        content:
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
+          '{"severity":"nit","kind":"style","file":"src/a.mjs","line":1,"message":"style nit"}],"summary":"mixed"}',
+      },
+      { content: '{"verdict":"confirmed","kind":"correctness","reason":"visible in the read"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2051,9 +2609,9 @@ describe("run gates", () => {
       },
       {
         content:
-          '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}',
       },
-      { content: '{"verdict":"refuted","reason":"the line is correct"}' },
+      { content: '{"verdict":"refuted","kind":"correctness","reason":"the line is correct"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2074,7 +2632,7 @@ describe("run gates", () => {
 
 describe("the run artifact", () => {
   const CONCERN =
-    '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
   const READ = {
     content: "",
     toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
@@ -2091,7 +2649,7 @@ describe("the run artifact", () => {
     const chat = readingChat([
       READ,
       { content: CONCERN },
-      { content: '{"verdict":"confirmed","reason":"the guard is real"}' },
+      { content: '{"verdict":"confirmed","kind":"correctness","reason":"the guard is real"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2105,7 +2663,7 @@ describe("the run artifact", () => {
     expect(result.commentId).toBe(101);
     const artifact = /** @type {import("./artifact.mjs").PublishedRunArtifact} */ (result.artifact);
     if (artifact === undefined) throw new Error("expected an artifact on publication");
-    expect(artifact.schemaVersion).toBe(2);
+    expect(artifact.schemaVersion).toBe(5);
     expect(artifact.repository).toBe("acme/widgets");
     expect(artifact.pullRequest).toBe(7);
     expect(artifact.headRef).toBe(HEAD);
@@ -2113,7 +2671,13 @@ describe("the run artifact", () => {
       classification: "published",
       reason: "Complete review published (1 findings)",
     });
-    expect(artifact.policy).toEqual({ strictness: "medium", strategy: "standard" });
+    expect(artifact.policy).toEqual({
+      strictness: "medium",
+      strategy: "standard",
+      basis: "base",
+      branch: "main",
+      sha: "7".repeat(40),
+    });
     expect(artifact.risk).toHaveLength(1);
     expect(artifact.risk[0]?.path).toBe("src/a.mjs");
     expect(artifact.findings).toHaveLength(1);
@@ -2125,6 +2689,7 @@ describe("the run artifact", () => {
       path: "src/a.mjs",
       startLine: 1,
       endLine: 4,
+      digest: contentDigest(A_CONTENT),
     });
     expect(artifact.verification.gate).toEqual({ passed: true });
     expect(artifact.verification.verdicts).toEqual([
@@ -2133,6 +2698,10 @@ describe("the run artifact", () => {
         verdict: "confirmed",
         lifecycle: "confirmed",
         reason: "the guard is real",
+        evidence: {
+          digest: contentDigest(A_CONTENT),
+          excerpt: A_CONTENT,
+        },
       },
     ]);
     expect(artifact.gates.map((gate) => gate.gate)).toEqual([
@@ -2160,7 +2729,7 @@ describe("the run artifact", () => {
     const chat = readingChat([
       READ,
       { content: CONCERN },
-      { content: '{"verdict":"refuted","reason":"the line is correct"}' },
+      { content: '{"verdict":"refuted","kind":"correctness","reason":"the line is correct"}' },
     ]);
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2209,7 +2778,7 @@ describe("the run artifact", () => {
     expect(artifact.verification.gate).toEqual({ passed: true });
   });
 
-  it("a draft writes no artifact", async () => {
+  it("a draft leaves a state skip record — the skip's whole outcome", async () => {
     const forge = forgeStub({ snapshotOverride: snapshot({ draft: true }) });
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2220,10 +2789,17 @@ describe("the run artifact", () => {
       io: io(forge),
     });
     expect(result.outcome).toBe("skip");
-    expect(result.artifact).toBeUndefined();
+    expect(result.artifact).toBeDefined();
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.kind).toBe("state");
+    expect(record.schemaVersion).toBe(applicabilityArtifactSchemaVersion);
+    expect(record.outcome).toEqual({
+      classification: "skip",
+      reason: "#7 is a draft — not ready means not reviewed",
+    });
   });
 
-  it("a closed pull request writes no artifact", async () => {
+  it("a closed pull request leaves a state skip record", async () => {
     const forge = forgeStub({ snapshotOverride: snapshot({ state: "closed" }) });
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2234,10 +2810,13 @@ describe("the run artifact", () => {
       io: io(forge),
     });
     expect(result.outcome).toBe("skip");
-    expect(result.artifact).toBeUndefined();
+    expect(result.artifact).toBeDefined();
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.kind).toBe("state");
+    expect(record.outcome.classification).toBe("skip");
   });
 
-  it("a run abandoned for a moved head writes no artifact", async () => {
+  it("a run abandoned for a moved head writes its abandonment artifact", async () => {
     let reads = 0;
     const forge = forgeStub();
     forge.getPullRequest = async () => {
@@ -2253,10 +2832,15 @@ describe("the run artifact", () => {
       io: io(forge),
     });
     expect(result.outcome).toBe("abandoned");
-    expect(result.artifact).toBeUndefined();
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("abandoned");
+    // Nothing was written before the head moved: no comment id, no policy.
+    expect(record.provenance).toBeUndefined();
+    expect(record.policy).toBeUndefined();
+    expect(record.findings).toBeUndefined();
   });
 
-  it("a dry run writes no artifact", async () => {
+  it("a dry run writes its dry-run artifact", async () => {
     const forge = forgeStub();
     const result = await reviewPullRequest({
       inputs: { ...INPUTS, dryRun: true },
@@ -2267,7 +2851,10 @@ describe("the run artifact", () => {
       io: io(forge),
     });
     expect(result.outcome).toBe("dry-run");
-    expect(result.artifact).toBeUndefined();
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("dry-run");
+    expect(record.policy).toBeUndefined();
+    expect(record.findings).toBeUndefined();
   });
 });
 
@@ -2281,12 +2868,14 @@ describe("artifact freshness around publication", () => {
 
   const MOVED = "c".repeat(40);
   const CONCERN =
-    '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
   const READ = {
     content: "",
     toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
   };
-  const VERDICT = { content: '{"verdict":"confirmed","reason":"the read settles it"}' };
+  const VERDICT = {
+    content: '{"verdict":"confirmed","kind":"correctness","reason":"the read settles it"}',
+  };
 
   /**
    * A forge whose PR reads and comment writes are recorded on one timeline,
@@ -2350,7 +2939,7 @@ describe("artifact freshness around publication", () => {
     expect(forge.calls.upserts).toHaveLength(1);
   });
 
-  it("a head moved after publication abandons with the comment standing and no artifact", async () => {
+  it("a head moved after publication abandons with the comment standing and its artifact naming the comment", async () => {
     const forge = sequencedForge({ movedAt: 4 });
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2361,9 +2950,15 @@ describe("artifact freshness around publication", () => {
       io: io(forge, readingChat([READ, { content: CONCERN }, VERDICT])),
     });
     expect(result.outcome).toBe("abandoned");
-    expect(result.artifact).toBeUndefined();
     expect(result.commentId).toBeUndefined();
     expect(result.reason).toContain("not written");
+    // The artifact IS written — it is the only pointer to the comment the
+    // run left standing, so an auditor can find the orphaned comment from
+    // the record alone.
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("abandoned");
+    expect(record.provenance).toEqual({ commentId: 101 });
+    expect(record.policy).toBeUndefined();
     expect(forge.calls.upserts).toHaveLength(1); // the comment stands
     expect(forge.timeline.at(-1)).toBe(`read:${MOVED.slice(0, 6)}`);
   });
@@ -2379,11 +2974,125 @@ describe("artifact freshness around publication", () => {
       io: io(forge, readingChat([READ, { content: CONCERN }, VERDICT])),
     });
     expect(result.outcome).toBe("abandoned");
-    expect(result.artifact).toBeUndefined();
     expect(result.commentId).toBeUndefined();
     expect(result.reason).toContain("nothing written");
+    // The abandonment record still leaves the run — nothing was written to
+    // the forge, so the record is the run's whole outcome.
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("abandoned");
+    expect(record.provenance).toBeUndefined();
     expect(forge.calls.upserts).toHaveLength(0); // nothing irreversible happened
     expect(forge.timeline.at(-1)).toBe(`read:${MOVED.slice(0, 6)}`);
+  });
+});
+
+describe("publication ownership", () => {
+  // The ownership distinction the publication contract rests on: an
+  // abandonment before this run wrote anything names no comment id anywhere
+  // — the comment standing on the thread belongs to whichever run won it —
+  // while an abandonment after the write keeps the id of the comment this
+  // run itself left standing. The returned canonical carries the real
+  // publication outcome beside the verdict: the two facts are independent.
+  const CONCERN =
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
+  const READ = {
+    content: "",
+    toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
+  };
+  const VERDICT = {
+    content: '{"verdict":"confirmed","kind":"correctness","reason":"the read settles it"}',
+  };
+  const RACED_COMMENT = (/** @type {number} */ id, /** @type {string} */ head) => ({
+    id,
+    body: `<!-- action-agents:review:0badcafe:head=${head} -->raced findings`,
+    user: { login: "github-actions[bot]" },
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T12:00:00Z",
+  });
+
+  it("an upsert-guard abandonment on the main path names no comment id anywhere", async () => {
+    const forge = forgeStub();
+    forge.listComments = async () => [RACED_COMMENT(55, "c".repeat(40))];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge, readingChat([READ, { content: CONCERN }, VERDICT])),
+    });
+    expect(result.outcome).toBe("abandoned");
+    expect(result.reason).toContain("concurrent");
+    expect(result.commentId).toBeUndefined();
+    expect(forge.calls.upserts).toHaveLength(0);
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("abandoned");
+    // A foreign comment stands on the thread; this run wrote none, so the
+    // provenance names none.
+    expect(record.provenance).toBeUndefined();
+  });
+
+  it("a post-write abandonment keeps the run's own commentId when the write was an update", async () => {
+    const MOVED = "d".repeat(40);
+    const forge = forgeStub();
+    forge.listComments = async () => [RACED_COMMENT(55, HEAD)]; // same head: the upsert updates it
+    let reads = 0;
+    const base = forge.getPullRequest.bind(forge);
+    forge.getPullRequest = async () => {
+      reads += 1;
+      return reads >= 4 ? snapshot({ head: { ref: "feature", sha: MOVED } }) : base(7);
+    };
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge, readingChat([READ, { content: CONCERN }, VERDICT])),
+    });
+    // The write landed — this run's update of its own comment stands — so
+    // the abandonment keeps that comment's id under provenance.
+    expect(result.outcome).toBe("abandoned");
+    expect(forge.calls.upserts).toEqual([{ id: 55, body: expect.any(String) }]);
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("abandoned");
+    expect(record.provenance).toEqual({ commentId: 55 });
+  });
+
+  it("the published canonical carries the real publication outcome beside the verdict", async () => {
+    // A fresh thread: this run's write created its comment.
+    const fresh = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forgeStub(), readingChat([READ, { content: CONCERN }, VERDICT])),
+    });
+    expect(fresh.outcome).toBe("published");
+    expect(fresh.canonical?.run).toEqual({
+      state: "published",
+      verdict: "pass",
+      publication: "created",
+    });
+
+    // An own comment already at this head: this run's write updated it.
+    const updating = forgeStub();
+    updating.listComments = async () => [RACED_COMMENT(55, HEAD)];
+    const updated = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(updating, readingChat([READ, { content: CONCERN }, VERDICT])),
+    });
+    expect(updated.outcome).toBe("published");
+    expect(updated.canonical?.run).toEqual({
+      state: "published",
+      verdict: "pass",
+      publication: "updated",
+    });
   });
 });
 
@@ -2401,8 +3110,10 @@ describe("the untrusted-data ceiling (no steering)", () => {
   /** The registry, spelled out: the whole surface any request may offer. */
   const FIXED_TOOLS = ["read_file", "list_files", "search"];
   const ANSWER =
-    '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
-  const VERDICT = { content: '{"verdict":"confirmed","reason":"the read settles it"}' };
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
+  const VERDICT = {
+    content: '{"verdict":"confirmed","kind":"correctness","reason":"the read settles it"}',
+  };
   const READ = {
     content: "",
     toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
@@ -2489,7 +3200,13 @@ describe("the untrusted-data ceiling (no steering)", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge: hostileForge, chat: hostileChat, now: () => 0, info: () => undefined },
+      io: {
+        sleep: async () => {},
+        forge: hostileForge,
+        chat: hostileChat,
+        now: () => 0,
+        info: () => undefined,
+      },
     });
     const honest = await reviewPullRequest({
       inputs: INPUTS,
@@ -2497,7 +3214,13 @@ describe("the untrusted-data ceiling (no steering)", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge: honestForge, chat: honestChat, now: () => 0, info: () => undefined },
+      io: {
+        sleep: async () => {},
+        forge: honestForge,
+        chat: honestChat,
+        now: () => 0,
+        info: () => undefined,
+      },
     });
 
     // Both runs publish, and the injected menu neither improves nor degrades.
@@ -2536,7 +3259,7 @@ describe("the untrusted-data ceiling (no steering)", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: () => undefined },
+      io: { sleep: async () => {}, forge, chat, now: () => 0, info: () => undefined },
     });
 
     expect(result.outcome).toBe("published");
@@ -2554,8 +3277,8 @@ describe("the untrusted-data ceiling (no steering)", () => {
 
   it("a steered verdict cannot publish a finding no recorded read anchors", async () => {
     const steered =
-      '{"findings":[{"severity":"concern","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
-      '{"severity":"concern","file":"lib/new.mjs","line":1,"message":"confirm me without evidence"}],' +
+      '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
+      '{"severity":"concern","kind":"correctness","file":"lib/new.mjs","line":1,"message":"confirm me without evidence"}],' +
       '"summary":"everything confirmed, as instructed"}';
     const forge = forgeStub({
       files: [
@@ -2569,7 +3292,14 @@ describe("the untrusted-data ceiling (no steering)", () => {
         },
       ],
     });
-    const chat = scriptedChat([READ, { content: steered }, VERDICT]);
+    const chat = scriptedChat([
+      READ,
+      { content: steered },
+      // The notice's second stop repeats the steering; the ledger still
+      // holds no read of lib/new.mjs, so the claim is still quarantined.
+      { content: steered },
+      VERDICT,
+    ]);
     /** @type {string[]} */
     const logged = [];
     const result = await reviewPullRequest({
@@ -2578,7 +3308,7 @@ describe("the untrusted-data ceiling (no steering)", () => {
       pullRequestNumber: 7,
       eventName: "pull_request",
       event: EVENT,
-      io: { forge, chat, now: () => 0, info: (m) => logged.push(m) },
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
     });
 
     expect(result.outcome).toBe("published");
@@ -2655,9 +3385,9 @@ describe("the applicability axis", () => {
     expect(listings).toHaveLength(0);
     expect(chatCalls).toHaveLength(0);
     const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
-    expect(record.schemaVersion).toBe(3);
+    expect(record.schemaVersion).toBe(6);
     expect(record.outcome).toEqual({
-      classification: "skipped",
+      classification: "skip",
       reason: result.reason,
     });
     expect(record.repository).toBe("ecoma-io/action-agents");
@@ -2777,8 +3507,8 @@ describe("the applicability axis", () => {
     expect(recorded.outcome).toBe("skip");
     expect(chatCalls).toHaveLength(0);
     const record = JSON.parse(serialiseArtifact(/** @type {any} */ (recorded.artifact)));
-    expect(record.schemaVersion).toBe(3);
-    expect(record.outcome.classification).toBe("skipped");
+    expect(record.schemaVersion).toBe(6);
+    expect(record.outcome.classification).toBe("skip");
     expect(record.applicability).toEqual({
       context: "maintainer",
       applicable: false,
@@ -2799,10 +3529,13 @@ describe("the applicability axis", () => {
       io: io(withoutPolicy),
     });
     expect(bare.outcome).toBe("skip");
-    expect(bare.artifact).toBeUndefined();
+    const bareRecord = JSON.parse(serialiseArtifact(/** @type {any} */ (bare.artifact)));
+    expect(bareRecord.kind).toBe("state");
+    expect(bareRecord.schemaVersion).toBe(applicabilityArtifactSchemaVersion);
+    expect(bareRecord.applicability).toBeUndefined();
   });
 
-  it("keeps zero-config runs byte-for-byte on schema version 2, no applicability anywhere", async () => {
+  it("keeps zero-config runs byte-for-byte on schema version 4, no applicability anywhere", async () => {
     const forge = forgeStub({ snapshotOverride: snapshotFor(MAINTAINER_DOCS) });
     const result = await reviewPullRequest({
       inputs: INPUTS,
@@ -2815,7 +3548,7 @@ describe("the applicability axis", () => {
     expect(result.outcome).toBe("published");
     const bytes = serialiseArtifact(/** @type {any} */ (result.artifact));
     const record = JSON.parse(bytes);
-    expect(record.schemaVersion).toBe(2);
+    expect(record.schemaVersion).toBe(5);
     expect(Object.keys(record).sort()).toEqual(
       [
         "coverage",
@@ -2869,7 +3602,7 @@ describe("the applicability axis", () => {
     });
   });
 
-  it("suppresses every skip record under dry-run — nothing written means nothing", async () => {
+  it("suppresses skip records under dry-run — the rule-matched dry run writes its dry-run artifact", async () => {
     const draft = forgeStub({
       config: DOGFOOD_CONFIG,
       snapshotOverride: snapshot({ draft: true }),
@@ -2899,7 +3632,13 @@ describe("the applicability axis", () => {
     });
     expect(ruledResult.outcome).toBe("dry-run");
     expect(ruledResult.reason).toContain("release-prs");
-    expect(ruledResult.artifact).toBeUndefined();
+    // A state skip under dry-run still writes nothing (the record is the
+    // policy's skip story and the policy never spoke) — but the rule-matched
+    // dry run's artifact is its whole outcome.
+    expect(draftResult.artifact).toBeUndefined();
+    const ruledRecord = JSON.parse(serialiseArtifact(/** @type {any} */ (ruledResult.artifact)));
+    expect(ruledRecord.outcome.classification).toBe("dry-run");
+    expect(ruledRecord.applicability).toBe("automation");
   });
 
   it("skips on a paths rule before the budget refusal, fetching the listing exactly once", async () => {
@@ -3304,5 +4043,771 @@ describe("the intensity axis", () => {
       inputs: { association: "NONE", head: "same-repo", authorType: "bot-allowlisted" },
     });
     expect(chat.captured).toHaveLength(0);
+  });
+});
+
+describe("the eligibility axis", () => {
+  /** The fixtures' base repo, so the derivation lands where the test says. */
+  const ELIG_CONTEXT = { ...CONTEXT, owner: "ecoma-io", repo: "action-agents" };
+
+  /** The eligibility dogfood policy: bot- and size-anchored skips, no allowlist needed. */
+  const ELIGIBILITY_CONFIG = JSON.stringify({
+    schemaVersion: 1,
+    applicability: {
+      bots: [],
+      rules: [
+        { id: "unlisted-bots", when: { author: { isBot: true } }, run: false },
+        { id: "oversized", when: { changes: { lines: { gt: 8000 } } }, run: false },
+      ],
+    },
+  });
+
+  /** The payload for a fixture: its author, head and base, the stub's number. */
+  /** @param {typeof import("./applicability.fixtures.mjs").RELEASE_AUTOMATION} fixture */
+  const eligEvent = (fixture) => ({
+    action: "synchronize",
+    pull_request: { ...fixture, number: 7, base: { ref: "main", sha: "8".repeat(40) } },
+  });
+
+  /** @param {number[]} sink @returns {import("#core/chat.mjs").Chat} */
+  const countingChat = (sink) => ({
+    async complete() {
+      sink.push(1);
+      return {
+        content: '{"findings":[],"summary":"nothing to report"}',
+        toolCalls: [],
+        finishReason: "stop",
+      };
+    },
+  });
+
+  /** @param {ReturnType<typeof forgeStub>} forge @returns {number[]} */
+  const countedListings = (forge) => {
+    /** @type {number[]} */
+    const sink = [];
+    const inner = forge.listPullRequestFiles.bind(forge);
+    forge.listPullRequestFiles = async () => {
+      sink.push(1);
+      return inner(7);
+    };
+    return sink;
+  };
+
+  it("skips an unallowlisted bot on the isBot anchor — recorded, zero model calls, zero writes", async () => {
+    const forge = forgeStub({
+      config: ELIGIBILITY_CONFIG,
+      snapshotOverride: snapshot({
+        title: "chore(deps): update vite to 8.2.1",
+        head: { ref: "renovate/vite-8.x", sha: HEAD },
+      }),
+    });
+    const listings = countedListings(forge);
+    /** @type {number[]} */
+    const chatCalls = [];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: ELIG_CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: eligEvent(RELEASE_AUTOMATION),
+      io: io(forge, countingChat(chatCalls)),
+    });
+    expect(result.outcome).toBe("skip");
+    expect(result.reason).toContain("unlisted-bots");
+    expect(forge.calls.upserts).toHaveLength(0);
+    expect(listings).toHaveLength(1);
+    expect(chatCalls).toHaveLength(0);
+    const record = JSON.parse(serialiseArtifact(/** @type {any} */ (result.artifact)));
+    expect(record.outcome.classification).toBe("skip");
+    expect(record.applicability).toEqual({
+      context: "external",
+      applicable: false,
+      posture: "standard",
+      intensity: {},
+      matchedRule: "unlisted-bots",
+      basis: "rule",
+      inputs: { association: "NONE", head: "same-repo", authorType: "bot-unlisted" },
+    });
+  });
+
+  it("skips an oversized PR on the changes anchor with its measured numbers in the reason", async () => {
+    const bigFiles = Array.from({ length: 400 }, (_unused, index) => ({
+      filename: `src/generated-${String(index)}.mjs`,
+      status: "modified",
+      additions: 15,
+      deletions: 10,
+      patch: "@@ -1 +1,2 @@\n+x",
+    }));
+    const forge = forgeStub({
+      config: ELIGIBILITY_CONFIG,
+      files: bigFiles,
+    });
+    const listings = countedListings(forge);
+    /** @type {number[]} */
+    const chatCalls = [];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: ELIG_CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: eligEvent(MAINTAINER_DOCS),
+      io: io(forge, countingChat(chatCalls)),
+    });
+    expect(result.outcome).toBe("skip");
+    expect(result.reason).toContain("oversized");
+    expect(result.reason).toContain("10000 changed lines across 400 files");
+    expect(forge.calls.upserts).toHaveLength(0);
+    expect(listings).toHaveLength(1);
+    expect(chatCalls).toHaveLength(0);
+  });
+
+  it("keeps a small PR on the eligible path when a changes rule exists but does not match", async () => {
+    const forge = forgeStub({
+      config: ELIGIBILITY_CONFIG,
+      snapshotOverride: snapshot({
+        title: MAINTAINER_DOCS.title,
+        head: { ref: MAINTAINER_DOCS.head.ref, sha: HEAD },
+      }),
+    });
+    const listings = countedListings(forge);
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: ELIG_CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: eligEvent(MAINTAINER_DOCS),
+      io: io(forge),
+    });
+    expect(result.outcome).toBe("published");
+    expect(listings).toHaveLength(1);
+    expect(forge.calls.upserts).toHaveLength(1);
+  });
+
+  it("measures the pre-ignore change — a wholly ignored file still counts against a changes rule", async () => {
+    // The one file is entirely inside the ignore set, so the post-ignore
+    // universe holds zero counted lines and the scope layer would never
+    // refuse. The eligibility guard reads the pre-ignore total instead:
+    // 9000 lines over `gt: 8000`, skip. Feeding this test post-ignore
+    // totals — the doctrine inversion — would flip it to no skip.
+    const PRE_IGNORE_CONFIG = JSON.stringify({
+      schemaVersion: 1,
+      ignore: ["generated/**"],
+      applicability: {
+        bots: [],
+        rules: [{ id: "oversized", when: { changes: { lines: { gt: 8000 } } }, run: false }],
+      },
+    });
+    const forge = forgeStub({
+      config: PRE_IGNORE_CONFIG,
+      files: [
+        {
+          filename: "generated/bulk.mjs",
+          status: "modified",
+          additions: 9000,
+          deletions: 0,
+          patch: "@@ -1 +1,2 @@\n+x",
+        },
+      ],
+    });
+    const listings = countedListings(forge);
+    /** @type {number[]} */
+    const chatCalls = [];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: ELIG_CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: eligEvent(MAINTAINER_DOCS),
+      io: io(forge, countingChat(chatCalls)),
+    });
+    expect(result.outcome).toBe("skip");
+    expect(result.reason).toContain("oversized");
+    expect(result.reason).toContain("9000 changed lines across 1 file");
+    expect(listings).toHaveLength(1);
+    expect(chatCalls).toHaveLength(0);
+    expect(forge.calls.upserts).toHaveLength(0);
+  });
+
+  it("suppresses the new-anchor skips under dry-run — logged, nothing written", async () => {
+    const forge = forgeStub({
+      config: ELIGIBILITY_CONFIG,
+      snapshotOverride: snapshot({
+        title: RELEASE_AUTOMATION.title,
+        head: { ref: RELEASE_AUTOMATION.head.ref, sha: HEAD },
+      }),
+    });
+    const result = await reviewPullRequest({
+      inputs: { ...INPUTS, dryRun: true },
+      context: ELIG_CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: eligEvent(RELEASE_AUTOMATION),
+      io: io(forge),
+    });
+    expect(result.outcome).toBe("dry-run");
+    expect(result.artifact?.outcome.classification).toBe("dry-run");
+    expect(forge.calls.upserts).toHaveLength(0);
+  });
+});
+describe("the cross-run reconciliation in the published comment", () => {
+  const CONCERN =
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"}],"summary":"one concern"}';
+  const TWO =
+    '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},{"severity":"nit","kind":"style","file":"src/b.mjs","line":2,"message":"naming"}],"summary":"two"}';
+  const READ = {
+    content: "",
+    toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
+  };
+  const READS = {
+    content: "",
+    toolCalls: [
+      { id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' },
+      { id: "r2", name: "read_file", arguments: '{"path":"src/b.mjs"}' },
+    ],
+  };
+  const VERDICT = {
+    content: '{"verdict":"confirmed","kind":"correctness","reason":"the read settles it"}',
+  };
+  const GONE = {
+    kind: "security",
+    file: "src/gone.mjs",
+    line: 9,
+    severity: "concern",
+    message: "hard-coded key",
+    subject: 'const key = "x";',
+    lifecycle: "confirmed",
+  };
+  const TWO_FILES = [
+    {
+      filename: "src/a.mjs",
+      status: "modified",
+      additions: 1,
+      deletions: 0,
+      patch: "@@ -1 +1,2 @@\n+x",
+    },
+    {
+      filename: "src/b.mjs",
+      status: "modified",
+      additions: 1,
+      deletions: 0,
+      patch: "@@ -1 +1,2 @@\n+y",
+    },
+  ];
+
+  /**
+   * A thread comment, as the forge lists it.
+   *
+   * @param {number} id
+   * @param {string} body
+   * @param {string} [login]
+   */
+  const listed = (id, body, login = "someone-else") => ({
+    id,
+    body,
+    user: { login },
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+
+  /**
+   * A published previous record, wrapped in the marker comment it rides in.
+   *
+   * @param {import("./canonical.mjs").CanonicalResult} record
+   */
+  const previousComment = (record) =>
+    listed(
+      55,
+      `<!-- action-agents:review:0badcafe:head=${record.head} -->\n**Review** — Complete\n${embedRecordBlock(record)}\n`,
+      "github-actions[bot]",
+    );
+
+  /**
+   * A previous record over arbitrary findings, published cleanly.
+   *
+   * @param {Array<{
+   *   kind: string,
+   *   file: string,
+   *   line: number,
+   *   severity: string,
+   *   message: string,
+   *   subject: string,
+   *   lifecycle: string,
+   *   fingerprint?: string,
+   *   verdict?: string,
+   *   reason?: string,
+   *   evidence?: { digest: string, excerpt: string },
+   * }>} findings
+   */
+  const previousRecord = (findings) =>
+    createCanonicalResult({ head: HEAD, run: { state: "published", verdict: "pass" }, findings });
+
+  /**
+   * @param {import("./run.mjs").ReviewForge} forge
+   * @param {Array<{ content: string, toolCalls?: { id: string, name: string, arguments: string }[] }>} turns
+   */
+  const runReview = async (forge, turns) =>
+    reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge, readingChat(turns)),
+    });
+
+  it("the published comment carries its own record for the next run", async () => {
+    const forge = forgeStub();
+    const result = await runReview(forge, [READ, { content: CONCERN }, VERDICT]);
+    expect(result.outcome).toBe("published");
+    const body = forge.calls.upserts[0]?.body ?? "";
+    const carried = parseRecordBlock(body);
+    if (carried === undefined) throw new Error("the upsert carried no readable record");
+    if (result.canonical === undefined) throw new Error("a published run lost its record");
+    expect(carried.findings).toEqual(result.canonical.findings);
+    expect(carried.head).toBe(HEAD);
+    expect(body.trimEnd().endsWith("-->")).toBe(true);
+  });
+
+  it("a recovered record labels persisting findings and refreshes the block in the same upsert", async () => {
+    const script = [READS, { content: TWO }, VERDICT];
+    const first = forgeStub({ files: TWO_FILES });
+    await runReview(first, script);
+    const prior = parseRecordBlock(first.calls.upserts[0]?.body ?? "");
+    if (prior === undefined) throw new Error("the first run's record did not parse");
+
+    const forge = forgeStub({ files: TWO_FILES });
+    forge.listComments = async () => [previousComment(prior)];
+    const result = await runReview(forge, script);
+    expect(result.outcome).toBe("published");
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).toContain("[persisting]");
+    expect(body).toContain("Compared with the previous review: 2 persisting.");
+    expect(body).not.toContain("Resolved since the last review");
+    if (result.canonical === undefined) throw new Error("a published run lost its record");
+    expect(parseRecordBlock(body)?.findings).toEqual(result.canonical.findings);
+  });
+
+  it("a moved previous anchor and a resolved finding render where they retired", async () => {
+    const script = [READS, { content: TWO }, VERDICT];
+    const first = forgeStub({ files: TWO_FILES });
+    await runReview(first, script);
+    const prior = parseRecordBlock(first.calls.upserts[0]?.body ?? "");
+    if (prior === undefined) throw new Error("the first run's record did not parse");
+    const kept = prior.findings[0];
+    if (kept === undefined) throw new Error("the prior record lost its finding");
+
+    const forge = forgeStub({ files: TWO_FILES });
+    forge.listComments = async () => [
+      previousComment(previousRecord([{ ...kept, line: 3 }, ...prior.findings.slice(1), GONE])),
+    ];
+    const result = await runReview(forge, script);
+    expect(result.outcome).toBe("published");
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).toContain("[moved]");
+    expect(body).toContain("[persisting]");
+    expect(body).toContain("Compared with the previous review: 1 persisting, 1 moved, 1 resolved.");
+    expect(body).toContain("### Resolved since the last review (1)");
+    expect(body).toContain("- `src/gone.mjs:9` — hard-coded key");
+  });
+
+  it("a current finding absent from the previous record is labelled new, with the resolved count", async () => {
+    const forge = forgeStub();
+    forge.listComments = async () => [previousComment(previousRecord([GONE]))];
+    const result = await runReview(forge, [READ, { content: CONCERN }, VERDICT]);
+    expect(result.outcome).toBe("published");
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).toContain("[new]");
+    expect(body).toContain("Compared with the previous review: 1 new, 1 resolved.");
+    expect(body).toContain("### Resolved since the last review (1)");
+  });
+
+  it("a corrupt previous record renders a first-run comment and never fails the run", async () => {
+    const forge = forgeStub();
+    forge.listComments = async () => [
+      listed(
+        55,
+        `<!-- action-agents:review:0badcafe:head=${HEAD} -->\nold prose\n<!-- action-agents-record:review:bm90IGpzb24= -->\n`,
+      ),
+    ];
+    const result = await runReview(forge, [READ, { content: CONCERN }, VERDICT]);
+    expect(result.outcome).toBe("published");
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).not.toContain("[new]");
+    expect(body).not.toContain("Compared with the previous review");
+    expect(body).not.toContain("Resolved since the last review");
+    expect(parseRecordBlock(body)).toBeDefined();
+  });
+
+  it("the upsert updates the action's own comment in place, record block and all", async () => {
+    const forge = forgeStub();
+    forge.listComments = async () => [previousComment(previousRecord([]))];
+    const result = await runReview(forge, [READ, { content: CONCERN }, VERDICT]);
+    expect(result.outcome).toBe("published");
+    expect(forge.calls.upserts).toEqual([{ id: 55, body: expect.any(String) }]);
+    if (result.canonical === undefined) throw new Error("a published run lost its record");
+    expect(parseRecordBlock(forge.calls.upserts[0]?.body ?? "")?.findings).toEqual(
+      result.canonical.findings,
+    );
+  });
+
+  it("labels change only the prose: record, verdict and SARIF bytes are identical", async () => {
+    const script = [READ, { content: CONCERN }, VERDICT];
+    const without = forgeStub();
+    const bare = await runReview(without, script);
+    const withPrevious = forgeStub();
+    withPrevious.listComments = async () => [previousComment(previousRecord([GONE]))];
+    const labelled = await runReview(withPrevious, script);
+
+    if (bare.canonical === undefined || labelled.canonical === undefined) {
+      throw new Error("a published run lost its record");
+    }
+    // The labels are comment prose: findings, head, state and verdict are
+    // identical. The one legitimate divergence is the publication fact —
+    // the labelled run updates the action's own comment where the bare run
+    // creates one — so it is normalised before the comparison.
+    expect({
+      ...labelled.canonical,
+      run: { ...labelled.canonical.run, publication: bare.canonical.run.publication },
+    }).toEqual(bare.canonical);
+    expect(labelled.canonical.run.verdict).toBe(bare.canonical.run.verdict);
+    expect(JSON.stringify(toSarif(labelled.canonical))).toBe(
+      JSON.stringify(toSarif(bare.canonical)),
+    );
+    const labelledBody = withPrevious.calls.upserts[0]?.body ?? "";
+    const bareBody = without.calls.upserts[0]?.body ?? "";
+    expect(labelledBody).toContain("[new]");
+    expect(bareBody).not.toContain("[new]");
+    expect(labelledBody).not.toBe(bareBody);
+  });
+
+  it("a collapsed duplicate wears the survivor's label, never its neighbour's", async () => {
+    // Two findings share the canonical identity — same file, kind and
+    // anchor-line content; only the message differs — and a distinct
+    // finding follows them. The record collapses the pair to one finding,
+    // so a join by position shifts every later label onto the wrong row:
+    // the duplicate must carry the survivor's own label and the third
+    // finding its own, exactly as the embedded record spells them.
+    const THREE =
+      '{"findings":[' +
+      '{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,"message":"off-by-one"},' +
+      '{"severity":"nit","kind":"correctness","file":"src/a.mjs","line":2,"message":"the arithmetic is off"},' +
+      '{"severity":"nit","kind":"style","file":"src/b.mjs","line":2,"message":"naming"}' +
+      '],"summary":"three"}';
+    // The previous run published only the third finding: the collapsed
+    // pair labels new, the third persisting — three distinct facts the
+    // comment must not shuffle.
+    const forge = forgeStub({ files: TWO_FILES });
+    forge.listComments = async () => [
+      previousComment(
+        previousRecord([
+          {
+            kind: "style",
+            file: "src/b.mjs",
+            line: 2,
+            severity: "nit",
+            message: "naming",
+            subject: "b2",
+            lifecycle: "unresolved",
+          },
+        ]),
+      ),
+    ];
+    const result = await runReview(forge, [READS, { content: THREE }, VERDICT, VERDICT]);
+    expect(result.outcome).toBe("published");
+    const body = forge.calls.upserts[0]?.body ?? "";
+    // The collapse itself happened: three published findings, two survive.
+    // (The embedded block carries the record minus `collapsed` — the audit
+    // trail is the run's own fact, never the thread's — so the pin reads
+    // the canonical result, and the block is checked against it.)
+    if (result.canonical === undefined) throw new Error("a published run lost its record");
+    expect(result.canonical.findings).toHaveLength(2);
+    expect(result.canonical.collapsed).toHaveLength(1);
+    const carried = parseRecordBlock(body);
+    if (carried === undefined) throw new Error("the upsert carried no readable record");
+    expect(carried.findings).toEqual(result.canonical.findings);
+    expect(body).toContain("- `src/a.mjs:2` — off-by-one [new]");
+    expect(body).toContain("- `src/a.mjs:2` — the arithmetic is off [new]");
+    expect(body).toContain("- `src/b.mjs:2` — naming [persisting]");
+    expect(body).toContain("Compared with the previous review: 1 persisting, 2 new.");
+    expect(body).not.toContain("Resolved since the last review");
+  });
+});
+
+describe("the #411 withheld-span law", () => {
+  it("withholds a finding whose anchor line certifies no span — published, named, never fatal", async () => {
+    writeFileSync(p.join(wsRoot, "src", "blank.mjs"), "line1\n\nline3\n");
+    const forge = forgeStub({
+      files: [
+        {
+          filename: "src/blank.mjs",
+          status: "modified",
+          additions: 1,
+          deletions: 0,
+          patch: "@@ -1 +1,3 @@\n+x",
+        },
+      ],
+    });
+    /** @type {string[]} */
+    const logged = [];
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: {
+        sleep: async () => {},
+        forge,
+        chat: readingChat([
+          {
+            content: "",
+            toolCalls: [
+              { id: "r1", name: "read_file", arguments: JSON.stringify({ path: "src/blank.mjs" }) },
+            ],
+          },
+          {
+            content:
+              '{"findings":[{"severity":"concern","kind":"correctness","file":"src/blank.mjs","line":2,"message":"off-by-one"}],"summary":"blank anchor"}',
+          },
+        ]),
+        now: () => 0,
+        info: (m) => logged.push(m),
+      },
+    });
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings).toEqual([]);
+    expect(result.canonical?.run).toEqual({
+      state: "published",
+      verdict: "pass",
+      publication: "created",
+    });
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).toContain(
+      "No published findings — 1 finding withheld: its anchor line carries no span to certify.",
+    );
+    expect(
+      logged.some(
+        (line) =>
+          line.includes("finding withheld") &&
+          line.includes("no span to certify") &&
+          line.includes("src/blank.mjs:2"),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("the quoted-evidence span gate (#479)", () => {
+  /** The dogfood shape, shrunk to a fixture: the anchor sits on a decoy
+   * line while the quoted evidence lives seventeen lines away — outside
+   * the anchor's three-line window on either side. */
+  const DUP_LINES = Array.from({ length: 20 }, (_, i) => `line${String(i + 1)}`);
+  DUP_LINES[2] = "record.jobs[jobName] = entry;";
+  DUP_LINES[16] = "// CLI entry";
+  const DUP_CONTENT = `${DUP_LINES.join("\n")}\n`;
+  const DUP_PATCH = `@@ -1 +1,20 @@\n${DUP_LINES.map((l) => `+${l}`).join("\n")}`;
+
+  it("withholds a finding whose quoted evidence is absent from its anchor window — before the plan spends a call", async () => {
+    writeFileSync(p.join(wsRoot, "src", "dup.mjs"), DUP_CONTENT);
+    const forge = forgeStub({
+      files: [
+        {
+          filename: "src/dup.mjs",
+          status: "modified",
+          additions: 1,
+          deletions: 0,
+          patch: DUP_PATCH,
+        },
+      ],
+    });
+    /** @type {string[]} */
+    const logged = [];
+    let chatCalls = 0;
+    const script = [
+      {
+        content: "",
+        toolCalls: [
+          { id: "r1", name: "read_file", arguments: JSON.stringify({ path: "src/dup.mjs" }) },
+        ],
+      },
+      {
+        content:
+          '{"findings":[{"severity":"concern","kind":"style","file":"src/dup.mjs","line":3,' +
+          '"message":"duplicate `// CLI entry` header comments"}],"summary":"wrong anchor"}',
+      },
+    ];
+    const chat = {
+      async complete() {
+        chatCalls += 1;
+        const next = script[Math.min(chatCalls - 1, script.length - 1)];
+        if (next === undefined || chatCalls > script.length) throw new Error("script exhausted");
+        return {
+          content: next.content,
+          toolCalls: next.toolCalls ?? [],
+          finishReason: next.toolCalls !== undefined ? "tool_calls" : "stop",
+        };
+      },
+    };
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
+    });
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings).toEqual([]);
+    expect(result.canonical?.run).toEqual({
+      state: "published",
+      verdict: "pass",
+      publication: "created",
+    });
+    const body = forge.calls.upserts[0]?.body ?? "";
+    expect(body).toContain(
+      "No published findings — 1 finding withheld: its quoted evidence is absent from the anchor window.",
+    );
+    expect(
+      logged.some(
+        (line) =>
+          line.includes("finding withheld") &&
+          line.includes("absent from its anchor window") &&
+          line.includes("src/dup.mjs:3"),
+      ),
+    ).toBe(true);
+    // Two calls — read and answer. The concern was plannable, and the plan
+    // never saw it: the gate withheld it before verification spent a call.
+    expect(chatCalls).toBe(2);
+  });
+
+  it("publishes a finding whose quoted evidence the anchor window carries", async () => {
+    const forge = forgeStub();
+    /** @type {string[]} */
+    const logged = [];
+    const chat = readingChat([
+      {
+        content: "",
+        toolCalls: [
+          { id: "r1", name: "read_file", arguments: JSON.stringify({ path: "src/a.mjs" }) },
+        ],
+      },
+      {
+        content:
+          '{"findings":[{"severity":"concern","kind":"correctness","file":"src/a.mjs","line":2,' +
+          '"message":"the guard `line2` is missing"}],"summary":"evidence in window"}',
+      },
+    ]);
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: { forge, chat, sleep: async () => {}, now: () => 0, info: (m) => logged.push(m) },
+    });
+    expect(result.outcome).toBe("published");
+    expect(result.canonical?.findings).toHaveLength(1);
+    expect(result.canonical?.findings[0]).toMatchObject({ file: "src/a.mjs", line: 2 });
+    expect(logged.some((line) => line.includes("absent from its anchor window"))).toBe(false);
+  });
+});
+
+describe("the unusable provider-answer class (#499)", () => {
+  /** The class the chat seam raises for a parseable completion with no content. */
+  const UNUSABLE = new ChatError("the provider's response holds no choices[0].message.content", {
+    kind: "unusable-answer",
+  });
+
+  it("hears a reasoning-only answer as an empty natural stop and recovers on the corrective re-ask", async () => {
+    const forge = forgeStub();
+    let completeCalls = 0;
+    const chat = {
+      async complete() {
+        completeCalls++;
+        if (completeCalls === 1) {
+          return {
+            content: "",
+            toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
+            finishReason: "tool_calls",
+          };
+        }
+        if (completeCalls === 2) {
+          throw UNUSABLE;
+        }
+        return {
+          content: '{"findings":[],"summary":"clean now"}',
+          toolCalls: [],
+          finishReason: "stop",
+        };
+      },
+    };
+
+    const result = await reviewPullRequest({
+      inputs: INPUTS,
+      context: CONTEXT,
+      pullRequestNumber: 7,
+      eventName: "pull_request",
+      event: EVENT,
+      io: io(forge, /** @type {any} */ (chat)),
+    });
+
+    expect(completeCalls).toBe(3);
+    expect(result.outcome).toBe("published");
+    expect(forge.calls.upserts).toHaveLength(1);
+  });
+  it("ends the run on the existing refusal after the bounded third try when the corrective re-ask is unusable too", async () => {
+    const forge = forgeStub();
+    let completeCalls = 0;
+    const chat = {
+      async complete() {
+        completeCalls++;
+        if (completeCalls === 1) {
+          return {
+            content: "",
+            toolCalls: [{ id: "r1", name: "read_file", arguments: '{"path":"src/a.mjs"}' }],
+            finishReason: "tool_calls",
+          };
+        }
+        throw UNUSABLE;
+      },
+    };
+
+    await expect(
+      reviewPullRequest({
+        inputs: INPUTS,
+        context: CONTEXT,
+        pullRequestNumber: 7,
+        eventName: "pull_request",
+        event: EVENT,
+        io: io(forge, /** @type {any} */ (chat)),
+      }),
+    ).rejects.toThrow(/failed the output contract three times/);
+    // Ask, the notice ask, the corrective re-ask, and the bounded third
+    // try (#516) — then the refusal, still before any verification spend.
+    expect(completeCalls).toBe(4);
+    expect(forge.calls.upserts).toHaveLength(0);
+  });
+
+  it("keeps malformed responses terminal and unretried — one call, the same red", async () => {
+    const forge = forgeStub();
+    let completeCalls = 0;
+    const chat = {
+      async complete() {
+        completeCalls++;
+        throw new ChatError("the provider's response body is not JSON", { excerpt: "<html>" });
+      },
+    };
+
+    await expect(
+      reviewPullRequest({
+        inputs: INPUTS,
+        context: CONTEXT,
+        pullRequestNumber: 7,
+        eventName: "pull_request",
+        event: EVENT,
+        io: io(forge, /** @type {any} */ (chat)),
+      }),
+    ).rejects.toThrow(/not JSON/);
+    expect(completeCalls).toBe(1);
+    expect(forge.calls.upserts).toHaveLength(0);
   });
 });

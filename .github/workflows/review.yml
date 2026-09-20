@@ -10,20 +10,33 @@ name: Review
 # marker comment per pull request, updated in place, guarded by the
 # pre-publication re-read of state and head. A hostile review of the whole
 # surface found no path from pull-request content to anything beyond that
-# one comment before this flip was made.
+# one comment before this flip was made; the Code Scanning upload below is
+# the one surface that has joined it since, and it is equally a projection
+# of the same canonical record.
 #
-# The write surface when that flip happens is exactly one marker comment on
-# the pull request — no labels (`triage`'s job), no verdicts, no mentions —
-# and the block below is the boundary that makes that true: `contents` stays
-# read-only because the working tree under `pull_request` is untrusted
-# input, and a fork's pull request carries neither secrets nor a write token,
-# which is the arrangement SECURITY.md documents for this trigger.
+# The write surface is the marker comment and — only after a published
+# review — the Code Scanning upload: no labels (`triage`'s job), no
+# verdicts, no mentions — and the block below is the boundary that makes
+# that true: `contents` stays read-only because the working tree under
+# `pull_request` is untrusted input, and a fork's pull request carries
+# neither secrets nor a write token, which is the arrangement SECURITY.md
+# documents for this trigger.
 #
-# The one non-comment output is local to the runner: the run's
-# machine-readable record is written inside the workspace (`.review-artifact`,
-# the action refuses to resolve outside it) and the upload step publishes
-# it as a workflow artifact. That step notifies nobody and grants nothing —
-# the artifact is downloadable by whoever can already see the run.
+# The run's machine-readable record stays consequence-free: it is written
+# inside the workspace (`.review-artifact`, the action refuses to resolve
+# outside it) and the upload step publishes it as a workflow artifact —
+# visible only to whoever can already see the run. Review records and never
+# enforces (ADR 006): what a verdict may block, this repository decides in
+# its own merge-protection surfaces, never in this workflow.
+#
+# Code Scanning is the one surface that leaves this repository's own pages,
+# and the one merge enforcement rides (ADR 006): a published run's
+# confirmed findings upload as SARIF — published runs only, confirmed
+# findings only; every non-published terminal uploads nothing. The upload
+# is the workflow's step, never the action's: the action only writes the
+# projection and surfaces `sarif-path` (the audit's §7.5 split). What the
+# resulting alerts do at a merge is this ruleset's decision, made here or
+# not at all.
 #
 # The action is referenced as `./review` from the checkout of the ref that
 # triggered the run, which under `pull_request` is the merge preview: a pull
@@ -31,6 +44,14 @@ name: Review
 # makes, stated rather than hidden, matches `triage.yml`'s: a same-repo
 # branch runs its own review code with the LLM gateway key in reach. Here
 # that means a maintainer's own push.
+#
+# Since the Archkeep integration (#518) this workflow also runs the evidence
+# recipe ahead of the action: pinned Archkeep steps leave a delta report in
+# the workspace, the `architecture-report` input names it, and the run
+# records what it says as the architecture family — records, never enforces
+# (ADR 006). The recipe this job runs is the dogfood copy of the one
+# docs/guides/review.md ships, and it is the drift canary for the five lines
+# of it the run contract freezes.
 
 on:
   pull_request:
@@ -38,12 +59,19 @@ on:
   # `edited` is deliberately absent — a re-worded description does not change
   # the code under review, and re-reviewing it would only churn the comment.
   # There is no workflow_dispatch: without a pull request there is nothing
-  # for this action to look at.
+  # for this action to look at. There is no `merge_group` either (ADR 006):
+  # the queue's required checks are `ci-gate` and `analysis-gate`, and both
+  # run on group heads — review needs nothing from the queue, and a
+  # merge_group event that reached this workflow anyway is not for this
+  # action: the action answers it with a typed refusal and writes nothing.
 
-# A comment is the whole write surface, and only when dry-run is off.
-permissions:
-  contents: read
-  pull-requests: write
+# The workflow-level floor grants nothing; the review job below restates its
+# reads and holds every write — a job-level `permissions` block REPLACES this
+# one rather than merging with it (analysis.yml's rule), so a job added later
+# inherits read-only instead of silently widening. The job's writes are the
+# marker comment and, only after a published review, the code scanning
+# upload.
+permissions: read-all
 
 # One review per pull request: a rapid push sequence replaces the queued run
 # rather than stacking reviews of stale heads.
@@ -58,33 +86,225 @@ jobs:
     # a run that cannot finish in fifteen minutes has hit a bound and will
     # say so rather than hang.
     timeout-minutes: 15
+    # Writes are the job's, stated here rather than inherited: the marker
+    # comment and — only after a published review — the code scanning
+    # upload. The action itself needs no read beyond the working tree
+    # (`contents`) and no other grant; there is no Checks API write and
+    # `actions: read` was a dead grant — the §7.5 artifacts-API verification
+    # was a one-off manual pass, never a runtime read. The artifact route is
+    # `upload-artifact`, which needs no grant at all — the job's token
+    # already carries it, which is why `triage.yml` uploads its records with
+    # no `actions:` line anywhere. `security-events: write` exists for the
+    # SARIF upload below, not for the artifact.
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
     steps:
       # Unlike `triage`, whose reads all go through the API, `review`'s
       # subject IS the working tree — this checkout is the snapshot the tools
       # read, confined to GITHUB_WORKSPACE by the action itself.
+      # `fetch-depth: 0` is recipe law 4 below: the baseline commit the
+      # delta judges must resolve in this clone, and a depth-1 checkout
+      # makes the merge-base step dead on arrival.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - uses: ./review
+      # ── The Archkeep evidence recipe ─────────────────────────────────────
+      #
+      # Architecture evidence enters this run as a report file produced
+      # before the action starts, by workflow steps rather than by the
+      # action: the zero-runtime-dependency law is untouched — the action
+      # neither spawns, installs nor imports Archkeep, and the evidence
+      # steps are outside the run contract's retry surface. Five of this
+      # recipe's lines are normative ("Architecture evidence at runtime" in
+      # docs/run-contract.md), and they are quoted here so the dogfood copy
+      # cannot drift from the words a consumer's copy is judged against:
+      #
+      # 1. Clear, then delete. The evidence directory is cleared before
+      #    capture, and the report file is deleted on any delta exit outside
+      #    {1, 3} — the exits where Archkeep died without a coherent
+      #    envelope, which is the whole planted-file channel: Archkeep
+      #    leaves `--output` files untouched when a run dies before building
+      #    one, so stale bytes beside a dead run would otherwise be read as
+      #    its verdict. On 1 and 3 the envelope is the verdict carrier and
+      #    stays: the reader pins its exit code to the manifest's recorded
+      #    exit — a coin-flip read is not admissible — and deleting it there
+      #    would collapse every findings run into the report-absent
+      #    `incomplete` lane, making law 2's "verdict: fail" unreachable.
+      #    The exit file is append-only, so a plant can only ever contribute
+      #    a nonzero exit line: plants can make evidence look worse, never
+      #    better.
+      # 2. Tolerate exactly {1, 3}. Exit 1 (verdict: fail) and exit 3 (no
+      #    verdict) are recorded, not red. Exit 2 — a usage error, a
+      #    mis-wiring, not a verdict — and everything else redden the step.
+      # 3. Capture steps never `||`, never `continue-on-error`. A failed
+      #    capture is a red run: evidence absent, review never starts.
+      #    `continue-on-error` is not a degradation mechanism — it reopens
+      #    the planted-file channel of law 1.
+      # 4. The baseline commit is the live merge-base, fetched. Never the
+      #    payload's `base.sha` alone — it can be stale, and a moved base
+      #    makes the delta attribute other people's merged changes to this
+      #    pull request as `introduced`: loud but wrong. The fetch strategy
+      #    must make the commit resolvable — `fetch-depth: 0` above is that.
+      # 5. The manifest is freshly written from the append-only exit file,
+      #    overwriting any plant, at the end of the evidence steps.
+      #
+      # One wiring fact the recipe rides on: the delta judges the pull
+      # request's head commit — `pull_request.head.sha`, the head the action
+      # pins its evidence expectation to — in a worktree of its own. The
+      # workspace checkout is the merge preview, and a report judged there
+      # pins a different head than the one the action expects, which reads
+      # as stale evidence on every run. The workspace itself stays
+      # untouched: it is the review's subject, never Archkeep's.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      # Consumer-pinned, exactly as the guide ships it. The action never
+      # learns this happened: no dependency edge is created, and the version
+      # pinned here is the one `pnpm arch:contract` measures the reader
+      # against, so the dogfood and the contract gate cannot drift apart.
+      - name: Install the pinned Archkeep
+        run: npm install --global @ecoma-io/archkeep@0.29.0
+
+      # Recipe law 1, first half: whatever a pull request planted under
+      # `.archkeep/` is gone before anything writes there.
+      - name: Clear the evidence directory (recipe law 1)
+        run: rm -rf .archkeep && mkdir .archkeep
+
+      # Recipe laws 3 and 4: the baseline is an evidence snapshot captured at
+      # the live merge-base of the pull request's head. No `||`, no
+      # `continue-on-error`: a failed capture is a red run and the review
+      # never starts — the one line here a frightened consumer must not
+      # "fix" with `continue-on-error: true`, which reopens the planted-file
+      # channel of law 1.
+      - name: Capture the baseline at the live merge-base (recipe laws 3-4)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base_sha="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
+          git worktree add --detach ../archkeep-base "$base_sha"
+          (cd ../archkeep-base && archkeep delta --capture --output "$GITHUB_WORKSPACE/.archkeep/base.json")
+          printf '%s\n' "$base_sha" > .archkeep/base-commit
+
+      # Recipe laws 1-3: the delta at the pull request's head, judged in a
+      # worktree at that commit. `set +e` exists only so the case arm can
+      # read the exit; every exit outside {1, 3} leaves the step with
+      # Archkeep's own code (law 2's red) after deleting the report (law 1's
+      # second half), while 1 and 3 append their exit line — append-only —
+      # and keep the envelope as the verdict carrier.
+      - name: Run the delta at the head (recipe laws 1-3)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git worktree add --detach ../archkeep-head "$HEAD_SHA"
+          set +e
+          (cd ../archkeep-head && archkeep delta "$GITHUB_WORKSPACE/.archkeep/base.json" --format json --output "$GITHUB_WORKSPACE/.archkeep/delta.json") 2> .archkeep/delta.stderr
+          code=$?
+          set -e
+          case "$code" in
+            0) ;;
+            1|3) printf 'exit=%s\n' "$code" >> .archkeep/exit ;;
+            *) rm -f .archkeep/delta.json; exit "$code" ;;
+          esac
+
+      # Recipe law 5: the manifest, freshly written from the append-only
+      # exit file — overwriting any plant — with the delta's stderr digest
+      # and both commits. The read takes the last nonzero exit line, so a
+      # plant's line can only ever make the recorded exit worse, never
+      # better: an empty file means the step exited zero.
+      - name: Write the manifest (recipe law 5)
+        run: |
+          exit_code="$(grep -oE 'exit=[0-9]+' .archkeep/exit 2>/dev/null | cut -d= -f2 | grep -v '^0$' | tail -n 1)"
+          [ -n "$exit_code" ] || exit_code=0
+          jq -n \
+            --argjson exitCode "$exit_code" \
+            --arg stderrDigest "$(sha256sum .archkeep/delta.stderr | cut -d' ' -f1)" \
+            --arg baseCommit "$(cat .archkeep/base-commit)" \
+            --arg headCommit "$(git -C ../archkeep-head rev-parse HEAD)" \
+            '{exitCode: $exitCode, stderrDigest: $stderrDigest,
+              base: {capturePath: "base.json", commit: $baseCommit},
+              head: {commit: $headCommit}}' > .archkeep/run.json
+
+      - id: review
+        uses: ./review
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           api-url: ${{ secrets.ECOMA_LLM_BASE_URL }}
           api-key: ${{ secrets.ECOMA_LLM_API_KEY }}
-          model: review
-          # Live: the write surface below is one upserted marker comment.
+          model: glm-5.3
+          # Live: publishes one upserted marker comment.
           dry-run: "false"
+          # The evidence the recipe above left: the delta report, with the
+          # manifest read from the run.json beside it — the sibling
+          # convention the input pins. Naming it makes this run
+          # architecture-aware: the verdict is recorded in the artifact's
+          # architecture section and never enforced anywhere.
+          architecture-report: .archkeep/delta.json
+
+      # Code Scanning sees the same confirmed findings the comment renders —
+      # §8's SARIF column: published runs only, confirmed findings only. A
+      # published review writes the projection under `runner.temp` and
+      # surfaces it as `sarif-path`, so the bare default `if:` (no
+      # `always()`) uploads nothing on every other terminal — refused,
+      # failed, abandoned, skipped, dry-run — and no false alarm rides on a
+      # green no-write run. The explicit category keeps these alerts a
+      # separate stream from `analysis.yml`'s uploads. This upload is also
+      # the surface merge enforcement rides (ADR 006): turning these alerts
+      # into a merge requirement is this ruleset's decision, made here or
+      # not at all. Pinned `tag@digest` like every third-party action here;
+      # Renovate bumps both halves.
+      - name: Upload the review's SARIF
+        if: steps.review.outputs.sarif-path != ''
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: ${{ steps.review.outputs.sarif-path }}
+          category: review
 
       # The run artifact — policy, risk table, findings with verification
-      # states, gate outcomes, coverage, phase log — as a downloadable file.
-      # `always()` keeps the record for runs whose comment step failed; a run
-      # that published nothing wrote no file, and `if-no-files-found: ignore`
-      # keeps those runs green.
+      # states, coverage, phase log — as a downloadable file. The `if` guards
+      # both ways: `always()` keeps the record for runs whose comment step
+      # failed — a red exit leaves its refused/failed record behind — while
+      # the non-empty check makes terminals that declare no record (the two
+      # carve-outs: a death before the run holds the facts an artifact is
+      # built from, and a failed artifact write itself) skip the upload
+      # silently — a lost write emits nothing, per the run contract. A dry
+      # run is not a carve-out: it writes its reduced `-dry-run-` artifact
+      # (review-artifact-dry-run-*.json), the run contract's first-class
+      # reduced record, and this step uploads it like any other declared
+      # write. The path is the exact file the action declared via its
+      # `artifact-file` output — set on every declared write, a red run's
+      # refused record included — never a glob. Two knobs are load-bearing
+      # (#378): `include-hidden-files: true`, because the record directory is
+      # hidden by design and upload-artifact prunes hidden files by default —
+      # the default matched zero files and still reported success — and
+      # `if-no-files-found: warn`, because a declared write that lands
+      # nowhere must be loud, not a green step over nothing.
       - name: Upload the run artifact
-        if: always()
+        if: always() && steps.review.outputs.artifact-file != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: review-run-artifact
-          path: .review-artifact/review-artifact-*.json
-          if-no-files-found: ignore
+          path: ${{ steps.review.outputs.artifact-file }}
+          include-hidden-files: true
+          if-no-files-found: warn
+
+      # The recipe's evidence — baseline snapshot, delta report, stderr, the
+      # append-only exit file, the manifest — for every run, green or red, so
+      # the bytes the reader judged survive provider outages and runner loss
+      # and can be re-read by hand exactly as the run read them. The same two
+      # load-bearing knobs the record upload above carries: hidden files
+      # included (`.archkeep` is hidden by design), and a declared directory
+      # that lands nowhere is loud rather than a green step over nothing.
+      - name: Upload the Archkeep evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-architecture-evidence
+          path: .archkeep/
+          include-hidden-files: true
+          if-no-files-found: warn

@@ -10,7 +10,7 @@ here; read those two for the work.
 
 Three trusted, bounded, auditable GitHub Actions for repository upkeep — `triage`, `review`,
 `harmonise` — against any OpenAI-compatible model. Each one is a
-separate action a consumer adopts on its own: `ecoma-io/action-agents/triage@v0.1`
+separate action a consumer adopts on its own: `ecoma-io/action-agents/triage@v0.11`
 names a directory, and that directory holds everything the action is.
 
 ```text
@@ -104,7 +104,26 @@ stated in the security policy at the repository root:
   body steer what an action does is the bug, not a missing feature.
 
 [`SECURITY.md`](SECURITY.md) is the longer form of all three, with the table the
-second one is read off.
+second one is read off. Every action run is also judged against a frozen
+contract — the terminal states and verdicts a run may end in, the failure
+taxonomy, the concurrency windows, the state-separation rule, and the seventeen
+invariants — written once in
+[docs/run-contract.md](docs/run-contract.md). Read it before changing
+anything a run's outcome rides on: a new outcome word, failure class, or
+invariant lands there first and in code second.
+
+**Prefer the smallest coherent, independently verifiable change.** Split work
+into the smallest units that each make sense on their own and are each
+self-contained enough to judge — not because big diffs are bad, but because a
+change this repository can review completely is a change it can hold
+accountable. `maxDiffLines` (the review's reading budget) and the `applicability`
+size guard (`when.changes`) are resource numbers and eligibility decisions
+respectively — never PR-size targets; see [the run contract](docs/run-contract.md#the-semantics-are-frozen). A diff past the budget is
+refused as capacity (red, recorded `refused`) — never reclassified into a
+green skip by a size rule. Precisely two shapes end green: an _eligibility_
+`run: false` decision (a bot attestation or an explicit policy rule) ends as
+a recorded skip, and a diff the `ignore` set shrinks under the budget
+reviews cleanly rather than being refused.
 
 ## Before you say a change is done
 

@@ -95,12 +95,20 @@ import { HttpError } from "./transport-errors.mjs";
  * @property {string} body an absent description is normalised to ""
  * @property {boolean | null} mergeable whether the head merges cleanly today — null while the forge is still computing it (GitHub returns null for that window)
  * @property {string | null} mergeableState the forge's mergeability classification — "clean", "dirty" (a conflict), "blocked", "behind", "draft", "unknown", or null while computing
+ * @property {string[]} labels the thread's labels — a pull request's number is its issue's number, and these are those labels
  * @property {{ ref: string, sha: string }} head
  * @property {{ ref: string, sha: string }} base
  */
 
-/** The check-run conclusions the rollup counts under their own name. */
-export const CHECK_RUN_CONCLUSIONS = [
+/**
+ * The check-run conclusions the rollup counts under their own name. The
+ * write-side vocabulary this once carried died with `createCheckRun` (ADR
+ * 006); only the read-side rollup's buckets still need the list, so it is
+ * module-private now.
+ *
+ * @type {string[]}
+ */
+const CHECK_RUN_CONCLUSIONS = [
   "success",
   "failure",
   "cancelled",
@@ -256,6 +264,31 @@ function isNotFound(cause) {
 }
 
 /**
+ * A response's label array as the name list the actions read. Every entry
+ * must be shaped like a label — a nameless entry is a response this module
+ * refuses, not a list it quietly shrugs off.
+ *
+ * @param {string} operation the read's name, for the refusal text
+ * @param {unknown} raw the response's `labels` value
+ * @returns {string[]}
+ */
+function labelsFrom(operation, raw) {
+  if (!Array.isArray(raw)) {
+    throw new ForgeError(operation, new Error("the response carries no label list"));
+  }
+  /** @type {string[]} */
+  const labels = [];
+  for (const entry of raw) {
+    const name = asRecord(entry)?.["name"];
+    if (typeof name !== "string") {
+      throw new ForgeError(operation, new Error("a label entry has no name"));
+    }
+    labels.push(name);
+  }
+  return labels;
+}
+
+/**
  * One repository label's full metadata — the facts GitHub holds about it.
  * `description` and `color` are each optional at the API: a label with no
  * description and a default colour is a normal label, not a broken answer.
@@ -334,6 +367,7 @@ const PER_PAGE = 100;
  *   listRepositoryLabels: () => Promise<string[]>,
  *   listRepositoryLabelsDetailed: () => Promise<RepositoryLabel[]>,
  *   getPullRequest: (number: number) => Promise<PullRequestSnapshot>,
+ *   getIssue: (number: number) => Promise<{ labels: string[] }>,
  *   listPullRequestFiles: (number: number) => Promise<PullRequestFile[]>,
  *   searchIssues: (query: string, options?: { limit?: number }) => Promise<SearchResult>,
  *   listCheckRuns: (ref: string) => Promise<CheckRunsSummary>,
@@ -369,22 +403,44 @@ export function createForge(config) {
   });
   const root = `/repos/${config.owner}/${config.repo}`;
 
+  // The identity read's second source is the GraphQL viewer. The endpoint
+  // shares the REST origin on github.com; Enterprise Server and the data
+  // residency hosts answer REST under `/api/v3` and GraphQL under
+  // `/api/graphql`. The viewer's URL is derived from the same `apiUrl` every
+  // REST read uses, so a deployment configures one GitHub origin, not two.
+  const restOrigin = new URL(config.apiUrl ?? "https://api.github.com");
+  const graphqlEndpoint = new URL(restOrigin.origin);
+  graphqlEndpoint.pathname = /\/api\/v3\/?$/.test(restOrigin.pathname)
+    ? "/api/graphql"
+    : `${restOrigin.pathname.replace(/\/+$/, "")}/graphql`;
+
   return {
     /**
      * The login the token writes as — the marker upsert finds its own
-     * comments by it. `GET /user` answers with the token's authenticated
-     * principal: `github-actions[bot]` under the workflow's GITHUB_TOKEN,
-     * the app's bot login under an App installation token, the user under a
-     * PAT — the same identity that authors whatever the token writes.
+     * comments by it. The identity is read from what the forge answers about
+     * the token, never guessed. `GET /user` answers with the token's
+     * authenticated principal for a token that has one (the user under a
+     * PAT, a fine-grained token); the workflow's GITHUB_TOKEN and every App
+     * installation token has none, and the endpoint refuses them as an
+     * integration — so the read then falls to the GraphQL viewer, which
+     * names the principal any token acts as: `github-actions[bot]` under
+     * GITHUB_TOKEN, the app's bot login under an App installation token.
+     * When both reads fail, both failures travel: the run is red rather
+     * than writing under an assumed login.
      */
     async whoami() {
       const operation = "reading the token's identity";
-      const record = asRecord(await call(operation, () => http.request("/user")));
-      const login = record?.["login"];
-      if (typeof login !== "string" || login === "") {
-        throw new ForgeError(operation, new Error("the response names no login"));
+      try {
+        const record = asRecord(await call(operation, () => http.request("/user")));
+        const login = record?.["login"];
+        if (typeof login === "string" && login !== "") return { login };
+      } catch {
+        // A refusal or a malformed answer is not an identity — it is the
+        // reason to ask the viewer. That read is the last source: when it
+        // fails too, its failure is the run's answer, and no assumed login
+        // stands in for the one nobody would name.
       }
-      return { login };
+      return viewerLogin();
     },
 
     /** The repository's own facts — the default branch name is what a run reads first. */
@@ -567,10 +623,10 @@ export function createForge(config) {
 
     /**
      * The pull request itself, read in one call: state, draft and merged
-     * flags, title, body, and both commits. This is the read a snapshot is
-     * built from and the read repeated immediately before publication — the
-     * pair of reads that makes reviewing commit A while the thread sits at
-     * commit B unreachable in practice.
+     * flags, title, body, the thread's labels, and both commits. This is
+     * the read a snapshot is built from and the read repeated immediately
+     * before publication — the pair of reads that makes reviewing commit A
+     * while the thread sits at commit B unreachable in practice.
      *
      * @param {number} number
      */
@@ -613,6 +669,7 @@ export function createForge(config) {
       // conflict signal; triage reads it as evidence, it never merges.
       const mergeable = record?.["mergeable"];
       const mergeableState = record?.["mergeable_state"];
+      const labels = labelsFrom(operation, record?.["labels"]);
       return {
         number,
         state,
@@ -622,9 +679,26 @@ export function createForge(config) {
         body,
         mergeable: typeof mergeable === "boolean" ? mergeable : null,
         mergeableState: typeof mergeableState === "string" ? mergeableState : null,
+        labels,
         head: { ref: headRef, sha: headSha },
         base: { ref: baseRef, sha: baseSha },
       };
+    },
+
+    /**
+     * A thread's labels, read live — the re-read a mutation is judged
+     * against immediately before it writes, where the event payload's label
+     * list is only a claim. `GET /issues/:n` serves pull requests too, but
+     * a pull request's snapshot read already carries its labels; this is
+     * the issue-thread read.
+     *
+     * @param {number} number
+     */
+    async getIssue(number) {
+      const operation = `reading issue #${String(number)}`;
+      const json = await call(operation, () => http.request(`${root}/issues/${String(number)}`));
+      const labels = labelsFrom(operation, asRecord(json)?.["labels"]);
+      return { labels };
     },
 
     /**
@@ -875,10 +949,12 @@ export function createForge(config) {
       // timed-out delete would 404 on the now-absent label and fail the run.
       // A 404 is the end state already reached: a replayed event or a
       // concurrent run can remove the label between the run's snapshot and
-      // this call, and GitHub answers that with 404. The thread existing is
-      // never in doubt here — every removal in these actions is preceded by
-      // an addLabels call on the same thread that would have failed first —
-      // so a 404 can only mean the label is already gone.
+      // this call, and GitHub answers that with 404. Under triage's
+      // remove-then-add ordering, this call can be the first write of the
+      // run, preceded only by the live-thread read — so a 404 here could
+      // mean the thread is gone. F-07's rule covers that inference: the
+      // label-absent end state holds either way, and F-07 names the
+      // thread-existence inference separately.
       try {
         await call(`removing '${name}' from #${String(number)}`, () =>
           http.request(`${root}/issues/${String(number)}/labels/${encodeURIComponent(name)}`, {
@@ -1241,6 +1317,43 @@ export function createForge(config) {
       url = next;
     }
   }
+
+  /**
+   * The GraphQL half of the token identity read: the viewer, which names the
+   * principal any token acts as — the app's bot login under an installation
+   * token, the user under a PAT. Carried on an HTTP POST only because the
+   * GraphQL endpoint speaks no other verb; the query reads, it never
+   * mutates. GitHub answers some refusals on this endpoint with HTTP 200 and
+   * an `errors` list instead of a status code, so an answer whose viewer
+   * names no login is refused with the provider's own first error, when it
+   * carries one — never processed as if it were an identity.
+   *
+   * @returns {Promise<{ login: string }>}
+   */
+  async function viewerLogin() {
+    const operation = "reading the token's identity from the GraphQL viewer";
+    const json = await call(operation, () =>
+      http.request(graphqlEndpoint.toString(), {
+        method: "POST",
+        body: { query: "query { viewer { login } }" },
+      }),
+    );
+    const record = asRecord(json);
+    const viewer = asRecord(asRecord(record?.["data"])?.["viewer"]);
+    const login = viewer?.["login"];
+    if (typeof login !== "string" || login === "") {
+      const detail = firstErrorDetail(record?.["errors"]);
+      throw new ForgeError(
+        operation,
+        new Error(
+          detail === undefined
+            ? "the response names no login"
+            : `the answer carries an error: ${detail}`,
+        ),
+      );
+    }
+    return { login };
+  }
 }
 
 /**
@@ -1278,6 +1391,22 @@ function asRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? /** @type {Record<string, unknown>} */ (value)
     : null;
+}
+
+/**
+ * The first readable message in a GraphQL `errors` list, or undefined — the
+ * provider's own words for why an answer carries no identity.
+ *
+ * @param {unknown} errors
+ * @returns {string | undefined}
+ */
+function firstErrorDetail(errors) {
+  if (!Array.isArray(errors)) return undefined;
+  for (const entry of errors) {
+    const message = asRecord(entry)?.["message"];
+    if (typeof message === "string" && message !== "") return message;
+  }
+  return undefined;
 }
 
 /**

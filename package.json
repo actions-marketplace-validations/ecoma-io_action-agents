@@ -1,6 +1,6 @@
 {
   "name": "@ecoma-io/action-agents",
-  "version": "0.5.0",
+  "version": "0.14.0",
   "private": true,
   "description": "Trusted, bounded, auditable GitHub Actions for repository maintenance, triage, review and harmonise, each one a self-contained action against any OpenAI-compatible model.",
   "keywords": [
@@ -34,7 +34,7 @@
     "#core/*.mjs": "./core/src/*.mjs",
     "#core-transport/*.mjs": "./core/transport/*.mjs"
   },
-  "packageManager": "pnpm@11.24.0",
+  "packageManager": "pnpm@12.3.4",
   "engines": {
     "node": ">=24",
     "pnpm": ">=11"
@@ -47,13 +47,22 @@
     "typecheck": "tsc --noEmit",
     "arch": "archkeep check",
     "arch:canary": "node tools/check-arch-canary.mjs",
+    "arch:canary-extended": "node tools/check-arch-canary-extended.mjs",
+    "arch:contract": "node tools/check-arch-contract.mjs",
+    "arch:contract:bless": "node tools/check-arch-contract.mjs --bless",
     "arch:transport-seam": "node tools/check-transport-seam.mjs",
+    "arch:http-monopoly": "node tools/check-http-monopoly.mjs",
+    "arch:forge-monopoly": "node tools/check-forge-monopoly.mjs",
+    "arch:action-shape": "node tools/check-action-shape.mjs",
     "test": "vitest run --coverage",
     "test:watch": "vitest",
     "test:tools": "node --test \"tools/**/*.test.mjs\" \"scripts/**/*.test.mjs\"",
+    "eval": "node tools/evaluate.mjs",
     "security": "node security/run-adversarial.mjs",
     "check-docs-links": "node scripts/check-docs-links.mjs",
+    "check-action-pins": "node tools/check-action-pins.mjs",
     "check-anchors": "node tools/check-anchors.mjs",
+    "check-readme-langs": "node tools/check-readme-langs.mjs",
     "check-uses-refs": "node tools/check-uses-refs.mjs",
     "check-action-inputs": "node tools/check-action-inputs.mjs",
     "check-workflow-inputs": "node tools/check-workflow-inputs.mjs",
@@ -64,10 +73,10 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.2",
     "@commitlint/config-conventional": "^21.2.2",
-    "@ecoma-io/archkeep": "0.18.1",
+    "@ecoma-io/archkeep": "0.29.0",
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.2",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^5.0.0",
     "@vitest/eslint-plugin": "^1.6.27",
     "eslint": "^10.9.0",
     "eslint-config-prettier": "^10.1.8",
@@ -77,6 +86,6 @@
     "prettier": "^3.9.6",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.67.0",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   }
 }

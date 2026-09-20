@@ -34,16 +34,18 @@ workflow's choice, and `dry-run` needs no write at all.
 
 ## Inputs
 
-| Input                | Meaning                                                                                                                                                                                                          |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `github-token`       | the token the action writes with — the workflow's `permissions:` block is the real bound                                                                                                                         |
-| `api-url`            | base URL of an OpenAI-compatible endpoint                                                                                                                                                                        |
-| `api-key`            | key for that endpoint; empty is a supported keyless configuration                                                                                                                                                |
-| `model`              | model id to ask                                                                                                                                                                                                  |
-| `request-timeout-ms` | per-attempt timeout in milliseconds for one provider call — the attempt must complete the whole completion; raise it for endpoints that legitimately take longer than 30 seconds; default 30000, floored at 1000 |
-| `config-path`        | overrides `.github/action-agents/triage/triage.json5` / `.json` — see the configuration page                                                                                                                     |
-| `labels`             | narrows the sheet the config file declares, for this call site only; a name the file does not declare is a startup error, and so is a `labels:` input with no file at all, because there is nothing to narrow    |
-| `dry-run`            | decide and log, write nothing — the default, so a first run cannot surprise anyone                                                                                                                               |
+| Input                | Meaning                                                                                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `github-token`       | the token the action writes with — the workflow's `permissions:` block is the real bound                                                                                                                           |
+| `api-url`            | base URL of an OpenAI-compatible endpoint                                                                                                                                                                          |
+| `api-key`            | key for that endpoint; empty is a supported keyless configuration                                                                                                                                                  |
+| `model`              | model id to ask                                                                                                                                                                                                    |
+| `request-timeout-ms` | per-attempt timeout in milliseconds for one provider call — the attempt must complete the whole completion; raise it for endpoints that legitimately take longer than two minutes; default 120000, floored at 1000 |
+| `config-path`        | overrides `.github/action-agents/triage/triage.json5` / `.json` — see the configuration page                                                                                                                       |
+| `labels`             | narrows the sheet the config file declares, for this call site only; a name the file does not declare is a startup error, and so is a `labels:` input with no file at all, because there is nothing to narrow      |
+| `dry-run`            | decide and log, write nothing — the default, so a first run cannot surprise anyone                                                                                                                                 |
+| `record-path`        | directory inside the workspace where the machine-readable run record is written at every terminal point — see [the run record](#the-run-record)                                                                    |
+| `verify`             | opt-in verification of the decision before anything is written — one bounded model call, downgrade-only, [its own section](#verification-opt-in-issue-274); default `false`, and a dry run never requests it       |
 
 Timeouts come in two layers. `request-timeout-ms` bounds one provider attempt; retries,
 backoff, `Retry-After` and the attempt limit are `core/transport/http.mjs` policy, not inputs.
@@ -73,6 +75,7 @@ statuses — are stated in [the core ceilings](ceilings.md#the-retry-ceiling).
       "documentation",
       "enhancement",
       "question",
+      "accepted-risk",
       "good first issue",
       "size/xs",
       "size/s",
@@ -85,6 +88,7 @@ statuses — are stated in [the core ceilings](ceilings.md#the-retry-ceiling).
       documentation: "semantic-classification",
       enhancement: "semantic-classification",
       question: "semantic-classification",
+      "accepted-risk": "semantic-classification",
       "good first issue": "routing-area",
     },
 
@@ -381,6 +385,12 @@ call, no mutation. An event that is not on the matrix is re-triaged, never
 silently skipped; `labeled` re-triages only when the change could move the
 queue lifecycle, and `unlabeled` always skips.
 
+One branch reads live before a skip becomes final: a `labeled` event whose
+changed label carries the `semantic-classification` role while the config
+declares queue markers arbitrates the payload's "not queued" claim against
+one live labels read at the call site, re-deciding when a marker the payload
+does not show is actually there; `events.mjs` itself stays pure.
+
 The model's answer is matched exactly against the sheet, in the Policy stage:
 `bug `, `Bug` and `BUG` are not `bug`, an off-sheet label is refused and
 logged rather than coerced, and an answer entirely off-sheet fails the run
@@ -419,13 +429,165 @@ sanitised candidate title; it states that the thread stays open and nothing
 is closed. A run that judged nothing incomplete and nothing related writes
 no comment at all.
 
+### Verification, opt-in (issue #274)
+
+Between the decision and any write sits an opt-in second look. It is off by
+default (`verify: false`); with `verify: true`, a non-dry-run makes one
+bounded model call after the decision and before any mutation, and a dry run
+never makes it — an operator previewing a decision sees the unverified
+decision, exactly as without the input.
+
+The pass checks operations; it does not propose any. The plan is minted by
+code from the decision — `add:<label>` per entry in `add`, `remove:<label>`
+per entry in `remove`, the bare `comment` when the decision's kind is the
+comment, and the bare `signal` when the decision composed a signal comment —
+so the verifier can neither invent nor merge an operation: a verdict naming
+an id outside the plan confirms nothing. The prompt restates
+that plan against the same evidence snapshot the decision was derived from —
+the thread's title, body and labels, wrapped as untrusted data, never
+re-read — and asks for one JSON array with one entry per operation:
+`{opId, verdict, reason}`. `opId` must quote a plan id the code minted,
+`verdict` must come from the closed vocabulary
+`confirmed | refuted | uncertain`, and `reason` must be a string of at most
+300 characters. (The judgment pair the issue froze is `verdict` + `reason`;
+the `opId` is the quote binding that ties a judgment to a plan operation, and
+the record's frozen `answers: [{opId, verdict, reasonDigest}]` shape requires
+it.)
+
+There is exactly one ask. Any deviation — an answer that does not parse, a
+wrong shape, an entry naming an operation the plan does not hold, an
+off-vocabulary verdict, a reason over its cap — leaves the operations it does
+not validly judge `uncertain`, and a transport failure lands the same way. A
+re-ask would teach the model that ignoring the contract is cheap.
+
+The pass is downgrade-only. A `refuted` or `uncertain` operation becomes a
+typed refusal entry in the decision — naming the operation id, the verdict
+and the verifier's reason, every untrusted fragment sanitised, one line,
+capped — and leaves the plan; a `confirmed` one stands. No verdict can add,
+widen or enable a write, so a hostile or useless verifier can at worst refuse
+a legitimate write. When every operation is downgraded there is nothing left
+to write: the run ends `refused` — a green run, a refusal being the ceilings
+working — with a reason naming the downgraded operations, and the mutate call
+never happens.
+
+The record carries the pass's durable half: `verification.requested`, one
+`answers` entry per verified operation carrying the sha256 digest of the
+reason text the verdict held, and the `downgraded` operation ids in plan
+order. The reason text itself stays out of the record; its digest makes the
+text checkable by whoever holds it. With the input off, on a dry run, or when
+the decision proposed nothing, the block is the empty one.
+
+What the pass does not catch, stated plainly: an answer that is fabricated
+but consistent — a model that confirms every operation regardless of the
+evidence, with well-formed reasons — reads exactly like a verification. The
+pass is a second opinion, not a proof; the ceilings it strengthens are the
+sheet and the sanitiser, which verification cannot weaken. Also by design:
+the code-composed signal comment's write is verified like every other write
+(issue #325) — a signal the pass does not confirm is dropped outright — and
+verification failure is never run failure.
+
+### The run record
+
+Every run ends in a record, whatever its terminal point: a landed mutation,
+a dry run, an event-gate skip, a write the freshness gate withheld, a
+failure. `triage/src/run-record.mjs` builds
+it, validates it fail-closed and serialises it byte-deterministically; the
+write itself is `writeRunRecord` in `triage/src/index.mjs`, under the same
+workspace ceiling every read honours — the path must resolve inside
+`GITHUB_WORKSPACE`, and `.git` is refused outright, before and after the
+directory is created.
+
+Where it is written, per terminal path:
+
+- a **landed mutation** — after `mutate()` returns, the record is written
+  with the decision attached. A failed write here is a logged loss, not a red
+  run: the mutate was the run's outcome, and the record was the loss.
+- a **dry run** — the same point, same rule; the record says `dryRun: true`
+  and its outcome is `skip` (the run contract's word for a run that wrote
+  nothing — see the mapping table in
+  [the run contract](../run-contract.md#what-todays-outcomes-map-to)).
+- an **event-gate skip** — the record is written before the run returns, with
+  the gate's reason verbatim and no `decision` key. Here a failed write is a
+  red run: a skip's record is the skip's whole outcome.
+- a **withheld write** — the freshness gate found the thread changed while
+  the run was in flight: nothing lands, the warning still names what moved,
+  and the record is written with `outcome: "abandoned"` and the divergence
+  reason as its `reason`, the superseded decision still carried. The run
+  stays green; here a failed write is a red run, exactly like the event-gate
+  skip — nothing else landed, so the record is the run's whole outcome.
+- a **failure** — the record is written in `run`'s catch, then the original
+  error is rethrown; the record's own write failure is logged, never allowed
+  to mask the original. A run that dies before the payload parses names no
+  thread and no policy pin — the record carries `null`s and the filename
+  falls back to the event name. A run that dies in the model call still says
+  what each ask saw: `modelAttempts` is filled as the asks happen, so the
+  failure's record carries the per-attempt facts (#521), not just the
+  reason.
+- a **config refusal** — the policy file is present but does not validate: the
+  run ends in `run`'s catch like a failure, but the record says
+  `outcome: "refused"` — the deterministic startup refusal the run contract's
+  F-02 names (#472), typed at the validation wrap so a misconfiguration never
+  reads as a defect. The reader arm stays `failed`: a configured
+  `config-path` naming a file the branch does not have, a policy declared
+  twice, a foreign schema major, a file that does not parse, a file past the
+  byte cap — the core loader throws them all outside the validation wrap.
+- a **downgraded plan** — opt-in verification refused every operation the
+  decision proposed: there is nothing left to write, the mutate call never
+  happens, and the run ends `refused` — green, a refusal being the ceilings
+  working. The record is written before the run returns with the
+  post-filter decision and the filled verification block, and here a failed
+  write is a red run, exactly like the event-gate skip — the record is the
+  run's whole outcome.
+
+The fields, in schema version 2: `schemaVersion`, `repository`, `event`
+(`eventName`, `action`), `thread` (`type`, `number`; `null` when the run died
+before the payload parsed), `dryRun`, `model`, `modelAttempts` (version 2's
+addition, #521 — the facts of each model ask, at most the retry contract's
+two: per attempt the code-owned `outcome` word, the HTTP `status` the
+transport saw or `null`, the request body's `bytes` as the chat seam measured
+them or `null` when the seam reported none, and the provider-declared,
+capped `finishReason`; the empty list when the run never asked the model),
+`policy` (`basis`, `branch`,
+`sha`; `null` before the source resolved), `decision` (present iff the run
+reached one: `kind`, `add`, `remove` with their code-owned reasons,
+`refusals`, the sanitised capped `rationale`, and the `signal` with its
+sanitised related title), `outcome`, `reason`, and the `verification` block
+issue #274 froze — `requested`, `answers` (`opId`, `verdict`, `reasonDigest`)
+and `downgraded` — filled by the opt-in verification pass when it ran, and
+the empty block otherwise. The executor's log lines and the comment body
+stay out: the log lines are the run log's, and the comment itself is the
+durable form of that path.
+
+`outcome` speaks the run contract's terminal-state vocabulary only —
+`published`, `partial`, `refused`, `abandoned`, `skip`, `failed` — and the
+validator refuses anything else. Today's paths use `published` (a landed
+mutation), `skip` (a dry run or an event-gate exit), `abandoned` (a write
+the freshness gate withheld — the thread changed while the run was in
+flight), `refused` (a deterministic refusal: opt-in verification downgraded
+every operation the decision proposed — nothing left to write — or a policy
+file present but failing to validate, the startup refusal #472 typed) and
+`failed` (what lands in the catch: a defect or an environment break; the
+config refusal is the one refusal the catch records, and it arrives typed).
+
+Delivery: the file lands under the `record-path` directory (default
+`.triage-record`), named `triage-record-<type>-<number>.json` for a parsed
+thread and `triage-record-<eventName>.json` for a run that died before the
+payload parsed — both inside the upload glob `triage-record-*.json`, which
+this repository's own triage workflow uploads with `if: always()`.
+
 ## Failure posture
 
 A run fails loudly. The provider unreachable after retries, a config that does
 not validate, an answer entirely off-sheet — the step goes red rather than
 green-on-nothing, and a workflow that wants triage soft uses
-`continue-on-error`. Refused labels are logged before the run ends, so the
-annotation says what was refused and why.
+`continue-on-error`. The config that does not validate records `refused` —
+the record word for the ceilings declining a misconfiguration (#472), never a
+defect; a config that cannot be read at all (a configured `config-path`
+naming a file the branch does not have) records `failed`. Refused labels are
+logged before the run ends, so the annotation says what was refused and why.
+The record write has its own two-tier posture, stated in
+[the run record](#the-run-record): after the run's own outcome has landed it
+is a logged loss, everywhere else it is the red run.
 
 ## What `triage` never does
 
@@ -438,6 +600,54 @@ thread wording can steer neither: the model's labels are matched exactly
 against the sheet, and the comment is composed by code. The PR evaluators
 read more than the issue side — a snapshot, checks, review state — and
 mutate nothing either: evidence never grows the write surface.
+
+## Architecture evidence — a recorded non-goal
+
+Every fact a `triage` decision rests on is read through the API: the event
+payload, the policy at its pinned SHA, the label metadata GitHub holds, the
+per-file diff counts, the thread's live state. The working tree is never
+evidence — the checkout a workflow needs so the runner can find the action at
+`./triage` is not read by the action, and no report file a workflow step
+leaves beside the run reaches it, because no input names one. That is a
+posture, not an omission: the working tree under `pull_request` is untrusted
+input, and `review` accepts that exposure because its subject _is_ the tree —
+paying for it with the workspace ceiling, the frozen tool registry and the
+evidence framing that surround every read. `triage`'s decisions — labels from
+a closed sheet, a measured size rung, a code-composed signal — never need tree
+bytes, so it takes on none of the exposure.
+
+The Archkeep runtime-integration campaign (#518,
+[the design record](archkeep-integration-analysis.md)) named this the one
+deliberate posture change P4 could have made: where a report exists for the
+same event, architecture facts could have joined the model's evidence, label
+picks staying closed-sheet and new record facts epistemic-state fields from a
+closed vocabulary — never a new GitHub-visible state. P4 evaluated the design
+record's three conditions (#550), and the answer is no:
+
+1. **A docs-first posture change** — decided by this section, and the decision
+   is that the posture does not change.
+2. **Dogfood evidence that review's architecture facts ever changed a
+   triage-relevant decision** — none exists. The P3 dogfood window (pull
+   requests #546, #547, #549) holds a triage run on every campaign pull
+   request, each classifying from its own API evidence — `enhancement` and
+   the measured size rung — with no architecture input; and no channel
+   connects review's architecture facts to a triage decision, so none could
+   have changed one.
+3. **Acknowledgement as consumer #2 in the reader's placement argument** —
+   moot with the second condition failed.
+
+The recorded state is therefore: **`triage` is architecture-blind by design,
+and staying that way is a non-goal of this repository** — not deferred work,
+not a roadmap item. Architecture facts are `review`'s evidence, recorded in
+its artifact and comment and enforced by nobody
+([ADR 006](../adr/006-code-scanning-merge-enforcement.md)); `triage`'s labels
+speak about the thread, not about the law, and the placement lever of the
+architecture reader in `core/` stands at promotion-later, review its only
+consumer. The revisit trigger is
+[ADR 002](../adr/002-no-intelligence-layer.md)'s own standard: a concrete,
+evidenced triage-relevant decision that only architecture facts could have
+carried, filed as an issue naming the decision and the evidence. A roadmap
+hunch does not reopen this.
 
 ## What `triage` uses from `core/`
 

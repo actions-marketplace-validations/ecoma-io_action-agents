@@ -18,10 +18,53 @@
     ".opencode/**",
   ],
 
-  // Generous but bounded: the largest diffs this repository sees are
-  // vendored-skill syncs, and those are exactly the ones worth refusing to
-  // half-review.
+  // A resource budget, not a PR-size rule. The count is additions plus
+  // deletions over the post-ignore universe; a diff past it is refused
+  // outright (red, recorded `refused`) rather than half-reviewed. No
+  // eligibility rule reclassifies that outcome — a change this repository
+  // cannot review completely is stated as such, never skipped green.
   maxDiffLines: 3000,
+
+  // The eligibility axis — whether a pull request consumes a review run at
+  // all. Every skip here is anchored by one of the three anchors the
+  // validator enforces: a pinned context, GitHub's bot attestation, or a
+  // measurement. Title, branch, path and label conventions never anchor a
+  // skip; they only narrow rules the anchor already governs.
+  applicability: {
+    // GitHub-attested bots classified as `automation`. Exact logins.
+    // `ecoma-io[bot]` is the release automation (release-please): the one
+    // bot whose writes this repository already trusts to merge.
+    bots: ["ecoma-io[bot]"],
+
+    // First match wins — a match ends the search.
+    rules: [
+      {
+        // Release pull requests contain no hand-written code:
+        // release-please folds version files and changelogs (the design
+        // record's motivating example, #192). Pinned context anchors the
+        // skip; the title and branch conventions narrow it to actual
+        // release pull requests so any other write the app makes stays
+        // reviewable.
+        id: "release-prs",
+        context: "automation",
+        when: {
+          title: "^chore\\(workspace\\): release",
+          branch: "^release-please--",
+        },
+        run: false,
+      },
+      {
+        // Every other GitHub-attested bot — renovate-class dependency
+        // automation among them. `user.type` is GitHub's own attestation:
+        // nobody but GitHub can mint it, and no pull-request content can
+        // fake it. Adding a bot to the allowlist above promotes it to
+        // full review; everything not listed lands here.
+        id: "unlisted-bots",
+        when: { author: { isBot: true } },
+        run: false,
+      },
+    ],
+  },
 
   // Path-scoped rubrics. Every document here must exist on the default
   // branch — a declared rule with no file is a startup error, not dormancy.

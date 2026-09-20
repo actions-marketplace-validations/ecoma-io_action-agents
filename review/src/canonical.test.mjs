@@ -1,0 +1,473 @@
+// Tests for the canonical result contract: the constructor is the only way
+// in, every closed vocabulary is enforced, fingerprints are recomputed and
+// checked against the reviewed bytes' own spelling, same-key claims collapse
+// to the first in publication order, and what it returns is frozen.
+
+import { describe, expect, it } from "vitest";
+
+import {
+  CANONICAL_VERSION,
+  CanonicalResultError,
+  RUN_STATES,
+  RUN_VERDICTS,
+  buildCanonicalRecord,
+  createCanonicalResult,
+  withRunPublication,
+} from "./canonical.mjs";
+import { ArtifactError } from "./artifact.mjs";
+import { isDigest } from "./digest.mjs";
+import { findingFingerprint, findingFingerprintV1 } from "./identity.mjs";
+import { DeterministicRefusalError } from "./refusal.mjs";
+import { FINDING_KINDS, RECONCILIATIONS } from "./vocabulary.mjs";
+
+/** A publication finding as the verification pass leaves it. */
+const finding = (over = {}) => ({
+  kind: "correctness",
+  file: "src/a.mjs",
+  line: 12,
+  severity: "concern",
+  message: "the guard is missing",
+  subject: "if (!x) return;",
+  lifecycle: "confirmed",
+  ...over,
+});
+
+const build = (over = {}) =>
+  createCanonicalResult({
+    head: "9c9473e",
+    run: { state: "published", verdict: "pass" },
+    findings: [finding()],
+    ...over,
+  });
+
+describe("createCanonicalResult", () => {
+  it("builds the frozen result with a recomputed fingerprint", () => {
+    const result = build();
+    expect(result.version).toBe(CANONICAL_VERSION);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.findings)).toBe(true);
+    expect(Object.isFrozen(result.findings[0])).toBe(true);
+    expect(Object.isFrozen(result.run)).toBe(true);
+    expect(Object.isFrozen(result.collapsed)).toBe(true);
+    expect(result.findings[0]?.fingerprint).toBe(
+      findingFingerprint({ file: "src/a.mjs", kind: "correctness", subject: "if (!x) return;" }),
+    );
+  });
+
+  it("normalises the path and the subject before hashing", () => {
+    const result = build({
+      findings: [finding({ file: "./src/a.mjs", subject: " if  (!x)  return; " })],
+    });
+    expect(result.findings[0]?.file).toBe("src/a.mjs");
+    expect(result.findings[0]?.subject).toBe("if (!x) return;");
+    expect(result.findings[0]?.fingerprint).toBe(
+      findingFingerprint({ file: "src/a.mjs", kind: "correctness", subject: "if (!x) return;" }),
+    );
+  });
+
+  it("collapses claims that share the identity key to the first in publication order", () => {
+    const result = build({
+      findings: [
+        finding({ message: "first claim" }),
+        finding({ message: "second claim, same span and kind" }),
+      ],
+    });
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.message).toBe("first claim");
+    expect(result.collapsed).toEqual([
+      { fingerprint: result.findings[0]?.fingerprint, message: "second claim, same span and kind" },
+    ]);
+  });
+
+  it("keeps claims on one span apart when their kinds differ", () => {
+    const result = build({
+      findings: [finding(), finding({ kind: "style", message: "naming" })],
+    });
+    expect(result.findings).toHaveLength(2);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it("keeps two long-span claims apart that share a 200-character prefix — truncation never merges", () => {
+    const prefix = "x".repeat(200);
+    const result = build({
+      findings: [
+        finding({ subject: prefix + "a".repeat(50), message: "first" }),
+        finding({ subject: prefix + "b".repeat(50), message: "second" }),
+      ],
+    });
+    expect(result.findings).toHaveLength(2);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it("rejects a stored fingerprint that the reviewed bytes do not spell", () => {
+    expect(() => build({ findings: [finding({ fingerprint: "0".repeat(64) })] })).toThrow(
+      CanonicalResultError,
+    );
+  });
+
+  it("accepts a stored fingerprint the constructor itself spells", () => {
+    const fingerprint = findingFingerprint({
+      file: "src/a.mjs",
+      kind: "correctness",
+      subject: "if (!x) return;",
+    });
+    const result = build({ findings: [finding({ fingerprint })] });
+    expect(result.findings[0]?.fingerprint).toBe(fingerprint);
+  });
+
+  it("pins the record schema at version 2 — the full-span identity migration", () => {
+    expect(CANONICAL_VERSION).toBe(2);
+  });
+
+  it("verifies a stored v1 fingerprint under the retired scheme the input's version spells", () => {
+    const stored = findingFingerprintV1({
+      file: "src/a.mjs",
+      kind: "correctness",
+      subject: "if (!x) return;",
+    });
+    const result = build({ version: 1, findings: [finding({ fingerprint: stored })] });
+    expect(result.version).toBe(1);
+    expect(result.findings[0]?.fingerprint).toBe(stored);
+  });
+
+  it("refuses a record version the pipeline never spelled", () => {
+    expect(() => build({ version: 3 })).toThrow(CanonicalResultError);
+  });
+
+  it("rejects findings outside the closed vocabularies", () => {
+    expect(() => build({ findings: [finding({ kind: "plot" })] })).toThrow(/findings\[0\]\.kind/);
+    expect(() => build({ findings: [finding({ severity: "blocker" })] })).toThrow(/severity/);
+    expect(() => build({ findings: [finding({ lifecycle: "candidate" })] })).toThrow(/lifecycle/);
+    expect(() => build({ findings: [finding({ verdict: "maybe" })] })).toThrow(/verdict/);
+  });
+
+  it("rejects a verdict whose publication state disagrees", () => {
+    expect(() =>
+      build({ findings: [finding({ verdict: "refuted", lifecycle: "confirmed" })] }),
+    ).toThrow(/publishes as refuted/);
+    const uncertain = build({
+      findings: [finding({ verdict: "uncertain", lifecycle: "unresolved" })],
+    });
+    expect(uncertain.findings[0]?.lifecycle).toBe("unresolved");
+  });
+
+  it("rejects a run record outside the contract vocabulary", () => {
+    expect(() => build({ run: { state: "settled", verdict: "pass" } })).toThrow(/run\.state/);
+    expect(() => build({ run: { state: "published", verdict: "fine" } })).toThrow(/run\.verdict/);
+    expect(() => build({ run: null })).toThrow(/run must carry/);
+  });
+
+  it("rejects a head that is not a git sha", () => {
+    expect(() => build({ head: "not-a-sha" })).toThrow(/head/);
+    expect(build({ head: "9c9473e9227c09fbbf9a1bdd96fd3ea7cf8ffd81" }).head).toBe(
+      "9c9473e9227c09fbbf9a1bdd96fd3ea7cf8ffd81",
+    );
+  });
+
+  it("rejects findings that are not anchored or not named", () => {
+    expect(() => build({ findings: [finding({ line: 0 })] })).toThrow(/line/);
+    expect(() => build({ findings: [finding({ line: 1.5 })] })).toThrow(/line/);
+    expect(() => build({ findings: [finding({ file: "" })] })).toThrow(/file/);
+    expect(() => build({ findings: [finding({ message: "" })] })).toThrow(/message/);
+    expect(() => build({ findings: [finding({ subject: "" })] })).toThrow(/subject/);
+  });
+
+  it("rejects evidence that does not carry a content digest", () => {
+    expect(() =>
+      build({ findings: [finding({ evidence: { digest: "nope", excerpt: "…" } })] }),
+    ).toThrow(/evidence\.digest/);
+    const bound = build({
+      findings: [
+        finding({
+          verdict: "confirmed",
+          evidence: { digest: "a".repeat(64), excerpt: "if (!x) return;" },
+        }),
+      ],
+    });
+    const boundFinding = bound.findings[0];
+    expect(isDigest(boundFinding?.evidence?.digest)).toBe(true);
+    expect(Object.isFrozen(boundFinding?.evidence)).toBe(true);
+  });
+
+  it("builds the nothing-to-review result", () => {
+    const result = build({ findings: [] });
+    expect(result.findings).toEqual([]);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it("clones and deep-freezes the coverage report it carries", () => {
+    const coverage = { covered: ["src/a.mjs"], uncovered: [], total: 1 };
+    const result = build({ coverage });
+    const carried = result.coverage;
+    if (!carried) {
+      throw new Error("the carried coverage report is missing");
+    }
+    expect(carried).toEqual({ covered: ["src/a.mjs"], uncovered: [], total: 1 });
+    expect(carried).not.toBe(coverage);
+    expect(Object.isFrozen(carried)).toBe(true);
+    expect(Object.isFrozen(carried.covered)).toBe(true);
+    expect(Object.isFrozen(carried.uncovered)).toBe(true);
+    coverage.covered.push("src/b.mjs");
+    expect(carried.covered).toEqual(["src/a.mjs"]);
+    expect("coverage" in build()).toBe(false);
+  });
+});
+
+describe("the closed vocabularies", () => {
+  it("pin the run-contract states and verdicts", () => {
+    expect([...RUN_STATES]).toEqual([
+      "published",
+      "partial",
+      "refused",
+      "abandoned",
+      "skip",
+      "failed",
+    ]);
+    expect([...RUN_VERDICTS]).toEqual(["pass", "fail", "unknown"]);
+  });
+
+  it("pin the reconciliation states — code computes them, the model never writes one", () => {
+    expect([...RECONCILIATIONS]).toEqual(["new", "persisting", "moved", "resolved", "unresolved"]);
+  });
+
+  it("pin the finding kinds the identity is keyed on", () => {
+    expect([...FINDING_KINDS]).toEqual([
+      "correctness",
+      "security",
+      "performance",
+      "api-misuse",
+      "resource-safety",
+      "style",
+      "test-gap",
+      "documentation",
+    ]);
+  });
+});
+
+describe("the publication fact", () => {
+  it("carries the publication fact beside the verdict when the run provides it", () => {
+    const result = build({ run: { state: "published", verdict: "fail", publication: "created" } });
+    expect(result.run).toEqual({
+      state: "published",
+      verdict: "fail",
+      publication: "created",
+    });
+  });
+
+  it("builds a record without a publication fact when none is given — v1 stays parseable", () => {
+    expect("publication" in build().run).toBe(false);
+  });
+
+  it("validates the publication fact against the upsert's vocabulary", () => {
+    expect(() =>
+      build({ run: { state: "published", verdict: "pass", publication: "published" } }),
+    ).toThrow(/run\.publication/);
+  });
+
+  it("keeps publication independent of the verdict — the two facts never weld", () => {
+    // A partial review's write lands: a failing verdict, a created comment.
+    const landedOnFail = build({
+      run: { state: "published", verdict: "fail", publication: "created" },
+    });
+    expect(landedOnFail.run.verdict).toBe("fail");
+    expect(landedOnFail.run.publication).toBe("created");
+    // The constructor keeps the facts orthogonal: publication success is not
+    // the review verdict. (A run itself never constructs a canonical for a
+    // lost write — an abandoned upsert returns before the canonical exists —
+    // but the fact, once attached, stays independent of the verdict.)
+    const lostOnPass = build({
+      run: { state: "published", verdict: "pass", publication: "abandoned" },
+    });
+    expect(lostOnPass.run.verdict).toBe("pass");
+    expect(lostOnPass.run.publication).toBe("abandoned");
+  });
+
+  it("withRunPublication attaches the real outcome without recomputing the record", () => {
+    const result = build();
+    const withPublication = withRunPublication(result, "updated");
+    expect(withPublication.run).toEqual({
+      state: "published",
+      verdict: "pass",
+      publication: "updated",
+    });
+    // Everything else is the same frozen record, by reference.
+    expect(withPublication.findings).toBe(result.findings);
+    expect(withPublication.collapsed).toBe(result.collapsed);
+    expect(withPublication.head).toBe(result.head);
+    expect(Object.isFrozen(withPublication)).toBe(true);
+    expect(Object.isFrozen(withPublication.run)).toBe(true);
+    expect(() => withRunPublication(result, "published")).toThrow(/run\.publication/);
+  });
+});
+
+describe("buildCanonicalRecord", () => {
+  it("delegates a valid record to the constructor unchanged", () => {
+    const result = buildCanonicalRecord({
+      head: "9c9473e",
+      run: { state: "published", verdict: "pass" },
+      findings: [finding()],
+    });
+    expect(result).toEqual(build());
+  });
+
+  it("retypes a shape rejection as the typed refusal the birth seam records", () => {
+    const attempt = () =>
+      buildCanonicalRecord({
+        head: "9c9473e",
+        run: { state: "published", verdict: "pass" },
+        findings: [finding({ subject: "" })],
+      });
+    expect(attempt).toThrow(DeterministicRefusalError);
+    expect(attempt).toThrow(/the run's record did not validate/);
+    expect(attempt).toThrow(/subject must be a non-empty string/);
+    // The cause chain stays intact: the belt retypes, it never erases.
+    try {
+      attempt();
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(DeterministicRefusalError);
+      expect(/** @type {Error} */ (cause).cause).toBeInstanceOf(CanonicalResultError);
+    }
+  });
+
+  it("lets a non-shape error travel untouched — the belt is not an exception sink", () => {
+    expect(() => buildCanonicalRecord(/** @type {*} */ (null))).toThrow(TypeError);
+  });
+});
+
+describe("the architecture section's carry (ADR 003 — additive)", () => {
+  const HEAD = "9c9473e9227c09fbbf9a1bdd96fd3ea7cf8ffd81";
+  const BASE = "1d147e30f9e26e5f1e7d68b0e5a9e4d5c3b2a190";
+
+  /** A valid established section — the shape every aware surface carries. */
+  const section = (over = {}) =>
+    /** @type {import("./artifact.mjs").ArchitectureSection} */ (
+      structuredClone({
+        verdict: "fail",
+        stale: false,
+        unknownReason: null,
+        coverage: { complete: true, analyzedFiles: 4, notAnalyzedCount: 0, blindSpotCount: 0 },
+        policyChanged: false,
+        toolVersion: "0.29.0",
+        reportDigest: "a".repeat(64),
+        provenance: { head: { commit: HEAD }, base: { commit: BASE } },
+        policyFingerprints: { head: `sha256:${"1".repeat(64)}`, base: `sha256:${"2".repeat(64)}` },
+        counts: {
+          introduced: 1,
+          introducedWaived: 0,
+          resolved: 0,
+          unchanged: 2,
+          unresolvable: { introduced: 0, resolved: 0, unchanged: 0, unknown: 0 },
+        },
+        introduced: [
+          {
+            messageId: "module-boundary",
+            sourceProject: "widgets-a",
+            target: "widgets-b/src/index.mjs",
+            waived: false,
+            headCount: 1,
+            decisionRef: null,
+          },
+        ],
+        resolved: [],
+        renamePairs: [],
+        customRules: null,
+        occurrencesReduced: 0,
+        ...over,
+      })
+    );
+
+  it("is absent on a record built without one — the pre-architecture shape, byte for byte", () => {
+    expect("architecture" in build()).toBe(false);
+    expect(Object.keys(build()).sort()).toEqual([
+      "collapsed",
+      "findings",
+      "head",
+      "run",
+      "version",
+    ]);
+  });
+
+  it("carries the section beside the findings, deep-frozen, additive", () => {
+    const input = section();
+    const result = build({ architecture: input });
+    expect(result.architecture).toEqual(input);
+    expect(Object.isFrozen(result.architecture)).toBe(true);
+    expect(Object.isFrozen(result.architecture?.counts)).toBe(true);
+    expect(result.architecture).not.toBe(input); // re-validated, never trusted by reference
+    // The record's other arms are untouched by the carry — the key set grew
+    // by exactly one.
+    expect(Object.keys(result).sort()).toEqual([
+      "architecture",
+      "collapsed",
+      "findings",
+      "head",
+      "run",
+      "version",
+    ]);
+    // A JSON round trip is what the marker block spells; the section
+    // survives it unchanged.
+    expect(JSON.parse(JSON.stringify(result)).architecture).toEqual(section());
+  });
+
+  it("keeps the section out of the record's own vocabulary — it is a fact, not a state", () => {
+    // The section never joins the reconciliation vocabulary a finding
+    // carries; it rides beside the run facts, additive and inert.
+    const result = build({ architecture: section() });
+    expect("reconciliation" in (result.architecture ?? {})).toBe(false);
+    expect(result.findings[0]?.reconciliation).toBeUndefined();
+  });
+
+  it("retypes the validator's refusal into this constructor's vocabulary — never an ArtifactError", () => {
+    const attempt = () => build({ architecture: section({ verdict: "maybe" }) });
+    expect(attempt).toThrow(CanonicalResultError);
+    expect(attempt).not.toThrow(ArtifactError);
+    expect(attempt).toThrow(/architecture\.verdict 'maybe' is outside the vocabulary/);
+    // The exact-keys law holds through the carry too — the label spells the
+    // record's arm, not the artifact's.
+    expect(() => build({ architecture: section({ extra: 1 }) })).toThrow(
+      /^architecture has an unknown key 'extra'/,
+    );
+  });
+
+  it("flows through the birth seam as the typed refusal the red boundary records", () => {
+    const attempt = () =>
+      buildCanonicalRecord({
+        head: "9c9473e",
+        run: { state: "published", verdict: "pass" },
+        findings: [finding()],
+        architecture: section({ verdict: "unknown", unknownReason: null }),
+      });
+    expect(attempt).toThrow(DeterministicRefusalError);
+    expect(attempt).toThrow(/the run's record did not validate/);
+    expect(attempt).toThrow(/without saying which kind/);
+    try {
+      attempt();
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(DeterministicRefusalError);
+      expect(/** @type {Error} */ (cause).cause).toBeInstanceOf(CanonicalResultError);
+    }
+  });
+
+  it("carries the withheld shape as faithfully as the established one — unknown is a fact, not a defect", () => {
+    const withheld = build({
+      architecture: section({
+        verdict: "unknown",
+        stale: true,
+        unknownReason: "stale",
+        introduced: [],
+        counts: {
+          introduced: 1,
+          introducedWaived: 0,
+          resolved: 0,
+          unchanged: 2,
+          unresolvable: { introduced: 0, resolved: 0, unchanged: 0, unknown: 0 },
+        },
+      }),
+    });
+    expect(withheld.architecture?.verdict).toBe("unknown");
+    expect(withheld.architecture?.stale).toBe(true);
+    // The run's own verdict is untouched by the withheld section — the
+    // canonical states facts, it does not derive verdicts from them.
+    expect(withheld.run.verdict).toBe("pass");
+  });
+});

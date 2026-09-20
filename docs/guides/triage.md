@@ -22,7 +22,7 @@ off-sheet applies its on-sheet half and logs the rest.
 Add a workflow file under `.github/workflows/`. The minimal form:
 
 ```yaml
-- uses: ecoma-io/action-agents/triage@v0.5
+- uses: ecoma-io/action-agents/triage@v0.12
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     api-url: ${{ vars.LLM_API_URL }}
@@ -30,7 +30,7 @@ Add a workflow file under `.github/workflows/`. The minimal form:
     model: ${{ vars.LLM_MODEL }}
 ```
 
-Pin to a floating minor (`@v0.5`), an exact version (`@v0.5.0`) or a commit SHA.
+Pin to a floating minor (`@v0.12`), an exact version (`@v0.12.0`) or a commit SHA.
 See [Getting started](getting-started.md#pinning) for the tradeoffs.
 
 The action is referenced as the directory `triage` in the repository. The
@@ -42,25 +42,61 @@ All inputs listed below. Shared inputs (`github-token`, `api-url`, `api-key`,
 `model`, `request-timeout-ms`, `config-path`) are documented in the
 [development configuration page](../development/configuration.md).
 
-| Input                | Required | Default | What it does                                              |
-| -------------------- | -------- | ------- | --------------------------------------------------------- |
-| `github-token`       | yes      | —       | Token for GitHub API calls.                               |
-| `api-url`            | yes      | —       | Base URL of an OpenAI-compatible endpoint.                |
-| `api-key`            | no       | —       | Key for that endpoint. Leave unset for keyless endpoints. |
-| `model`              | yes      | —       | Model id to ask.                                          |
-| `request-timeout-ms` | no       | `30000` | Per-attempt timeout in milliseconds.                      |
-| `config-path`        | no       | `""`    | Override the config file location.                        |
-| `labels`             | no       | `""`    | Narrow the label sheet to a comma-separated subset.       |
-| `dry-run`            | no       | `true`  | Decide and log, write nothing.                            |
+| Input                | Required | Default          | What it does                                                            |
+| -------------------- | -------- | ---------------- | ----------------------------------------------------------------------- |
+| `github-token`       | yes      | —                | Token for GitHub API calls.                                             |
+| `api-url`            | yes      | —                | Base URL of an OpenAI-compatible endpoint.                              |
+| `api-key`            | no       | —                | Key for that endpoint. Leave unset for keyless endpoints.               |
+| `model`              | yes      | —                | Model id to ask.                                                        |
+| `request-timeout-ms` | no       | `120000`         | Per-attempt timeout in milliseconds.                                    |
+| `config-path`        | no       | `""`             | Override the config file location.                                      |
+| `labels`             | no       | `""`             | Narrow the label sheet to a comma-separated subset.                     |
+| `dry-run`            | no       | `true`           | Decide and log, write nothing.                                          |
+| `verify`             | no       | `false`          | One extra model call re-checks the plan before writing; downgrade-only. |
+| `record-path`        | no       | `.triage-record` | Directory for the machine-readable run record.                          |
 
 **`labels`**: a comma-separated subset of the label sheet declared in the config
 file. A name the file does not declare is a startup error. Setting this with no
 file at all is also a startup error, because there is nothing to narrow. Empty
 means no narrowing — with no file the classification is written as a comment.
 
+**`record-path`**: every run — landed mutation, dry run, gate skip, withheld
+write, failure —
+writes one machine-readable record here: event, thread, policy pin, the
+decision when one was made, the terminal state in the run contract's
+vocabulary, and the reason. The write is confined to the workspace and `.git`
+is refused; a consumer workflow can upload the files with the glob
+`triage-record-*.json`, the way this repository's own workflow does.
+
 **`dry-run`**: defaults to `true`, so a first run cannot surprise anyone. When
 true, the action decides and logs the classification but writes no labels and no
 comment. Flip to `false` after verifying the sheet produces the right results.
+
+**`verify`**: defaults to `false` — the second look is opt-in. When true, after
+the decision and before anything is written, the run makes one bounded model
+call that re-checks each proposed operation — identified by an id the code
+mints (`add:<label>`, `remove:<label>`, `comment`), never by model text —
+against the same evidence the decision was derived from. The answer is judged
+against a strict contract, and every operation the verifier refutes or cannot
+confirm is downgraded to a refusal: the pass can only prevent writes, never
+cause them. Downgrading every operation ends the run `refused` with nothing
+written — and the run itself stays green. No verify answer is ever re-asked. A
+dry run never requests verification, so an operator previewing a decision sees
+the unverified decision. The [development page](../development/triage.md#verification-opt-in-issue-274)
+spells out the contract and what the pass does not catch.
+
+**Writing is freshness-gated.** Everything the decision was built from — the
+thread's labels, and for a pull request also its state, merged flag and head
+SHA — is re-read from the API immediately before anything is written, and the
+values the run started from are treated as claims, not authority. If the thread
+moved while the run was in flight (a push replaced the head, the PR was merged
+or closed, the labels changed), the run writes nothing, logs one warning
+naming what moved, and its record ends as `abandoned` carrying that reason —
+the run itself stays green; it never re-derives a decision from the newer state, because
+that would mean answering a question the model was never asked. This costs one
+extra API read per run — the issue or pull request itself. On a pull request
+the marker records the head the run verified, so two concurrent runs at
+different heads cannot overwrite each other — the newer run's upsert refuses.
 
 ## Config file
 
@@ -84,7 +120,7 @@ instructions) — classification is written as a comment rather than as labels.
 
 The file is read at an immutable commit SHA from the **resolved policy source**:
 
-- For `issues` events and `workflow_dispatch`: the repository's default branch.
+- For `issues` events: the repository's default branch.
 - For `pull_request` events: the pull request's base branch.
 
 This means a pull request cannot edit the policy that governs its own triage.
@@ -94,12 +130,12 @@ The full mechanism is in the [configuration page](../development/configuration.m
 
 The file is JSON5 (comments, trailing commas, single quotes).
 
-| Key             | Required | What it does                                                                                                                                                                  |
-| --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `schemaVersion` | no       | Absent is accepted (pre-versioning files keep working); `1` and `2` are readable — a schema-1 file is migrated on read with a warning; anything else is refused at startup.   |
-| `labels`        | no       | The policy block: `use` (the usable set), `roles` (what each label is for), `exclusive`, `workflowMarkers`, `triageOwned`, `priority`, `needsMoreInfo`, `routing`. See below. |
-| `size`          | no       | Size measurement from the diff: `exclude` (globs), `ladder` (rungs with `upTo` and `label`). The catch-all rung has no `upTo`.                                                |
-| `instructions`  | no       | Paths to instruction documents: `instruction` (both), `issue-instruction` (issues only), `pr-instruction` (pull requests only).                                               |
+| Key             | Required | What it does                                                                                                                                                                                                                         |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `schemaVersion` | no       | Absent is accepted (pre-versioning files keep working); `1` and `2` are readable — a schema-1 file is migrated on read with a warning; anything else is a startup error — the run goes red before any model call, recorded `failed`. |
+| `labels`        | no       | The policy block: `use` (the usable set), `roles` (what each label is for), `exclusive`, `workflowMarkers`, `triageOwned`, `priority`, `needsMoreInfo`, `routing`. See below.                                                        |
+| `size`          | no       | Size measurement from the diff: `exclude` (globs), `ladder` (rungs with `upTo` and `label`). The catch-all rung has no `upTo`.                                                                                                       |
+| `instructions`  | no       | Paths to instruction documents: `instruction` (both), `issue-instruction` (issues only), `pr-instruction` (pull requests only).                                                                                                      |
 
 #### `labels` — a policy, not a registry
 
@@ -311,7 +347,8 @@ matching size label.
 ## Events
 
 `triage` decides exactly which events re-run its pipeline. Its expensive work
-is one model call plus the evidence reads that feed it, so it only pays for
+is one decide call — opt-in verification adds at most one bounded verify call
+— plus the evidence reads that feed it, so it only pays for
 them when the event could have changed triage-relevant evidence: the thread's
 content, its diff, its draft state, or the queue state the
 `labels.workflowMarkers` lifecycle keys on. Everything else logs one audit
@@ -344,37 +381,102 @@ the model would classify. `unlabeled` always skips: removing a label changes
 no content evidence, and removing the queue marker is a human dequeue triage
 respects rather than rewrites.
 
+The skip's "not queued" premise comes from the event payload's label list, a
+claim rather than a read. When the changed label is a classification one in a
+marker-configured repository, the gate arbitrates the claim against the live
+thread: a marker applied between the event's delivery and the gate — the race
+where a template's `opened` run is cancelled by its `labeled` sibling — still
+completes the queue lifecycle instead of stranding the thread.
+
 An event that is not on the matrix is re-triaged, never silently skipped — a
 payload this action was not built for is not classified as a no-op. To run
 only on the events that matter, list them in your workflow's `on:` block; the
 matrix is the action's belt-and-braces guard for whatever your trigger sends
 it.
 
+The matrix covers `issues` and `pull_request` payloads, and those two names are
+the only events the entrypoint accepts. A run triggered by anything else —
+`workflow_dispatch`, `push`, `schedule` — throws at startup and ends red,
+writing its `failed` record (run contract F-01): triage classifies threads, and
+a dispatch or a schedule tick carries no thread. Declare no other trigger in
+the `on:` block; [`harmonise`](harmonise.md) is the action built for schedule
+ticks.
+
+### Redelivery
+
+GitHub webhooks are at-least-once: the same event can be delivered more than
+once. There is no dedupe, by design — a second delivery is a complete second
+run that pays its own model call and re-derives its plan from the thread's
+live state. It never replays a previous run's plan, because there is no plan
+store anywhere in the pipeline. That makes a redelivery safe rather than
+merely tolerated: removals tolerate a label that is already gone, additions
+are idempotent, and the classification comment is updated in place instead of
+duplicated. Two identical deliveries converge the thread instead of corrupting
+it.
+
+The belt over those suspenders is a workflow `concurrency` group keyed on the
+thread, so redelivered events queue behind the live run instead of running
+beside it:
+
+```yaml
+concurrency:
+  group: triage-${{ github.event.issue.number || github.event.pull_request.number }}
+```
+
+Leave `cancel-in-progress` off: a canceled run stops mid-mutation exactly
+where it stands — a half-applied plan no exception ever reports. Any partial
+state a canceled, failed or redelivered run leaves is repaired by the next
+run, because every run re-derives from live state, and removals now run before
+additions so the half-state a death leaves is the safer one (a thread missing
+an addition, never a stale claim standing beside its replacement). See
+[Failure modes](#failure-modes) for what a partial mutation reports.
+
 ## Cost and budget controls
 
-| Control              | Default | Effect                                                               |
-| -------------------- | ------- | -------------------------------------------------------------------- |
-| `dry-run`            | `true`  | No API calls to GitHub for writing. Model calls still count.         |
-| `request-timeout-ms` | `30000` | Per-attempt timeout. Raise for endpoints that are legitimately slow. |
+| Control              | Default  | Effect                                                                    |
+| -------------------- | -------- | ------------------------------------------------------------------------- |
+| `dry-run`            | `true`   | No API calls to GitHub for writing. Model calls still count.              |
+| `verify`             | `false`  | Off, the pass costs nothing; `true` adds at most one bounded verify call. |
+| `request-timeout-ms` | `120000` | Per-attempt timeout. Raise for endpoints that are legitimately slow.      |
 
-The action makes exactly one model call per thread per run. There is no agent
-loop — the model reads the thread body, the config sheet, and the instructions,
-and answers in one round.
+The action asks the model once per thread per run. An answer that never
+presented the JSON object the prompt asked for — empty, or prose instead of
+the object — earns exactly one more ask: a provider fumble gets a second
+chance, and a second fumble fails the run with the shape class named
+(_empty_, _no JSON object_, _does not parse_). Each ask leaves its facts in
+the run record's `modelAttempts` — the outcome word, the HTTP status the
+transport saw, the request body's byte size — so a run that fails here says
+what each of the two attempts saw, without a re-run (#521). An answer that
+parses is taken as it stands: an off-sheet refusal or a missed contract is
+the model's decision, and a decision is never retried. An answer the
+provider declares truncated (`finish_reason: length`) is judged as neither:
+it fails the run before parsing, without the extra ask — no prefix of a cut
+answer is published. Model text is never logged — the
+refusal names the shape, not the bytes. There is no agent loop — the model
+reads the thread body, the config sheet, and the instructions, and answers
+in one round (at most two asks, in the worst case). Opt-in verification
+(`verify: true`) adds at most one bounded verify call on top: it re-checks
+the plan the decision reached, its answer is judged once against the contract,
+and it is never re-asked.
 
 ## Failure modes
 
-| Symptom                                                      | Cause                                                                     | Resolution                                                                       |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| "Label X is not in the sheet"                                | The model chose a label the config does not declare.                      | Declare it in the config, or remove it from the `labels:` input.                 |
-| "No config file at PATH"                                     | `config-path` set to a path that does not exist.                          | Fix the path, or remove `config-path` and use the default locations.             |
-| "schemaVersion Y is not supported"                           | Config file declares a schema version this build does not understand.     | Downgrade `schemaVersion` or update the action tag.                              |
-| "Size label X is declared on multiple rungs"                 | A label appears on two ladder entries.                                    | Deduplicate.                                                                     |
-| "declares the label 'X', which the repository does not have" | A policy names a label GitHub does not hold.                              | Create the label in GitHub, or remove it from `labels.use`.                      |
-| "Instruction document exceeds 8 KiB"                         | An instruction document is too large.                                     | Shorten it.                                                                      |
-| "Config file exceeds 64 KiB"                                 | The config file is too large.                                             | Reduce it — a 64 KiB policy is already very long prose.                          |
-| Provider unreachable                                         | The `api-url` endpoint did not respond within `request-timeout-ms`.       | Check the endpoint, the network, and the timeout value.                          |
-| HTTP 403 on labels                                           | `pull-requests: write` scope missing.                                     | Add the scope to the workflow's `permissions:` block.                            |
-| Run failed red — the answer was entirely off-sheet           | The model named no label the sheet declares, and no PR size rung applies. | The sheet is the contract: refine it, or the `labels:` input, never the matcher. |
+| Symptom                                                                                                                                  | Cause                                                                                                                                          | Resolution                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "Label X is not in the sheet"                                                                                                            | The model chose a label the config does not declare.                                                                                           | Declare it in the config, or remove it from the `labels:` input.                                                                                                                                                                                                            |
+| "No config file at PATH"                                                                                                                 | `config-path` set to a path that does not exist.                                                                                               | Fix the path, or remove `config-path` and use the default locations.                                                                                                                                                                                                        |
+| "schemaVersion Y is not supported"                                                                                                       | Config file declares a schema version this build does not understand.                                                                          | Downgrade `schemaVersion` or update the action tag.                                                                                                                                                                                                                         |
+| "Size label X is declared on multiple rungs"                                                                                             | A label appears on two ladder entries.                                                                                                         | Deduplicate.                                                                                                                                                                                                                                                                |
+| "declares the label 'X', which the repository does not have"                                                                             | A policy names a label GitHub does not hold.                                                                                                   | Create the label in GitHub, or remove it from `labels.use`.                                                                                                                                                                                                                 |
+| "Instruction document exceeds 8 KiB"                                                                                                     | An instruction document is too large.                                                                                                          | Shorten it.                                                                                                                                                                                                                                                                 |
+| "Config file exceeds 64 KiB"                                                                                                             | The config file is too large.                                                                                                                  | Reduce it — a 64 KiB policy is already very long prose.                                                                                                                                                                                                                     |
+| Provider unreachable                                                                                                                     | The `api-url` endpoint did not respond within `request-timeout-ms`.                                                                            | Check the endpoint, the network, and the timeout value.                                                                                                                                                                                                                     |
+| HTTP 403 on labels                                                                                                                       | `pull-requests: write` scope missing.                                                                                                          | Add the scope to the workflow's `permissions:` block.                                                                                                                                                                                                                       |
+| Run failed red — the answer was entirely off-sheet                                                                                       | The model named no label the sheet declares, and no PR size rung applies.                                                                      | The sheet is the contract: refine it, or the `labels:` input, never the matcher.                                                                                                                                                                                            |
+| "the provider truncated its response (finish_reason: length)", or "the provider truncated the re-asked response (finish_reason: length)" | The provider hit its output cap mid-answer and declared the answer incomplete — on the first ask, or on the one re-ask a fumbled answer earns. | Raise the provider-side output budget (e.g. `max_tokens`), then re-run — a cut answer is never parsed, published, or re-asked.                                                                                                                                              |
+| "the model's answer was empty (after 2 attempts)" — or _holds no JSON object_ / _does not parse_                                         | The provider answered both asks without the JSON object the prompt asked for.                                                                  | Read the record's `modelAttempts` first (#521): HTTP 200s on kilobyte-sized requests are the provider answering empty — re-run, and take the recorded payload size to the provider if it persists; an `unanswered` attempt with a null status is a transport break instead. |
+| "the triage mutation stopped part-way: …"                                                                                                | A write failed after an earlier one had applied (endpoint timeout, 5xx) — or the run was canceled mid-mutation.                                | The message names what applied, what failed and what was not attempted. Re-run the action: the next run re-derives from live state and repairs the half-state.                                                                                                              |
+| "could not read the token's writing identity …"                                                                                          | The identity read failed (the API did not answer it), so the run cannot tell which comments are its own.                                       | Transient — re-run. The run refuses before writing anything rather than guessing an identity and duplicating its own comment.                                                                                                                                               |
 
 ## Recipes
 
@@ -427,7 +529,7 @@ Use the `labels:` workflow input to limit one workflow to bugs and enhancements
 only, while another workflow covers the full sheet.
 
 ```yaml
-- uses: ecoma-io/action-agents/triage@v0.5
+- uses: ecoma-io/action-agents/triage@v0.12
   with:
     labels: "bug,enhancement"
 ```

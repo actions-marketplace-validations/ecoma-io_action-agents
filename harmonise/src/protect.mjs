@@ -27,6 +27,8 @@ import { randomBytes } from "node:crypto";
 
 import { fenceMask, maskCodeSpans, maskDestinations, splitLines } from "./markdown.mjs";
 
+import { DeterministicRefusalError } from "./refusal.mjs";
+
 /** The shape of every placeholder this module mints. Case-insensitive on purpose: a token the model re-cased must be named as an unknown, never pass for prose. */
 const TOKEN_PATTERN = /\[\[harmonise:([0-9a-f]{16}):([gs])([1-9][0-9]*)\]\]/gi;
 
@@ -108,8 +110,9 @@ export function protectDocument(source, { glossary = [], newId = defaultId }) {
 
 /**
  * Restores a translated document: validates every placeholder this run minted
- * appears exactly as often as it must and nothing unknown wears the
- * namespace, then substitutes the original bytes.
+ * appears exactly as often as it must and, keyed on first occurrences, in the
+ * protected document's order, that nothing unknown wears the namespace, then
+ * substitutes the original bytes.
  *
  * @param {string} candidate the translated text
  * @param {Protection} protection what `protectDocument` returned
@@ -132,6 +135,35 @@ export function restoreDocument(candidate, protection) {
           (actual === 0 ? " — the translation lost protected content" : ""),
       );
     }
+  }
+  // Order: every token is pinned by its first occurrence, whatever its count
+  // — a repeated token's first occurrence is a position like any other, and
+  // exempting it would let a singleton swap with it unnoticed (#358). The
+  // key is each token's first occurrence in the protected document itself,
+  // not Map iteration order: the skip spans above are pushed bottom-up, so
+  // Map order is not document order. In that document order, the
+  // candidate's first occurrence of each token must never move backwards; a
+  // decrease means the candidate does not preserve the protected content's
+  // order, and restoring it would publish protected bytes in each other's
+  // places. A legitimate translation that reorders clauses is refused here
+  // too — never re-asked — because wrong bytes are worse than a refused run.
+  /** @type {[number, string][]} */
+  const tokenOrder = [];
+  for (const [token] of protection.counts) {
+    tokenOrder.push([protection.text.indexOf(token), token]);
+  }
+  tokenOrder.sort((a, b) => a[0] - b[0]);
+  let previousAt = -1;
+  let previousToken = "";
+  for (const [, token] of tokenOrder) {
+    const at = candidate.indexOf(token);
+    if (at < previousAt) {
+      throw new DeterministicRefusalError(
+        `placeholder ${token} appears before ${previousToken} — the candidate does not preserve the protected content's order`,
+      );
+    }
+    previousAt = at;
+    previousToken = token;
   }
   let restored = candidate;
   for (const [token, original] of protection.spans) {
@@ -169,7 +201,7 @@ function collectSkipRanges(lines) {
       // to swallow the fence and whatever follows it.
       const unsettled = pending[0];
       if (unsettled !== undefined) {
-        throw new Error(
+        throw new DeterministicRefusalError(
           `harmonise:skip on line ${String(unsettled + 1)} would target a fenced code block — ` +
             `wrap the block in harmonise:skip-start / harmonise:skip-end instead`,
         );
@@ -191,7 +223,7 @@ function collectSkipRanges(lines) {
 
     const kind = DIRECTIVE_LINE.exec(line)?.[1];
     if (kind === undefined) {
-      throw new Error(
+      throw new DeterministicRefusalError(
         `line ${String(index + 1)}: '${line}' addresses harmonise but is not one of ` +
           `harmonise:skip, harmonise:skip-start, harmonise:skip-end`,
       );
@@ -201,7 +233,7 @@ function collectSkipRanges(lines) {
       pending.push(index);
     } else if (kind === "skip-start") {
       if (openRegion !== undefined) {
-        throw new Error(
+        throw new DeterministicRefusalError(
           `line ${String(index + 1)}: harmonise:skip-start opens a region while another ` +
             `(line ${String(openRegion + 1)}) is already open — nested regions are not supported`,
         );
@@ -211,18 +243,20 @@ function collectSkipRanges(lines) {
       ranges.push([openRegion, index]);
       openRegion = undefined;
     } else {
-      throw new Error(
+      throw new DeterministicRefusalError(
         `line ${String(index + 1)}: harmonise:skip-end with no open harmonise:skip-start`,
       );
     }
   }
 
   if (openRegion !== undefined) {
-    throw new Error(`harmonise:skip-start on line ${String(openRegion + 1)} is never closed`);
+    throw new DeterministicRefusalError(
+      `harmonise:skip-start on line ${String(openRegion + 1)} is never closed`,
+    );
   }
   const unsettled = pending[0];
   if (unsettled !== undefined) {
-    throw new Error(
+    throw new DeterministicRefusalError(
       `harmonise:skip on line ${String(unsettled + 1)} has no following line to preserve`,
     );
   }
@@ -365,7 +399,7 @@ function chooseId(source, newId) {
     const id = newId();
     if (!source.includes(`[[harmonise:${id}:`)) return id;
   }
-  throw new Error(
+  throw new DeterministicRefusalError(
     `the document contains text colliding with ${String(MAX_ID_ATTEMPTS)} consecutive ` +
       `placeholder ids — refused rather than risk token ambiguity`,
   );

@@ -23,9 +23,9 @@ inputs:
     description: >-
       Per-attempt timeout in milliseconds for one provider call. The attempt
       must complete the whole completion; raise it for endpoints that
-      legitimately take longer than 30 seconds to answer in full.
+      legitimately take longer than two minutes to answer in full.
     required: false
-    default: "30000"
+    default: "120000"
   config-path:
     description: Overrides `.github/action-agents/review/review.json5` / `.json`, read from the resolved policy source (the default branch, or a pull request's base branch). When set, only that path is read and the default locations are not consulted; a path that does not exist there is a startup error. # consumer path
     required: false
@@ -45,13 +45,38 @@ inputs:
   artifact-path:
     description: >-
       Directory inside the workspace where the machine-readable run record is
-      written after a published review, as a JSON file named after the
-      reviewed commit. The record carries the same facts the comment renders
-      — policy, risk table, findings with their verification states, gate
-      outcomes, coverage and the phase log — and the write never leaves the
-      workspace. When the review publishes nothing, no file is written.
+      written, as a JSON file named for the run's outcome and the reviewed
+      commit. A record lands at every terminal that declares one — a published
+      review, a skip, an abandonment, a dry run, and the refused or failed red
+      terminals — each carrying what that terminal actually read, and the
+      exact file written is published as the `artifact-file` output. The write
+      never leaves the workspace. A terminal that declares no record, or whose
+      record write failed, leaves no file and logs the loss.
     required: false
     default: ".review-artifact"
+  architecture-report:
+    description: >-
+      Path inside the workspace to the `archkeep delta` report the consumer's
+      pinned architecture step left behind, with the recipe's manifest read
+      from the `run.json` beside it — the convention the integration recipe
+      pins. Empty — the default — keeps the run architecture-blind:
+      byte-identical to a run that never heard of Archkeep. When set, both
+      files are read under workspace confinement with a 2 MiB cap, judged
+      against the runtime-evidence protocol, and the frozen evidence is
+      recorded on the run. A report that is absent beside a zero exit, or
+      past the cap, ends the run red as a failed read; bytes that parse but
+      disagree with the protocol end it red as a refusal. The verdict itself
+      never gates the review — recording it is this input's whole effect.
+    required: false
+    default: ""
+
+outputs:
+  sarif-path:
+    description: Path to the review's SARIF projection, written under the runner's temp directory. Present after a published review whose SARIF write succeeded.
+  artifact-file:
+    description: Path on the runner to the machine-readable run record this run wrote — the exact file the write laid down, published at every terminal that declares a record, on a published review and on the red boundary's record alike. Empty when the terminal declares no record or the record write failed, and the run logs that it did.
+  refusal-class:
+    description: Set to `model-output-unusable` exactly when the run was refused because the provider's final answer held no JSON object on every attempt — the transient class a re-run recovers (#516). Branch on it to re-run mechanically. Unset on every other terminal, green or red.
 
 runs:
   using: node24

@@ -1,0 +1,31 @@
+{
+  "captureExit": 0,
+  "exitCode": 3,
+  "stdoutBytes": 0,
+  "stderrDigest": "7e697530a4cb64c18d702f6d82bd63329aa5ee56f8022fd88a771527d88d7834",
+  "repeatable": true,
+  "envelope": null,
+  "reader": {
+    "verdict": "unknown",
+    "stale": false,
+    "incompleteness": {
+      "reason": "incomplete",
+      "note": "the report does not parse; the recorded step exit is 3"
+    },
+    "counts": {
+      "introduced": 0,
+      "introducedWaived": 0,
+      "resolved": 0,
+      "unchanged": 0,
+      "renamePairs": 0,
+      "occurrencesReduced": 0,
+      "customFindings": null,
+      "unresolvable": {
+        "introduced": 0,
+        "resolved": 0,
+        "unchanged": 0,
+        "unknown": 0
+      }
+    }
+  }
+}

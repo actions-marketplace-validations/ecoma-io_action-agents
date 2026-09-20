@@ -42,7 +42,7 @@ engineering makes that text trustworthy, so the design does not try.
 
 The question a ceiling answers is therefore not _how do we stop a model being
 talked into something_, which has no reliable answer, but **what is the worst a
-model that has already been talked into something can reach.** Four ceilings
+model that has already been talked into something can reach.** Five ceilings
 answer it, and each is enforced in code rather than asked for in a prompt:
 
 1. **Model output never composes an API call. It may only choose from a set a
@@ -118,12 +118,37 @@ answer it, and each is enforced in code rather than asked for in a prompt:
    what it does has a vulnerability, not a missing feature.
 
 4. **File access is confined to the checked-out workspace.** This one applies to
-   any action that reads files — `review` does. Every path is resolved through
+   any action that reads files — `review` does — and to any action that writes
+   them: `triage`'s run record is written below `GITHUB_WORKSPACE`, under the
+   same ceiling. Every path is resolved through
    `realpath` and refused unless it lands inside `GITHUB_WORKSPACE`; `.git` is
    refused outright, because it holds the credential the checkout was performed
    with. A path escape here is a direct route from an injected instruction to
    the runner's secrets, which is why it is treated as a vulnerability rather
    than as a robustness bug.
+
+5. **The model never decides a consequence; code does, deterministically, from
+   the canonical record.** This bounds what a talked-into model can do to a
+   merge decision (ADR 006, decision 5): the consequences are code-owned from
+   the canonical record — the recorded verdict and the SARIF projection — and
+   the model names no consequence of its own. A review's published findings
+   are bound at a capture boundary: code reads the reviewed bytes at each
+   finding's anchor and stores the digest and excerpt its fingerprint is
+   recomputable from, and a capture the tree cannot honour — a file that is
+   gone, a line past its end, a path outside the workspace — refuses the run
+   rather than publishing a finding whose evidence confirms nothing. The
+   finding kinds ride the same discipline: the answer must name a kind from
+   the closed vocabulary, the verification pass binds the kind from its own
+   evidence, and a verdict naming a kind the answer did not claim demotes the
+   finding instead of confirming it. The recorded verdict is the code law
+   `mayPublish && coverageComplete ? "pass" : "fail"` over facts the model
+   does not choose — nothing a model answer says can make an incomplete
+   review pass, and the SARIF projection publishes confirmed findings only,
+   never a verdict, a state or an enforcement fact, with bytes that are
+   byte-identical for the same record. There is no check run and no
+   `gate-verdict` to move: a consequence the model could create it could
+   forge, so review declares none — merge enforcement is the consumer's
+   ruleset over Code Scanning. Fixtures: `security/fixtures/canonical-gate/`.
 
 ## Scope
 

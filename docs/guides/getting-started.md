@@ -32,11 +32,11 @@ for what belongs where.
 Every `uses:` reference takes a ref that controls what code runs. Three shapes,
 in order of safety:
 
-| Ref                  | Example                                 | What it resolves to                                                    |
-| -------------------- | --------------------------------------- | ---------------------------------------------------------------------- |
-| `v0.5` (floating)    | `ecoma-io/action-agents/review@v0.5`    | The latest patch release in the `v0.5` line. Gets fixes automatically. |
-| `v0.5.0` (exact)     | `ecoma-io/action-agents/review@v0.5.0`  | Exactly that release. Never moves.                                     |
-| `<sha>` (SHA-pinned) | `ecoma-io/action-agents/review@abc123…` | Exactly those bytes. Immutable.                                        |
+| Ref                  | Example                                 | What it resolves to                                                     |
+| -------------------- | --------------------------------------- | ----------------------------------------------------------------------- |
+| `v0.12` (floating)   | `ecoma-io/action-agents/review@v0.12`   | The latest patch release in the `v0.12` line. Gets fixes automatically. |
+| `v0.12.0` (exact)    | `ecoma-io/action-agents/review@v0.12.0` | Exactly that release. Never moves.                                      |
+| `<sha>` (SHA-pinned) | `ecoma-io/action-agents/review@abc123…` | Exactly those bytes. Immutable.                                         |
 
 Floating tags deliver patches without a workflow edit — that is usually what you
 want. Exact tags deliver reproducibility — that is what you want when it is. A
@@ -95,7 +95,6 @@ on:
     types: [opened, edited, reopened]
   pull_request:
     types: [opened, edited, synchronize, reopened]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -116,7 +115,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - uses: ecoma-io/action-agents/triage@v0.5
+      - uses: ecoma-io/action-agents/triage@v0.12
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           api-url: ${{ vars.LLM_API_URL }}
@@ -162,7 +161,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - uses: ecoma-io/action-agents/review@v0.5
+      - uses: ecoma-io/action-agents/review@v0.12
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           api-url: ${{ vars.LLM_API_URL }}
@@ -175,7 +174,8 @@ jobs:
         with:
           name: review-run-artifact
           path: .review-artifact/review-artifact-*.json
-          if-no-files-found: ignore
+          include-hidden-files: true
+          if-no-files-found: warn
 ```
 
 `review` runs on `pull_request`, raised from within the repository. Its subject
@@ -216,7 +216,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - uses: ecoma-io/action-agents/harmonise@v0.5
+      - uses: ecoma-io/action-agents/harmonise@v0.12
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           api-url: ${{ vars.LLM_API_URL }}

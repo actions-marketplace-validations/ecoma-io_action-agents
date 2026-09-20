@@ -1,8 +1,22 @@
+<!-- harmonise:skip-start -->
 <p align="center">
-  <img src=".github/assets/banner.png" alt="Action Agents — trusted, bounded, auditable GitHub Actions for repository maintenance: triage, review and harmonise, each one a self-contained action against any OpenAI-compatible model" width="100%" />
+  <a href="https://github.com/ecoma-io/action-agents/actions/workflows/ci.yml"><img src="https://github.com/ecoma-io/action-agents/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/ecoma-io/action-agents/actions/workflows/analysis.yml"><img src="https://github.com/ecoma-io/action-agents/actions/workflows/analysis.yml/badge.svg" alt="Analysis" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache 2.0" /></a>
+  <a href="https://github.com/ecoma-io/action-agents/releases"><img src="https://img.shields.io/github/v/release/ecoma-io/action-agents.svg" alt="Latest release" /></a>
 </p>
+<!-- harmonise:skip-end -->
 
+<p align="center">
+  <img src=".github/assets/logo.png" alt="Action Agents — trusted, bounded, auditable GitHub Actions for repository maintenance: triage, review and harmonise, each one a self-contained action against any OpenAI-compatible model" width="64px" />
+</p>
 <h1 align="center">Action Agents</h1>
+
+<!-- harmonise:skip-start -->
+<p align="center">
+<a href="README.md">English</a> | <a href="README.vi.md">Tiếng Việt</a> | <a href="README.zh.md">中文</a> | <a href="README.ja.md">日本語</a> | <a href="README.es.md">Español</a> | <a href="README.hi.md">हिन्दी</a> | <a href="README.ar.md">العربية</a> | <a href="README.pt.md">Português</a> | <a href="README.bn.md">বাংলা</a> | <a href="README.ru.md">Русский</a> | <a href="README.fr.md">Français</a>
+</p>
+<!-- harmonise:skip-end -->
 
 <p align="center">
   <strong>Trusted, bounded, auditable GitHub Actions for repository maintenance.</strong><br />
@@ -13,23 +27,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ecoma-io/action-agents/actions/workflows/ci.yml"><img src="https://github.com/ecoma-io/action-agents/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://github.com/ecoma-io/action-agents/actions/workflows/analysis.yml"><img src="https://github.com/ecoma-io/action-agents/actions/workflows/analysis.yml/badge.svg" alt="Analysis" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache 2.0" /></a>
-  <a href="https://github.com/ecoma-io/action-agents/releases"><img src="https://img.shields.io/github/v/release/ecoma-io/action-agents.svg" alt="Latest release" /></a>
+  <a href="docs/README.md">Docs</a> ·
+  <a href="https://github.com/ecoma-io/action-agents/issues/new?template=bug_report.yml">Report Bug</a> ·
+  <a href="https://github.com/ecoma-io/action-agents/issues/new?template=feature_request.yml">Feature Request</a>
 </p>
 
 <p align="center">
-  <a href="#get-started"><strong>Quick&nbsp;start&nbsp;→</strong></a> ·
-  <a href="#the-actions">The&nbsp;actions</a> ·
-  <a href="SECURITY.md">Security</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a> ·
-  <a href="AGENTS.md">For&nbsp;agents</a> ·
-  <a href="docs/README.md">Docs</a> ·
-  <a href="https://ecoma.io">About&nbsp;Ecoma</a>
+  <img src=".github/assets/banner.png" alt="Action Agents — trusted, bounded, auditable GitHub Actions for repository maintenance: triage, review and harmonise, each one a self-contained action against any OpenAI-compatible model" width="100%" />
 </p>
-
----
 
 Repository upkeep is the work nobody schedules: labelling what arrived, reading
 a diff properly, keeping the translated docs from drifting apart. A model can do
@@ -76,7 +81,7 @@ jobs:
       # review reads the working tree, so it needs a checkout
       - uses: actions/checkout@v5
 
-      - uses: ecoma-io/action-agents/review@v0.5
+      - uses: ecoma-io/action-agents/review@v0.12
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           api-url: ${{ vars.LLM_API_URL }}
@@ -89,13 +94,13 @@ jobs:
 Every `uses:` reference takes a ref that controls what code runs. Three shapes,
 in order of safety:
 
-| Ref                  | Example                                 | What it resolves to                                                    |
-| -------------------- | --------------------------------------- | ---------------------------------------------------------------------- |
-| `v0.5` (floating)    | `ecoma-io/action-agents/review@v0.5`    | The latest patch release in the `v0.5` line. Gets fixes automatically. |
-| `v0.5.0` (exact)     | `ecoma-io/action-agents/review@v0.5.0`  | Exactly that release. Never moves.                                     |
-| `<sha>` (SHA-pinned) | `ecoma-io/action-agents/review@abc123…` | Exactly those bytes. Immutable.                                        |
+| Ref                  | Example                                 | What it resolves to                                                     |
+| -------------------- | --------------------------------------- | ----------------------------------------------------------------------- |
+| `v0.12` (floating)   | `ecoma-io/action-agents/review@v0.12`   | The latest patch release in the `v0.12` line. Gets fixes automatically. |
+| `v0.12.0` (exact)    | `ecoma-io/action-agents/review@v0.12.0` | Exactly that release. Never moves.                                      |
+| `<sha>` (SHA-pinned) | `ecoma-io/action-agents/review@abc123…` | Exactly those bytes. Immutable.                                         |
 
-Floating tags (`v0.1`, `v0.2`) deliver patches without a workflow edit — that is
+Floating tags (`v0.10`, `v0.11`, `v0.12`) deliver patches without a workflow edit — that is
 usually what you want. Exact tags deliver reproducibility — that is what you
 want when it is. A commit SHA delivers an audit trail — the strongest pin, and
 what security policy engines enforce.
@@ -133,7 +138,7 @@ is a vulnerability in **your** repository, and no action can fix it for you.
 ### The root action
 
 The repository root contains an `action.yml`, but it is **not a runnable
-action**. It exists so that `uses: ecoma-io/action-agents@v0.5.0` resolves
+action**. It exists so that `uses: ecoma-io/action-agents@v0.12.0` resolves
 against a tag rather than failing with a missing-manifest error. When invoked,
 it immediately fails with an error naming the three real actions and telling you
 to pick one. This follows the pattern established by
@@ -167,13 +172,3 @@ an issue: [SECURITY.md](SECURITY.md). Everything else —
 
 [Apache License 2.0](LICENSE) — © Mai Ngọc Hóa (John Martin) and the Action
 Agents contributors. Apache-2.0 for its explicit patent grant.
-
----
-
-<p align="center">
-  <sub>
-    Maintained by <a href="https://ecoma.io">Ecoma</a> ·
-    <a href="https://ecoma.io">Website</a> ·
-    <a href="https://github.com/ecoma-io">Github</a>
-  </sub>
-</p>

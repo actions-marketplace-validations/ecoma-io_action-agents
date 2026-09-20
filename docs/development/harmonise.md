@@ -16,17 +16,18 @@ A real run needs `contents: write` and `pull-requests: write`, and the workflow'
 
 ## Inputs
 
-| Input                | Meaning                                                                                                                                                                                                          |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `github-token`       | the token the action writes with — the workflow's `permissions:` block is the real bound                                                                                                                         |
-| `api-url`            | base URL of an OpenAI-compatible endpoint                                                                                                                                                                        |
-| `api-key`            | key for that endpoint; empty is a supported keyless configuration                                                                                                                                                |
-| `model`              | model id to ask                                                                                                                                                                                                  |
-| `request-timeout-ms` | per-attempt timeout in milliseconds for one provider call — the attempt must complete the whole completion; raise it for endpoints that legitimately take longer than 30 seconds; default 30000, floored at 1000 |
-| `config-path`        | overrides `.github/action-agents/harmonise/harmonise.json5` / `.json` — see the configuration page                                                                                                               |
-| `source-language`    | overrides `sourceLanguage`; must name a language the config declares. Required in v1 — the config must exist and name a source language.                                                                         |
-| `documents`          | glob filter over the source-document set; empty = all of them. Default is empty, because the map defines the space                                                                                               |
-| `dry-run`            | report drift and missing translations, propose nothing — the default, because the output of a real run is a pull request                                                                                         |
+| Input                | Meaning                                                                                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `github-token`       | the token the action writes with — the workflow's `permissions:` block is the real bound                                                                                                                           |
+| `api-url`            | base URL of an OpenAI-compatible endpoint                                                                                                                                                                          |
+| `api-key`            | key for that endpoint; empty is a supported keyless configuration                                                                                                                                                  |
+| `model`              | model id to ask                                                                                                                                                                                                    |
+| `request-timeout-ms` | per-attempt timeout in milliseconds for one provider call — the attempt must complete the whole completion; raise it for endpoints that legitimately take longer than two minutes; default 120000, floored at 1000 |
+| `config-path`        | overrides `.github/action-agents/harmonise/harmonise.json5` / `.json` — see the configuration page                                                                                                                 |
+| `source-language`    | overrides `sourceLanguage`; must name a language the config declares. Required in v1 — the config must exist and name a source language.                                                                           |
+| `documents`          | glob filter over the source-document set; empty = all of them. Default is empty, because the map defines the space                                                                                                 |
+| `dry-run`            | report drift and missing translations, propose nothing — the default, because the output of a real run is a pull request                                                                                           |
+| `record-path`        | directory inside the workspace where the machine-readable run record lands at the run's terminal points; default `.harmonise-record` — see [the run record](#the-run-record)                                       |
 
 Timeouts come in two layers. `request-timeout-ms` bounds one provider attempt; retries,
 backoff, `Retry-After` and the attempt limit are `core/transport/http.mjs` policy, not inputs.
@@ -220,9 +221,18 @@ One pair is one unit of work, and a run's report is built from what happens to e
   by the LLM. If generation fails, the run fails according to the failure policy;
 - **an orphan translation** — its slug has no source — is recorded in the report
   and **never deleted, modified, or recreated**. Orphans are reported only;
-- **an empty source, or a document past the cap (32 KiB — ensures both documents
-  fit within the evidence wrapper's 64 KiB cap)**, skips that pair with a reason,
-  and the run continues;
+- **an empty source skips that pair** with a reason, and the run continues;
+- **a document larger than one chunk is translated chunk by chunk** —
+  partitioned deterministically at structural Markdown boundaries, one
+  provider request per chunk whose system layer names the fragment's
+  position ("fragment i of N") so the model translates the fragment in
+  place, reassembled whole before the whole-document gates run. Two
+  bounds refuse a pair deterministically instead: an unsplittable block
+  past `MAX_CHUNK_BYTES` (8 KiB — sized so a chunk's complete answer
+  comes back inside a provider's output cap; 24 KiB chunks produced
+  empty answers and dropped placeholder tokens on the first real
+  dogfood run), or a document past `MAX_CHUNKS_PER_PAIR` (32 chunks —
+  the pair's execution budget);
 - **every pair skipping** is a red run: work existed and none of it was
   attempted successfully.
 
@@ -252,7 +262,7 @@ translated document
 
 Placeholders use a random-per-run identifier (similar to `core/untrusted.mjs`) to prevent untrusted content from forging them. A document containing the literal placeholder syntax cannot bypass validation because the random identifier changes each run.
 
-A placeholder has the shape `[[harmonise:<run-id>:<kind><n>]]` — one shared random hex `run-id` per action run, a kind (`g` for glossary terms, `s` for protected spans), and an index. One glossary term maps to one placeholder repeated at each of its occurrences; each protected span gets its own.
+A placeholder has the shape `[[harmonise:<run-id>:<kind><n>]]` — one shared random hex `run-id` per action run, a kind (`g` for glossary terms, `s` for protected spans), and an index: for `g`, the term's position in the glossary array (`g1` is the first entry); for `s`, the span's position in document order. The index is how a refusal that names a token maps back to the consumer's own config — a message naming `g3` points at the third entry of the configured glossary, one naming `s2` at the second protected span in document order. One glossary term maps to one placeholder repeated at each of its occurrences; each protected span gets its own.
 
 - If a source document already contains text in the placeholder's own namespace, the id is regenerated before use; a source that collides with several consecutive ids is refused rather than risk ambiguity;
 - Validation counts every placeholder occurrence: a translation must carry exactly the source's count of each — no loss, no duplication, no edited syntax, no invented placeholders;
@@ -275,6 +285,7 @@ If the model:
 - Wrong count of a placeholder → translation invalid, run fails;
 - Modifies a placeholder syntax → translation invalid, run fails;
 - Replaces the placeholder with the term in target language → translation invalid, run fails;
+- Moves a later placeholder's first occurrence ahead of an earlier one's → typed refusal: the pair is skipped and recorded `refused`, never re-asked in-run (#358);
 
 ### Scope (v1)
 
@@ -486,6 +497,53 @@ A pair whose links do not match fails with one violation line per difference: a 
 
 This is not a generic Markdown transformation framework. It implements only the validation necessary for `harmonise` to work correctly.
 
+## The script gate
+
+Before anything is restored, the tokenised answer is judged by
+`harmonise/src/script-gate.mjs`: `judgeScript(text, languageTag)` counts the
+candidate's **translatable prose** per Unicode script — `\p{L}` membership
+with `\p{Script=…}` tests — and refuses the pair unless the configured
+target language's scripts hold strictly more than half of the counted
+letters. The count is over prose only, and the exclusions are the protection
+layer's own masking machinery (`markdown.mjs`'s `fenceMask`,
+`maskCodeSpans`, `maskDestinations` and `frontmatterExtent`), never a second
+implementation: the leading frontmatter block (keys are source-language
+words, values are already f-tokens — neither votes), fenced code blocks,
+inline code spans, link machinery (inline and image destinations,
+reference-definition destinations, angle autolinks, bare scheme URLs) and
+the pipeline's own `[[harmonise:…]]` token spellings. Link text is prose and
+keeps voting; inline HTML tag names in prose are the accepted residual
+voters — no HTML parser exists here, and none is being built.
+
+The refusal sentence names the target subtag, the winning foreign script and
+the fraction, byte-deterministically, quoting no candidate content — and it
+points at the fix: a model or language-configuration problem, never a
+document problem, and the document is never coerced.
+
+The expected scripts come from a curated table keyed by the language tag's
+primary subtag (`en` → Latin, `ru`/`uk`/`bg`/`mk`/`be` → Cyrillic, `ja` →
+Han + Hiragana + Katakana, `ko` → Hangul + Han), judged as a union. The
+table is code, not configuration — a tag joins it when its script is
+uncontroversial, by a reviewed decision in this repository, never a consumer
+setting — and the standing precedent for staying out is `sr`: Serbian is
+officially Cyrillic and commonly Latin, so either single expected script
+would refuse one of the two correct spellings wholesale, and the tag's own
+subtags cannot disambiguate (`sr-Latn` and `sr-Cyrl` both reduce to `sr`).
+A primary subtag the table does not know leaves the pair unjudged by this
+gate rather than guessed at: a fail-open strictly narrower than a wrong
+default. `mn` is the standing case of doubt: Mongolian is Cyrillic in
+dominant everyday use but co-official in its traditional script, so it waits
+for a consumer need rather than joining by assumption. A candidate with no
+counted letters passes.
+
+The violation is the typed deterministic refusal (`refusal.mjs`'s
+`DeterministicRefusalError`), raised in `judgeAnswer` — never retried, like
+every answer-contract failure — and its class is the record's outcome: an
+all-pairs wrong-script red set records `refused` at the boundary (#347's
+class column), while one defect line beside it records `failed`. The gate
+judges the arriving candidate only: the identity no-op path in `judgeAnswer`
+returns before it, and an endorsed publication is not re-judged.
+
 ## The prompt
 
 One request per pair, assembled in one order:
@@ -552,6 +610,25 @@ overwrites; `(unknown, missing)` — a record whose target was deleted — refus
 rather than recreating the deletion. Resolving a refusal is a human decision:
 restore the translation memory or the recorded fingerprint, or adopt or delete
 the file by hand.
+
+**Accepted risk — consistent forgery of the advisory files.** "Verified" is
+exact, and exactly this far: the base is a translation-memory entry keyed by
+the record's source and policy fingerprints and the pair's language whose
+bytes hash to the record's `translationFingerprint` — `recordedMergeBase` in
+`harmonise/src/index.mjs`. That is hash equality joining the two advisory
+files: it proves the state record and the memory entry agree with each other,
+never that harmonise authored either. A hand-edited state record plus a
+hand-edited memory entry that joins it is therefore accepted as a verified
+base, and the merge runs against those bytes. The risk is accepted, not
+overlooked. Both files live in the consumer's repository under one write
+access, so a hand able to forge the pair consistently is a hand with commit
+access — the adversary the protection table exists for is the model
+displacing human edits, not a repository writer — and the same hand could
+delete the pair instead, which fails closed: a `preserve-required` pair with
+no memory entry to verify refuses, the same loud refusal as any unverifiable
+base. And forgery buys only the merge base: the merged result is still
+proposed on the action's own pull request, where a human reads it before it
+lands.
 
 ## The pull request
 
@@ -718,9 +795,100 @@ Two caveats the implementation must settle before code:
 - **Suffix follows the branch key.** The advisory files must carry the same key the publishing branch is named by; if the branch scheme later moves to per-target-language branching, the suffix moves with it or the guarantee breaks.
 - **Same target from multiple sources still collides.** Two branches both translating `fr` write the same target's records — but that is genuine content overlap, not a spurious advisory collision, and is outside the common one-source-per-target case.
 
+## Design note — documentation-versus-intent consistency, deferred
+
+> **Status: explored, deferred — no runtime change (P4 of the Archkeep runtime integration, #518; #551).** The exploration ends in a deferral, and the deferral is the deliverable: no input, no pipeline stage and no evidence channel is added, and a run's behaviour is byte-identical to what it was before. It is recorded here with its reasons and its revisit trigger rather than left as silence.
+
+Archkeep can report where a repository's documentation and its intent records disagree — `drift` output ranks the law edits that would reconcile them. The P4 question was whether `harmonise` could carry that output as evidence of document staleness. Two hard lines bound any answer, set by [the integration design record](archkeep-integration-analysis.md): architecture authority is never rewritten from documentation, and mismatches surface as evidence and interpretation in the pull request the human merges. The mirror holds for this action too — `harmonise` never rewrites documentation from architecture authority: a mismatch it noticed would be reported, never repaired. On those lines the exploration lands on deferral, for four reasons.
+
+**A different judgment axis.** This action's correctness bar is per-language equivalence to the source document, never source truth. A stale source is propagated faithfully, by design: translation mirrors whatever the source says, and [the document set](#the-document-set) inventories pairs, not claims. Whether a document's content is still current is a judgment the pipeline has no machinery to make or to use — adding drift facts to the prompt would invite the model to editorialize off the one axis its output is judged on.
+
+**The evidence channel is a posture change.** A run reads everything through the Git APIs of its resolved policy source — [the policy source](#the-policy-source) pins every read to one SHA — and never reads the workspace checkout. Drift output exists only as a workflow artifact or workspace file, so consuming it would be this action's first working-tree read: exactly the posture change the design record fences behind three explicit conditions for `triage`, with no comparable case here to justify one.
+
+**No honest surface.** A documentation-versus-intent mismatch is about the source document, and the source is read-only in every run ([what `harmonise` never does](#what-harmonise-never-does)). Remediation is a human edit to that source — and where `review`'s architecture grounding already puts law facts in front of the human, that pull request is the surface which can actually carry the fix. A `harmonise` proposal cannot contain the correction, so it should not carry the finding.
+
+**No evidenced consumer.** The dogfood corpus is multilingual READMEs; architecture documentation in this organization is source-language-only, so no architecture document sits in a map today. That is [ADR 002](../adr/002-no-intelligence-layer.md)'s evidenced-consumer standard — the same bar the architecture reader's promotion is parked behind — and it is unmet: no decision a run makes would change if it knew the mismatch.
+
+The deferral reopens when a dogfooded repository has translated architecture documents in its map and suffers a real staleness event — an issue naming the decision only documentation-versus-intent facts could carry. Even then the two hard lines hold: the mismatch arrives as evidence and interpretation in the pull request the human merges, and the correction is a human edit to the source-language document, mirrored to translations by an ordinary run afterwards.
+
+## The run record
+
+Every run leaves one machine-readable record of itself at the terminal point it
+reaches: the pull request a real run published, the partial exit that follows
+failed pairs, the all-in-step skip, the dry run. `harmonise/src/run-record.mjs`
+builds it, validates it fail-closed and serialises it byte-deterministically;
+the write itself is `writeRunRecord` in `harmonise/src/index.mjs`, under the
+same workspace ceiling every read honours — the path must resolve inside
+`GITHUB_WORKSPACE`, and `.git` is refused outright, before and after the
+directory is created. The family's shared contract — one record per run,
+byte-determinism, the fail-closed validator, the closed outcome vocabulary, the
+two-tier write posture — is [the run contract's](../run-contract.md#run-records);
+its retention row is [ADR 003](../adr/003-evidence-retention.md).
+
+Where it is written, per terminal path:
+
+- a **published run** — after the pull request is opened or updated. A failed
+  write here is a logged loss, not a red run: the publication was the run's
+  outcome, and the record was the loss.
+- a **partial exit** — the same point, same rule, with the failed pairs counted
+  in the record and the run still exiting red after the record lands.
+- an **all-in-step skip** and a **dry run** — the same logged-loss tier as
+  the paths above (#347): a failed write is logged, the run keeps its
+  verdict, and the built record is stashed — a red exit (failed pairs)
+  re-attempts it at the boundary writer, exactly as it was built.
+
+A throw the run did not declare — a config refusal, a transport break, a
+mid-run defect — is recorded by the boundary writer: `refused`
+for a typed deterministic refusal, `failed` for every other throw, and then
+the original error still fails the step, so the record never masks the throw
+it records (#344, #347). Only a run that dies before it holds the facts a
+record is built from, and a run whose record write itself fails — at the
+boundary, or at a declared point under the logged-loss tier — stay
+unrecorded; the upload's `if-no-files-found: warn` keeps the green ones
+green and the miss loud (#378).
+
+The fields, in schema version 3: `schemaVersion`, `repository`, `eventName`,
+`sourceLanguage`, `dryRun`, `outcome`, `reason` (the terminal path's own
+sentence, sanitised and capped — the cap is measured the way the validator's
+bound is read, in UTF-16 length, so a capped reason always fits it (#347)),
+`pairs` (`selected` — the schedule's size in pair-targets, one
+source document against one language — under `proposed`, `unchanged`,
+`skipped`, `failed`, the four that partition it, and the validator refuses a
+record where they do not; `null` when the run died before its accounting was
+finalised), `pullRequest` (`number`, `created`; `null` when the run wrote
+none) and `headSha` (the base commit every read pinned to; `null` before the
+run resolved one). The log lines and
+the pull-request body stay out of the record: the log lines are the run log's,
+and the pull request itself is the durable form of that path.
+
+`outcome` speaks the run contract's terminal-state vocabulary through
+`HARMONISE_OUTCOMES`, the closed set `harmonise/src/run-record.mjs` exports and
+validates against — a word outside it is refused, not coerced. The
+publication, partial and skip paths record `published`, `partial` and
+`skip`; the red terminals record `refused` — every line of the red set a
+deterministic refusal — or `failed` when one defect line is present, the
+worst line deciding (#347).
+
+Delivery: the file lands under the `record-path` directory (default
+`.harmonise-record`), named after the base commit — `harmonise-record-<base
+sha>.json`, from `harmoniseRecordFilename` in the same module — so a record's
+identity is the instant it judged. The name sits inside the upload glob
+`.harmonise-record/harmonise-record-*.json`, which this repository's own
+harmonise workflow uploads with `if: always()` as the `harmonise-run-record`
+artifact. Because the record directory is hidden by design, the upload's
+`include-hidden-files: true` is load-bearing — upload-artifact prunes hidden
+files by default, and without it the glob matches zero files while the step
+still reports success (#378) — and `if-no-files-found: warn` keeps a declared
+write that lands nowhere loud instead of green over nothing.
+
+Retention: every field is a fact the code already computed — no model text, no
+document text, no translation text. The record carries the run's own pair
+accounting and terminal state; the translation's durable form is the pull
+request body, and the record is the run's, not the documents'.
+
 ## Failure posture
 
-The same law as `triage`: the provider unreachable after retries, a config that does not validate, a set narrowed to nothing — red, not green-on-nothing.
+The same law as `triage`: the provider unreachable after retries, a config that does not validate, a set narrowed to nothing — red, not green-on-nothing. The record write's posture is F-14's two-tier rule, stated in [the run record](#the-run-record) and in [the run contract](../run-contract.md#run-records): where the run's own outcome has landed — publication, partial exit, and, since #347, the declared skip points — the loss is logged and the verdict stands; where the record write is the run's only outcome, the loss is the red run; a red exit re-attempts the stashed record at the boundary writer, and a failure's record never masks the original error it records.
 
 **PR behavior on failures:** If at least one pair succeeds, the run creates a PR containing the successful changes and exits red. The log records which pairs failed. If no pairs succeed, the run fails with no PR. This ensures partial work is reviewable while failures are not silently ignored.
 
@@ -742,7 +910,7 @@ The failure line records the verdict — `… (classified transport, exhausted)`
 An answer that violates the answer contract is a **refusal**: raised where the answer is judged (`plan`'s `judgeAnswer`) and never retried — a second identical call would return an identical answer.
 
 - Malformed JSON, or content that is empty or whitespace only → refusal, no retry;
-- Placeholder corruption (glossary or skip), a lost protected token, forged or tampered frontmatter → refusal, no retry;
+- Placeholder corruption (glossary or skip), a lost protected token, forged or tampered frontmatter, an answer in the wrong script → refusal, no retry;
 - Structural or link validation failure → refusal, no retry;
 - A provider error object at HTTP 200 → unknown, one retry under the policy;
 
@@ -750,7 +918,7 @@ An answer that violates the answer contract is a **refusal**: raised where the a
 
 ## Capabilities
 
-What a run does is decided by `src/index.mjs` and what it imports; a module nothing on that path reaches changes no run, however complete its tests. On `main` today the production path runs through `config`, `inventory`, `patterns`, `markdown`, `links`, `link-graph`, `fingerprint`, `drift`, `stale`, `state`, `plan`, `protect`, `prompt`, `answer` and `pull-request` — and, wired on `main` since `v0.3.0` through `plan` and `src/index.mjs`, `frontmatter`, `blocks`, `tm`, `pool`, `protection`, `threeway` and `recovery`: the translation memory (#64) is read once per run, consulted per pair as advisory reference, and recorded on publication — then pruned at that publication to exactly the entries the sync state's records reference, so the memory has no eviction cap of its own: a state record can always reach the merge base it references, whatever the repository's age or size (#150), and a no-op endorsement is recorded the same way so an endorsed pair converges instead of costing one model call per run forever (#95, #150); pairs translate under the bounded-concurrent pool (#85), outcomes returned in input order so completion order never reaches the record; a target that drifted outside harmonise is merged three-way against the base the memory proves (#91), a merge that cannot be proven failing the pair closed; and every pair's failure is classified and retried under the deterministic recovery policy (#107) — refusals and auth failures never, transport faults twice, unknown once, the policy's mapped backoff between attempts. Plus — from `core/` — `http`, `chat`, `forge`, `glob`, `inputs`, `json5-parse`, `runtime`, `untrusted` and `sanitise`. The skip-unchanged classification (#75) is part of the run itself: a pair whose recorded publication still matches is skipped without a model call.
+What a run does is decided by `src/index.mjs` and what it imports; a module nothing on that path reaches changes no run, however complete its tests. On `main` today the production path runs through `config`, `inventory`, `patterns`, `markdown`, `links`, `link-graph`, `fingerprint`, `drift`, `stale`, `state`, `plan`, `protect`, `script-gate`, `prompt`, `answer` and `pull-request` — and, wired on `main` since `v0.3.0` through `plan` and `src/index.mjs`, `frontmatter`, `blocks`, `tm`, `pool`, `protection`, `threeway` and `recovery`: the translation memory (#64) is read once per run, consulted per pair as advisory reference, and recorded on publication — then pruned at that publication to exactly the entries the sync state's records reference, so the memory has no eviction cap of its own: a state record can always reach the merge base it references, whatever the repository's age or size (#150), and a no-op endorsement is recorded the same way so an endorsed pair converges instead of costing one model call per run forever (#95, #150); pairs translate under the bounded-concurrent pool (#85), outcomes returned in input order so completion order never reaches the record; a target that drifted outside harmonise is merged three-way against the base the memory proves (#91), a merge that cannot be proven failing the pair closed; and every pair's failure is classified and retried under the deterministic recovery policy (#107) — refusals and auth failures never, transport faults twice, unknown once, the policy's mapped backoff between attempts. Plus — from `core/` — `http`, `chat`, `forge`, `glob`, `inputs`, `json5-parse`, `runtime`, `untrusted` and `sanitise`. The skip-unchanged classification (#75) is part of the run itself: a pair whose recorded publication still matches is skipped without a model call.
 
 What `harmonise` uses from `core/`, module by module: +
 
@@ -799,7 +967,7 @@ This specification is the contract the shipped code implements; what follows are
 - Pattern overlap — a file claimed by two patterns goes to the more specific one (more literal characters around the placeholder); two patterns of equal specificity are refused rather than guessed;
 - Language key ref-name validation — language keys are validated as BCP 47 tags (`^[a-zA-Z]{2,8}(-[a-zA-Z0-9]+)*$`), which is also what keeps the branch name `harmonise/<sourceLanguage>` a safe ref name;
 - ~~Commit/PR attribution and title format~~ — settled: the title is the repository's own via `pullRequest.title` (issue #30);
-- Dry-run report — the report is the action log and nothing is written; a pair that failed still turns a dry run red.
+- Dry-run report — the report is the action log and nothing is written to the repository; a pair that failed still turns a dry run red. The one file a dry run leaves is its run record ([the run record](#the-run-record)), written in the workspace.
 
 **Link rewriting complexity:** Relative link recomputation across directories is specified; complex paths (deep nesting, encoded segments) resolve through the same deterministic algorithm, but exotic destinations — angle-bracket destinations, backslash separators — pass through untouched in v1.
 
@@ -813,6 +981,8 @@ The specification is living text, and changes to it are recorded here rather tha
 - **Correctness hardening:** Glossary detection is specified as whole-word — a term flanked by a letter, digit or underscore never matches — and its scope excludes link machinery: inline link and image destinations, reference-definition destinations, angle autolinks, and bare scheme URLs. Newline handling is pinned by test: protected content round-trips byte-for-byte under LF, CRLF, mixed newlines, and a missing final newline. Document resolution is answered from the inventory's own index rather than a per-link scan of `pairs`.
 - **Title customization (#30):** The commit subject and pull-request title — one line, always — may be renamed by the repository through the optional `pullRequest.title` config key. `{n}` and `{sourceLanguage}` are its only placeholders, substituted deterministically at publish time; absent, the built-in convention stands byte-for-byte unchanged. The pull-request body stays action-authored.
 - **Recovery wiring (#107):** The pair loop's fixed two-attempt retry is replaced by the deterministic recovery policy. Every failure is classified — refusal, transport, auth, unknown — and the class decides the retry: transport faults retry twice (up to three model calls per pair), unknown failures once, and refusals and auth failures never. Answer-contract violations — malformed JSON, empty content, placeholder corruption, lost protected tokens, structural and link validation failures, frontmatter tampering — are refusals: the one-retry allowance link and structural failures had is withdrawn, and the second call an unfixable answer used to spend is no longer made.
+- **Script gate (#354):** The tokenised answer is judged before restoration by a script floor — `plan`'s `judgeScript`, counting letters per Unicode script against a curated primary-subtag table — and the pair refuses unless the target language's scripts hold strictly more than half of the counted letters. The violation joins the answer-contract refusals: raised in `judgeAnswer`, never retried. A language the table does not know is not judged by the gate, and a same-script wrong-language answer still passes — a script floor, not language identification.
+- **Script gate hardening (#354 reviews):** The count is narrowed to translatable prose — the leading frontmatter block, fenced code blocks, inline code spans and link machinery never vote, through the protection layer's own `markdown.mjs` masks, and inline HTML tag names in prose stay voters as the accepted residual — and the violation is raised as the typed deterministic refusal, so an all-pairs wrong-script red set records `refused` (F-09 names it beside #351). `sr` leaves the table — its script is contested, and the gate is off for it — while `mk` and `be` join the Cyrillic row. I17 is reworded to arriving-candidate scope: the identity no-op path returns before the gate, and an endorsed publication is not re-judged.
 
 ## Acceptance criteria
 

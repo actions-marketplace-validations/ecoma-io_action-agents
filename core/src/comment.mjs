@@ -104,17 +104,49 @@ function defaultNewId() {
  * @property {number} issueNumber the thread — an issue number or a pull request's
  * @property {(marker: string) => string} buildBody the action's comment, around the marker it is handed
  * @property {string[]} [ownLogins] the logins this action's own comments carry — defaults to the workflow-token bot; the actions resolve theirs from the token with {@linkcode resolveOwnLogins}, and a caller with other plans says so here
- * @property {string} [head] the commit the comment records, when the action records one
+ * @property {string | undefined} [head] the commit the comment records, when the action records one — an issue thread's upsert passes undefined, and its marker carries no head
  * @property {number} [startedAt] epoch milliseconds, for the newer-head rule
  * @property {() => string} [newId]
  * @property {(message: string) => void} [log]
  */
 
 /**
+ * The upsert's structured outcome — the publication fact every caller
+ * judges. An applied outcome carries the id of the comment THIS upsert left
+ * standing; an abandoned outcome carries no `id` at all (the comment standing
+ * on the thread is another run's, and this upsert must never claim it) and
+ * names that foreign comment instead. `deletedDuplicates` is surfaced on
+ * every outcome: an abandonment mutates nothing, so it is always 0 there.
+ *
+ * @typedef {object} UpsertCreated
+ * @property {"created"} outcome
+ * @property {number} id the comment this upsert created
+ * @property {number} deletedDuplicates own duplicates removed — 0 on a fresh thread
+ */
+
+/**
+ * @typedef {object} UpsertUpdated
+ * @property {"updated"} outcome
+ * @property {number} id the comment this upsert updated
+ * @property {number} deletedDuplicates own duplicates removed to keep exactly one
+ */
+
+/**
+ * @typedef {object} UpsertAbandoned
+ * @property {"abandoned"} outcome
+ * @property {number} foreignId the standing comment's id — another run's, named only to explain the refusal
+ * @property {number} deletedDuplicates always 0: an abandonment leaves the thread exactly as it was found
+ */
+
+/**
+ * @typedef {UpsertCreated | UpsertUpdated | UpsertAbandoned} UpsertOutcome
+ */
+
+/**
  * Creates or updates the action's one comment on a thread.
  *
  * @param {UpsertOptions} options
- * @returns {Promise<{ outcome: "created" | "updated" | "abandoned", id: number }>}
+ * @returns {Promise<UpsertOutcome>}
  */
 export async function upsertComment(options) {
   const log = options.log ?? (() => undefined);
@@ -151,7 +183,7 @@ export async function upsertComment(options) {
       options.issueNumber,
       options.buildBody(marker),
     );
-    return { outcome: "created", id: created.id };
+    return { outcome: "created", id: created.id, deletedDuplicates: 0 };
   }
 
   // Newest wins: ids ascend with creation, and the upsert keeps exactly one
@@ -161,13 +193,6 @@ export async function upsertComment(options) {
   if (winner === null) {
     throw new Error("the marker upsert found no comment after finding some");
   }
-  for (const loser of marked.slice(0, -1)) {
-    log(
-      `deleting a duplicate ${options.action} comment (${String(loser.id)}) — the upsert keeps exactly one`,
-    );
-    await options.store.deleteComment(loser.id);
-  }
-
   const marker = parseMarker(winner.body);
   if (
     options.head !== undefined &&
@@ -186,15 +211,39 @@ export async function upsertComment(options) {
         `abandoning the ${options.action} comment on #${String(options.issueNumber)} — ` +
           `a concurrent run recorded head ${marker.head} after this one started`,
       );
-      return { outcome: "abandoned", id: winner.id };
+      // The guard fires before any mutation: the duplicate cleanup below has
+      // not run yet, so the thread stays exactly as it was found — the
+      // standing comment and every duplicate on it are the run that won the
+      // thread's to claim, never this one's.
+      return { outcome: "abandoned", foreignId: winner.id, deletedDuplicates: 0 };
     }
+  }
+
+  for (const loser of marked.slice(0, -1)) {
+    log(
+      `deleting a duplicate ${options.action} comment (${String(loser.id)}) — the upsert keeps exactly one`,
+    );
+    await options.store.deleteComment(loser.id);
   }
 
   await options.store.updateComment(
     winner.id,
     options.buildBody(markerLine(options.action, marker?.id ?? "", options.head)),
   );
-  return { outcome: "updated", id: winner.id };
+  return { outcome: "updated", id: winner.id, deletedDuplicates: marked.length - 1 };
+}
+
+/** The run could not learn which logins carry its own comments, so it refused. */
+export class OwnLoginsError extends Error {
+  /** @param {Error} cause */
+  constructor(cause) {
+    super(
+      `could not read the token's writing identity (${cause.message}) — ` +
+        `refusing to guess which comments on the thread are the action's own`,
+    );
+    this.name = "OwnLoginsError";
+    this.cause = cause;
+  }
 }
 
 /**
@@ -202,24 +251,24 @@ export async function upsertComment(options) {
  * workflow's token actually writes as — `github-actions[bot]` under a
  * GITHUB_TOKEN, the app's bot login under an App token, the token's user
  * under a PAT — read from the API rather than assumed, so the upsert keeps
- * exactly one of its own whatever token the workflow chose. When the read
- * fails the default bot login stands in: exact under GITHUB_TOKEN, and under
- * anything else it costs one duplicate comment that the next healthy run's
- * upsert claims and collapses.
+ * exactly one of its own whatever token the workflow chose.
+ *
+ * A read that fails is a typed red run, never a silent guess. An assumed
+ * identity silently changes the write surface: under a token that writes as
+ * anything but the assumed login, the upsert reads the action's own prior
+ * comment as somebody else's and duplicates it instead of updating in place —
+ * exactly the defect guessing produced before this refusal existed. A run
+ * that cannot establish which comments are its own must not write at all.
  *
  * @param {{ whoami: () => Promise<{ login: string }> }} forge
- * @param {(message: string) => void} log
  * @returns {Promise<string[]>}
+ * @throws {OwnLoginsError} when the identity read fails
  */
-export async function resolveOwnLogins(forge, log) {
+export async function resolveOwnLogins(forge) {
   try {
     const { login } = await forge.whoami();
     return [login];
   } catch (cause) {
-    log(
-      `could not read the token's writing identity ` +
-        `(${cause instanceof Error ? cause.message : String(cause)}) — assuming ${DEFAULT_OWN_LOGIN}`,
-    );
-    return [...DEFAULT_OWN_LOGINS];
+    throw new OwnLoginsError(cause instanceof Error ? cause : new Error(String(cause)));
   }
 }

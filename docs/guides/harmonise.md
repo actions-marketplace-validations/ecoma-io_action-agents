@@ -22,7 +22,7 @@ action's own history.
 Add a workflow file under `.github/workflows/`. The minimal form:
 
 ```yaml
-- uses: ecoma-io/action-agents/harmonise@v0.5
+- uses: ecoma-io/action-agents/harmonise@v0.12
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     api-url: ${{ vars.LLM_API_URL }}
@@ -31,7 +31,7 @@ Add a workflow file under `.github/workflows/`. The minimal form:
     source-language: en
 ```
 
-Pin to a floating minor (`@v0.5`), an exact version (`@v0.5.0`) or a commit SHA.
+Pin to a floating minor (`@v0.12`), an exact version (`@v0.12.0`) or a commit SHA.
 See [Getting started](getting-started.md#pinning) for the tradeoffs.
 
 The action is referenced as the directory `harmonise` in the repository.
@@ -56,17 +56,18 @@ and pass it as `github-token`.
 All inputs listed below. Shared inputs are documented in the
 [development configuration page](../development/configuration.md).
 
-| Input                | Required | Default | What it does                                                            |
-| -------------------- | -------- | ------- | ----------------------------------------------------------------------- |
-| `github-token`       | yes      | —       | Token for GitHub API calls.                                             |
-| `api-url`            | yes      | —       | Base URL of an OpenAI-compatible endpoint.                              |
-| `api-key`            | no       | —       | Key for that endpoint. Leave unset for keyless endpoints.               |
-| `model`              | yes      | —       | Model id to ask.                                                        |
-| `request-timeout-ms` | no       | `30000` | Per-attempt timeout in milliseconds.                                    |
-| `config-path`        | no       | `""`    | Override the config file location.                                      |
-| `source-language`    | yes      | —       | BCP-47 tag of the source-of-truth language.                             |
-| `documents`          | no       | `""`    | Comma-separated globs narrowing which source documents to keep in step. |
-| `dry-run`            | no       | `true`  | Report drift, propose nothing.                                          |
+| Input                | Required | Default             | What it does                                                            |
+| -------------------- | -------- | ------------------- | ----------------------------------------------------------------------- |
+| `github-token`       | yes      | —                   | Token for GitHub API calls.                                             |
+| `api-url`            | yes      | —                   | Base URL of an OpenAI-compatible endpoint.                              |
+| `api-key`            | no       | —                   | Key for that endpoint. Leave unset for keyless endpoints.               |
+| `model`              | yes      | —                   | Model id to ask.                                                        |
+| `request-timeout-ms` | no       | `120000`            | Per-attempt timeout in milliseconds.                                    |
+| `config-path`        | no       | `""`                | Override the config file location.                                      |
+| `source-language`    | yes      | —                   | BCP-47 tag of the source-of-truth language.                             |
+| `documents`          | no       | `""`                | Comma-separated globs narrowing which source documents to keep in step. |
+| `dry-run`            | no       | `true`              | Report drift, propose nothing.                                          |
+| `record-path`        | no       | `.harmonise-record` | Directory for the machine-readable run record.                          |
 
 **`source-language`**: the key of the `languages` map every other version is
 judged against. Must be declared in the config file.
@@ -171,6 +172,22 @@ glossary: [
 Control characters (`\0`, newlines, tabs) are refused at startup — they are never
 an intentional glossary entry.
 
+Restoration checks order as well as counts: every placeholder — however often
+it repeats — is pinned by its first occurrence, and a candidate that places two
+in each other's positions is refused — no protected span's first occurrence is
+ever restored transposed. The pin scopes to first occurrences on purpose: a
+repeated term's later occurrences re-seat by counts and may relocate, so a
+document ordered A, B, A restores from a candidate ordered A, A, B, with B's
+clause carried past A's second occurrence. That residual is accepted, not
+missed — wrong bytes for a repeated term's later occurrences are the deliberate
+price of not refusing legitimate clustering. The trade is one-sided on purpose:
+a legitimate translation that moves a later protected clause earlier is refused
+and not re-asked, because wrong bytes are worse than a refused run. An upgrade
+makes that refusal newly reachable: a document that passed on an earlier
+version by fronting a repeated term's first occurrence now refuses — with no
+re-translation storm behind it, because a pair the diff shows unchanged is
+skipped before the model is asked, let alone a gate consulted.
+
 #### `instructions`
 
 Paths to instruction documents on the resolved policy source.
@@ -178,21 +195,23 @@ Paths to instruction documents on the resolved policy source.
 ```json5
 instructions: {
   instruction: ".github/action-agents/harmonise/instruction.md",
-  languages: {
+  "language-instructions": {
     vi: ".github/action-agents/harmonise/vi-instruction.md",
     de: ".github/action-agents/harmonise/de-instruction.md",
   },
 }
 ```
 
-| Sub-key           | Default path                                     |
-| ----------------- | ------------------------------------------------ |
-| `instruction`     | `.github/action-agents/harmonise/instruction.md` |
-| `languages.<tag>` | Not set — optional per-language instructions.    |
+| Sub-key                       | Default path                                     |
+| ----------------------------- | ------------------------------------------------ |
+| `instruction`                 | `.github/action-agents/harmonise/instruction.md` |
+| `language-instructions.<tag>` | Not set — optional per-language instructions.    |
 
-The `instruction` document applies to all pairs. A `languages`-specific
-document, when present, is appended after the general instruction for that
-target language.
+The `instruction` document applies to every pair. A `language-instructions`
+entry applies to one language's pairs, and every tag it names must be a key of
+`languages`. Both are optional. The prompt carries the general instruction as
+its custom layer and this language's instruction, if one exists, as the layer
+after it. Only these two sub-keys exist — any other key is refused at startup.
 
 #### `concurrency`
 
@@ -293,6 +312,13 @@ with optimistic locking. A dry run proposes nothing.
 document, target document, change type (new, updated, unchanged, noop), and any
 recovery action taken.
 
+**Run record**: one JSON file per run under `record-path` (default
+`.harmonise-record`), named after the base commit the run pinned to — the
+outcome, the pair accounting and the pull request it wrote, never document or
+model text. This repository's own workflow uploads it as the
+`harmonise-run-record` artifact; the contract is on the
+[development page](../development/harmonise.md#the-run-record).
+
 ### Pull request lifecycle
 
 1. The action discovers all translatable pairs from the source documents on the
@@ -304,46 +330,142 @@ recovery action taken.
 5. The pull request runs CI like any contributor's, if `github-token` is an App
    token.
 
+### When a pair is re-translated
+
+A pair is re-translated when its source bytes changed, when the translation
+policy moved — the glossary, any instruction document, the transformation
+version — or when the **model identity** changed: the model id and the
+endpoint the ask went to are part of the policy digest every state record
+carries, so switching model or provider re-runs every affected pair instead
+of silently carrying over wording the old model produced. The same force
+applies once on upgrade, when the digest gains the identity fields.
+
 ## Manual-edit protection
 
 A target document that was edited by hand outside the action's own history is
-protected from being overwritten. The action detects drift by comparing the
-target against the base the translation memory proves: if the target's current
-content differs from what the action last wrote, the merge cannot be proven and
-the pair fails closed — the action reports the conflict and moves on.
+protected from being overwritten. Drift is detected by comparing the target
+against the base the translation memory verifies: if the target's current
+content differs from that base, the pair is classified as target drift and
+marked preserve-required — your edits will not be silently overwritten.
 
-This means a human can edit a translated document and the action will not
-silently overwrite those edits. Resolve the conflict manually, then the next run
-sees the new base and proceeds.
+Whether the pair then merges or refuses depends on the base. When a verified
+base exists — a translation-memory entry whose bytes hash exactly to the
+recorded translation fingerprint — the action runs a deterministic three-way
+merge whose inputs are that verified last-translated base, the current target,
+and the fresh rendition the model just produced. Human edits win ties: a clean
+merge adopts them and the pair publishes as usual. The source document is not a
+merge input — the merge reconciles your edits with the new rendition, not with
+the source text.
 
-The three-way merge is deterministic and code-owned: the action reads the
-original source, the last-translated target, and the current target, and
-produces a merged result or a refusal. The development page has the full
+The pair fails closed only when the merge conflicts or when no verified base
+exists: the action reports the failed pair and moves on. Resolving a refusal is
+a human decision — restore the translation memory or the recorded fingerprint,
+or adopt or delete the file by hand. The development page has the full
 algorithm.
 
 ## Skip directives
 
-A source document can opt out of translation for a specific language by adding a
-directive to its frontmatter or body. The directive syntax is language-agnostic
-and parsed before any model call:
+A source document can protect its own lines from translation with HTML-comment
+directives in the body. A protected region survives the translate step
+byte-for-byte: it is replaced by a placeholder before the model call and
+restored afterwards, by the same mechanism the glossary uses. There are three
+forms, each a whole line whose only content is the comment:
 
 ```markdown
----
-harmonise:
-  skip: [vi, de]
----
+<!-- harmonise:skip -->
+<!-- harmonise:skip-start -->
+<!-- harmonise:skip-end -->
 ```
 
-A document with a `skip` directive for every target language is excluded from
-the source set entirely — it is not read and not counted as a noop pair.
+`<!-- harmonise:skip -->` protects the next non-blank line. The `skip-start`
+and `skip-end` directives bracket a region — markers included — that is
+preserved whole.
+
+Directives are honored from the source document only; the model cannot
+introduce one. A malformed directive fails the run — an unclosed or nested
+region, a `skip-end` with no open `skip-start`, or any other whole-line
+`<!-- harmonise:… -->` comment is refused, never silently ignored. Comment-like
+text inside a fenced code block or mid-line is content, not a directive, and is
+never validated as one. The full validation rules are on the
+[development page](../development/harmonise.md#skip-directives).
+
+## What a translated answer must pass
+
+An **arriving candidate** — the model's answer — is judged by deterministic
+gates before it can become a proposal: parse, the script gate, placeholder
+restoration, frontmatter identity, structural preservation and link
+identity. A document larger than one chunk arrives as several candidates —
+one per chunk, each judged as it arrives — and the gates run again over
+the reassembled whole. The scope is the arriving answer: one that repeats the
+published translation byte-for-byte is a no-op and returns before the gates —
+an endorsed publication is not re-judged. A refusal is never retried — the
+same answer fails the same way. An answer the provider declares truncated
+(`finish_reason: length`) never reaches the gates at all: the pair fails
+naming the truncation, unretried — no prefix of a cut answer is parsed or
+proposed.
+
+The **script gate** checks that the candidate's translatable prose is written
+in the target language's script: a `vi` target must come back in Latin
+letters, a `ja` target in Japanese writing. The expected scripts must hold
+more than half of the candidate's counted letters, and an answer whose
+remaining prose is half wrong-script letters refuses. What the gate accepts
+by design:
+
+- **Same-script wrong-language answers pass.** An English answer for an `es`
+  target is Latin on Latin; the gate is a script floor, not language
+  identification.
+- **Only prose votes.** Letters of inline code, the frontmatter block and
+  link destinations no longer vote; HTML tag names in prose remain voters.
+  The action's own placeholder spellings never vote.
+- **Traditional and simplified Chinese are one Unicode script.** A `zh`
+  target expects Han, and the gate cannot tell 简体 from 繁體.
+- **Serbian is not judged.** `sr` is absent from the table because its script
+  is contested — Cyrillic is the official script, Latin is in wide everyday
+  use — and the gate is off for it rather than refusing one of the two
+  correct spellings wholesale. The same holds for `sr-Latn` and `sr-Cyrl`:
+  the table keys on the primary subtag alone.
+- **A target language the gate does not know is not judged.** A language
+  whose primary subtag is absent from the gate's built-in table leaves the
+  pair unjudged by this gate — a fail-open deliberately narrower than a wrong
+  default that would refuse correct translations wholesale.
+
+A script-gate refusal names the target subtag, the winning script and the
+fraction — read it as a model or language-configuration problem (the wrong
+model, or the wrong tag in `languages`), not a document problem: the
+document is never coerced, and nothing is written.
+
+The table of known languages is part of the action, not your configuration —
+there is nothing to set for it. Its coverage, by script:
+
+| Script                    | Primary subtags                                                                                                                    |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Latin                     | `en`, `vi`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `pl`, `tr`, `id`, `sv`, `da`, `no`, `nb`, `fi`, `cs`, `ro`, `hu`, `ca`, `sq`, `ms` |
+| Cyrillic                  | `ru`, `uk`, `bg`, `mk`, `be`                                                                                                       |
+| Han                       | `zh`                                                                                                                               |
+| Han + Hiragana + Katakana | `ja`                                                                                                                               |
+| Hangul + Han              | `ko`                                                                                                                               |
+| Thai                      | `th`                                                                                                                               |
+| Arabic                    | `ar`, `fa`, `ur`                                                                                                                   |
+| Hebrew                    | `he`                                                                                                                               |
+| Greek                     | `el`                                                                                                                               |
+| Devanagari                | `hi`, `mr`, `ne`                                                                                                                   |
+| Bengali                   | `bn`                                                                                                                               |
+| Tamil                     | `ta`                                                                                                                               |
+| Georgian                  | `ka`                                                                                                                               |
+| Armenian                  | `hy`                                                                                                                               |
+| Ethiopic                  | `am`                                                                                                                               |
+
+A pair that published a wrong-script answer before this gate existed refuses
+on its next source change — unchanged pairs skip before the gate runs, so
+there is no re-translation storm on upgrade.
 
 ## Cost and budget controls
 
-| Control              | Default | Effect                                                  |
-| -------------------- | ------- | ------------------------------------------------------- |
-| `concurrency`        | `2`     | How many pairs translate at once. Max `4`.              |
-| `dry-run`            | `true`  | Report drift, propose nothing. Model calls still count. |
-| `request-timeout-ms` | `30000` | Per-attempt timeout for one provider call.              |
+| Control              | Default  | Effect                                                  |
+| -------------------- | -------- | ------------------------------------------------------- |
+| `concurrency`        | `2`      | How many pairs translate at once. Max `4`.              |
+| `dry-run`            | `true`   | Report drift, propose nothing. Model calls still count. |
+| `request-timeout-ms` | `120000` | Per-attempt timeout for one provider call.              |
 
 Each translatable pair that actually changed makes one model call (translation)
 plus potentially a recovery call. Pairs that are unchanged or noop make no model
@@ -351,17 +473,21 @@ calls — the action detects staleness from the diff before asking the model.
 
 ## Failure modes
 
-| Symptom                                                  | Cause                                                 | Resolution                                                                         |
-| -------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| "No config file found"                                   | No file at the configured or default locations.       | Create `.github/action-agents/harmonise/harmonise.json5`.                          |
-| "sourceLanguage not found in languages"                  | `sourceLanguage` is not a key of the `languages` map. | Add the source language to the map, or change `sourceLanguage`.                    |
-| "Language pattern must contain exactly one `{document}`" | A language's pattern is malformed.                    | Fix the pattern — `**/{document}.vi.md` is correct.                                |
-| "Glossary entry contains control characters"             | A glossary term has `\0`, newlines or tabs.           | Remove the control characters.                                                     |
-| "Config file exceeds 64 KiB"                             | Config file too large.                                | Reduce it.                                                                         |
-| "Instruction document exceeds 8 KiB"                     | An instruction document is too large.                 | Shorten it.                                                                        |
-| "PR title exceeds 200 characters"                        | The rendered title is too long.                       | Shorten the template or the number of changed documents.                           |
-| "Manual-edit conflict"                                   | A target document was edited outside the action.      | Resolve the conflict manually. The action reports the pair as failed and moves on. |
-| "Provider unreachable"                                   | The `api-url` endpoint did not respond.               | Check the endpoint and the timeout.                                                |
+| Symptom                                                                                                                                                                                                                                                                                                                                         | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Resolution                                                                                                                                                                                                               |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| "No config file found"                                                                                                                                                                                                                                                                                                                          | No file at the configured or default locations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Create `.github/action-agents/harmonise/harmonise.json5`.                                                                                                                                                                |
+| "sourceLanguage not found in languages"                                                                                                                                                                                                                                                                                                         | `sourceLanguage` is not a key of the `languages` map.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Add the source language to the map, or change `sourceLanguage`.                                                                                                                                                          |
+| "Language pattern must contain exactly one `{document}`"                                                                                                                                                                                                                                                                                        | A language's pattern is malformed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Fix the pattern — `**/{document}.vi.md` is correct.                                                                                                                                                                      |
+| "Glossary entry contains control characters"                                                                                                                                                                                                                                                                                                    | A glossary term has `\0`, newlines or tabs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Remove the control characters.                                                                                                                                                                                           |
+| "Config file exceeds 64 KiB"                                                                                                                                                                                                                                                                                                                    | Config file too large.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Reduce it.                                                                                                                                                                                                               |
+| "Instruction document exceeds 8 KiB"                                                                                                                                                                                                                                                                                                            | An instruction document is too large.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Shorten it.                                                                                                                                                                                                              |
+| "PR title exceeds 200 characters"                                                                                                                                                                                                                                                                                                               | The rendered title is too long.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Shorten the template or the number of changed documents.                                                                                                                                                                 |
+| "Manual-edit conflict"                                                                                                                                                                                                                                                                                                                          | A target document was edited outside the action.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Resolve the conflict manually. The action reports the pair as failed and moves on.                                                                                                                                       |
+| "Provider unreachable"                                                                                                                                                                                                                                                                                                                          | The `api-url` endpoint did not respond.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Check the endpoint and the timeout.                                                                                                                                                                                      |
+| "the provider truncated its response (finish_reason: length) — the model's output is incomplete and cannot be judged as a translation (classified refusal, give-up)", or "the provider truncated its response (finish_reason: length) — the model's output is incomplete and cannot be judged as a translation (classified refusal, exhausted)" | The provider hit its output cap mid-answer and declared it incomplete. The suffix after the message is the pair loop's recovery classification, not a verdict: the cut shares the never-retried class a content refusal gets — the same ask would cut the same answer again — and the action word tracks the pair's retry history (`give-up` on the pair's first ask, `exhausted` after a prior retryable failure — a transport blip, say — spent an attempt), while the terminal decision stays with the run boundary, where a provider cut is a defect line: the record lands `failed`, never `refused`. | Raise the provider-side output budget (e.g. `max_tokens`), then re-run — a cut answer is never parsed, retried or proposed.                                                                                              |
+| "… the candidate does not preserve the protected content's order"                                                                                                                                                                                                                                                                               | The translation moved a later protected term's first occurrence ahead of an earlier one — often a legitimate target-language reorder, not model failure.                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Reorder the source's protected firsts, drop the term from the glossary, or wait for the next run (a refusal is never re-asked in-run, but the next scheduled run makes a fresh model call); hand-translate if it recurs. |
+
+| "the document needs N chunks, past the 32-chunk execution budget — split the document", or "an unsplittable block of N bytes does not fit one chunk — shrink or split it" | The source document is larger than the chunked-translation budgets allow: more than 32 chunks per pair, or one block (a fenced code block, a single paragraph) past the 8 KiB per-chunk bound. The pair skips before any model call; split the document or shrink the block. |
 
 ## Recipes
 
@@ -397,12 +523,45 @@ English source, three targets, per-language instructions.
   glossary: ["action-agents", "ecoma-io", "SECURITY.md"],
   instructions: {
     instruction: ".github/action-agents/harmonise/instruction.md",
-    languages: {
+    "language-instructions": {
       vi: ".github/action-agents/harmonise/vi-instruction.md",
     },
   },
 }
 ```
+
+### A multilingual README with protected badges and selector
+
+Documents that translate themselves should not translate their machinery. A
+README's badge row and its language selector are the same bytes in every
+language — a translation that re-renders them drifts the set apart, and a later
+run would preserve that drift rather than repair it. Protect both with regions,
+and place them identically in every twin so the headers stay byte-comparable:
+
+```markdown
+<h1>Your action</h1>
+
+<p>Your intro.</p>
+
+<!-- harmonise:skip-start -->
+<p>
+  <a href="…"><img src="…" alt="CI" /></a>
+</p>
+<!-- harmonise:skip-end -->
+
+<!-- harmonise:skip-start -->
+
+<a href="README.md">English</a> | <a href="README.vi.md">Tiếng Việt</a>
+
+<!-- harmonise:skip-end -->
+```
+
+The convention this repository's own README follows: the canonical document
+carries the content; every twin carries the same two protected regions, the
+same selector line, and structural headings left in the source language so
+anchors keep resolving across languages. A twin that has never been written is
+a missing document, not an English fallback — the configured language fails
+until its document exists, and the harmonise run proposes creating it.
 
 ### App token for CI on the harmonise PR
 
@@ -423,7 +582,7 @@ jobs:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_KEY }}
 
-      - uses: ecoma-io/action-agents/harmonise@v0.5
+      - uses: ecoma-io/action-agents/harmonise@v0.12
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           api-url: ${{ vars.LLM_API_URL }}
@@ -437,7 +596,7 @@ jobs:
 Verify what a run would change without touching anything.
 
 ```yaml
-- uses: ecoma-io/action-agents/harmonise@v0.5
+- uses: ecoma-io/action-agents/harmonise@v0.12
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     api-url: ${{ vars.LLM_API_URL }}

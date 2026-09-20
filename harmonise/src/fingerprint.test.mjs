@@ -21,8 +21,8 @@ function policy() {
 }
 
 describe("TRANSFORMATION_VERSION", () => {
-  it("is 1 — the first pipeline version", () => {
-    expect(TRANSFORMATION_VERSION).toBe(1);
+  it("is 2 — the chunked-translation pipeline", () => {
+    expect(TRANSFORMATION_VERSION).toBe(2);
   });
 });
 
@@ -81,7 +81,34 @@ describe("policyFingerprint", () => {
 
   it("moves when the transformation version changes", () => {
     expect(policyFingerprint(policy())).not.toBe(
-      policyFingerprint({ ...policy(), transformationVersion: 2 }),
+      policyFingerprint({ ...policy(), transformationVersion: 3 }),
+    );
+  });
+
+  it("moves when the model identity changes (#252)", () => {
+    expect(policyFingerprint(policy())).not.toBe(
+      policyFingerprint({ ...policy(), model: "triage" }),
+    );
+    expect(policyFingerprint({ ...policy(), model: "triage" })).not.toBe(
+      policyFingerprint({ ...policy(), model: "translate" }),
+    );
+  });
+
+  it("moves when the endpoint changes, and ignores a trailing slash", () => {
+    const withEndpoint = { ...policy(), model: "triage", apiUrl: "https://gw.example.com/v1" };
+    expect(policyFingerprint(withEndpoint)).not.toBe(
+      policyFingerprint({ ...withEndpoint, apiUrl: "https://gw.example.org/v1" }),
+    );
+    // The same endpoint spelled with and without a final slash is the same
+    // provider; the canonicalization strips it before hashing.
+    expect(policyFingerprint(withEndpoint)).toBe(
+      policyFingerprint({ ...withEndpoint, apiUrl: "https://gw.example.com/v1/" }),
+    );
+  });
+
+  it("moves when the model identity is added at all — absent and set differ", () => {
+    expect(policyFingerprint(policy())).not.toBe(
+      policyFingerprint({ ...policy(), model: "triage", apiUrl: "https://gw.example.com/v1" }),
     );
   });
 

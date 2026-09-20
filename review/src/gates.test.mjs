@@ -5,7 +5,19 @@
 
 import { describe, expect, it } from "vitest";
 
-import { GATES, GateFactsError, evaluateGate, evaluateGates } from "./gates.mjs";
+import { contentDigest } from "./digest.mjs";
+import {
+  ARCHITECTURE_GATES,
+  GATES,
+  GateFactsError,
+  architectureEvidenceEstablished,
+  evaluateGate,
+  evaluateGates,
+} from "./gates.mjs";
+
+/** The digest every fixture read and its finding's provenance share — parity by construction. */
+const READ_DIGEST = contentDigest("the captured bytes the ledger holds for src/a.mjs");
+const OTHER_DIGEST = contentDigest("the captured bytes the ledger holds for src/b.mjs");
 
 /** @returns {import("./gates.mjs").ConclusionFacts} */
 function conclusionFacts() {
@@ -72,6 +84,23 @@ function runFacts(over = {}) {
   };
 }
 
+/** The head the run reviews — 40 hex chars, as every pinned ref spells it. */
+const REVIEWED_HEAD = "a".repeat(40);
+
+/** A foreign head — coherent bytes pinned somewhere else. */
+const FOREIGN_HEAD = "e".repeat(40);
+
+/** @returns {import("./gates.mjs").ArchitectureGateFacts} */
+function architectureFacts(over = {}) {
+  return {
+    verdict: "pass",
+    stale: false,
+    pinnedHead: REVIEWED_HEAD,
+    headSha: REVIEWED_HEAD,
+    ...over,
+  };
+}
+
 /** A published finding with its anchored read reference. */
 function anchored(over = {}) {
   return {
@@ -79,14 +108,14 @@ function anchored(over = {}) {
     file: "src/a.mjs",
     line: 2,
     message: "off-by-one",
-    provenance: { path: "src/a.mjs", startLine: 1, endLine: 40 },
+    provenance: { path: "src/a.mjs", startLine: 1, endLine: 40, digest: READ_DIGEST },
     ...over,
   };
 }
 
 /** The recorded read `anchored()`'s provenance names — ledger data, not the finding's claim. */
 function ledgerRead(over = {}) {
-  return { path: "src/a.mjs", startLine: 1, endLine: 40, ...over };
+  return { path: "src/a.mjs", startLine: 1, endLine: 40, digest: READ_DIGEST, ...over };
 }
 
 /** A quarantined finding — the #84 mechanism working as declared. */
@@ -107,7 +136,141 @@ describe("the declared set", () => {
   it("refuses an unknown gate name", () => {
     expect(() => evaluateGate(/** @type {any} */ ("nonexistent"), {})).toThrow(GateFactsError);
     expect(() => evaluateGate(/** @type {any} */ ("nonexistent"), {})).toThrow(
-      /the declared set is conclusion, bound, coverage, provenance, verification/,
+      /the declared set is conclusion, bound, coverage, provenance, verification, architecture/,
+    );
+  });
+});
+
+describe("the architecture family's declared set", () => {
+  it("declares the six gates frozen, architecture appended after verification", () => {
+    expect(Object.isFrozen(ARCHITECTURE_GATES)).toBe(true);
+    expect([...ARCHITECTURE_GATES]).toEqual([
+      "conclusion",
+      "bound",
+      "coverage",
+      "provenance",
+      "verification",
+      "architecture",
+    ]);
+    // The blind family's table is untouched — a blind run never sees the
+    // sixth gate.
+    expect([...GATES]).not.toContain("architecture");
+  });
+
+  it("the predicate is evidence-established, never verdict-equals-pass", () => {
+    // Verdict ∈ {pass, fail} ∧ head pinned ∧ not stale — the conjuncts,
+    // one at a time.
+    expect(architectureEvidenceEstablished(architectureFacts())).toBe(true);
+    expect(architectureEvidenceEstablished(architectureFacts({ verdict: "fail" }))).toBe(true);
+    expect(architectureEvidenceEstablished(architectureFacts({ verdict: "unknown" }))).toBe(false);
+    expect(architectureEvidenceEstablished(architectureFacts({ stale: true }))).toBe(false);
+    expect(architectureEvidenceEstablished(architectureFacts({ pinnedHead: null }))).toBe(false);
+    expect(architectureEvidenceEstablished(architectureFacts({ pinnedHead: FOREIGN_HEAD }))).toBe(
+      false,
+    );
+  });
+
+  it("passes on an established fail — recorded findings are not the gate's business", () => {
+    const result = evaluateGate("architecture", architectureFacts({ verdict: "fail" }));
+    expect(result).toEqual({ gate: "architecture", passed: true });
+  });
+
+  it("an unknown verdict fails with the kind of unknown named", () => {
+    const incomplete = evaluateGate(
+      "architecture",
+      architectureFacts({ verdict: "unknown", stale: false, pinnedHead: null }),
+    );
+    expect(incomplete.passed).toBe(false);
+    expect(incomplete.reason).toBe(
+      "the architecture evidence is incomplete — no architecture verdict was established",
+    );
+    const staleForeign = evaluateGate(
+      "architecture",
+      architectureFacts({ verdict: "unknown", stale: true, pinnedHead: FOREIGN_HEAD }),
+    );
+    expect(staleForeign.reason).toBe(
+      "the architecture evidence is stale — it pins a head other than the one this review judged, so its verdict is withheld as unknown",
+    );
+    const staleUnpinned = evaluateGate(
+      "architecture",
+      architectureFacts({ verdict: "unknown", stale: true, pinnedHead: null }),
+    );
+    expect(staleUnpinned.reason).toBe(
+      "the architecture evidence is stale — it pins no head commit, so its verdict is withheld as unknown",
+    );
+  });
+
+  it("a verdict beside a stale flag, or pinned anywhere but here, is never a pass", () => {
+    const contradictory = evaluateGate(
+      "architecture",
+      architectureFacts({ verdict: "pass", stale: true }),
+    );
+    expect(contradictory.passed).toBe(false);
+    expect(contradictory.reason).toContain("contradictory facts");
+    const unpinned = evaluateGate(
+      "architecture",
+      architectureFacts({ verdict: "pass", pinnedHead: null }),
+    );
+    expect(unpinned.passed).toBe(false);
+    expect(unpinned.reason).toContain("pins no head commit");
+    const elsewhere = evaluateGate(
+      "architecture",
+      architectureFacts({ verdict: "fail", pinnedHead: FOREIGN_HEAD }),
+    );
+    expect(elsewhere.passed).toBe(false);
+    expect(elsewhere.reason).toContain("another head");
+  });
+
+  it("refuses malformed facts fail-closed — the reader's shape, never coerced", () => {
+    expect(() => evaluateGate("architecture", {})).toThrow(GateFactsError);
+    expect(() => evaluateGate("architecture", { verdict: "maybe" })).toThrow(GateFactsError);
+    expect(() => evaluateGate("architecture", architectureFacts({ stale: "no" }))).toThrow(
+      GateFactsError,
+    );
+    expect(() => evaluateGate("architecture", architectureFacts({ pinnedHead: 40 }))).toThrow(
+      GateFactsError,
+    );
+    expect(() => evaluateGate("architecture", architectureFacts({ headSha: "" }))).toThrow(
+      GateFactsError,
+    );
+  });
+
+  it("the family selection is structural: an architecture slice selects the six-gate table", () => {
+    const aware = evaluateGates(runFacts({ architecture: architectureFacts() }));
+    expect(aware.results.map((result) => result.gate)).toEqual([...ARCHITECTURE_GATES]);
+    expect(aware.mayPublish).toBe(true);
+    // And the gate refuses with the posture the contract names: an aware
+    // run can never publish over unestablished architecture facts.
+    const withheld = evaluateGates(
+      runFacts({
+        architecture: architectureFacts({
+          verdict: "unknown",
+          stale: true,
+          pinnedHead: FOREIGN_HEAD,
+        }),
+      }),
+    );
+    expect(withheld.mayPublish).toBe(false);
+    expect(withheld.failed[0]?.gate).toBe("architecture");
+    expect(withheld.failed[0]?.reason).toContain("stale");
+  });
+
+  it("a bundle without the slice keeps the five-gate table, and its unknown-key refusal names five", () => {
+    const blind = evaluateGates(runFacts());
+    expect(blind.results.map((result) => result.gate)).toEqual([...GATES]);
+    expect(() => evaluateGates(runFacts({ gates: true }))).toThrow(
+      /the declared set is conclusion, bound, coverage, provenance, verification$/,
+    );
+  });
+
+  it("never lets the sixth gate pass on a missing slice", () => {
+    // A key present with no value is the aware family declaring a slice it
+    // never supplied — the one missing-shape the six-gate family can hold.
+    // (Deleting the key outright is not this gate's missing case: without
+    // the key there is no architecture family at all, and the five-gate
+    // table of a blind run is exactly right.)
+    expect(() => evaluateGates(runFacts({ architecture: undefined }))).toThrow(
+      /the 'architecture' slice is missing/,
     );
   });
 });
@@ -272,7 +435,11 @@ describe("gate provenance", () => {
     const result = evaluateGate(
       "provenance",
       provenanceFacts({
-        published: [anchored({ provenance: { path: "./src/a.mjs", startLine: 1, endLine: 40 } })],
+        published: [
+          anchored({
+            provenance: { path: "./src/a.mjs", startLine: 1, endLine: 40, digest: READ_DIGEST },
+          }),
+        ],
         quarantined: [],
       }),
     );
@@ -340,6 +507,40 @@ describe("gate provenance", () => {
     expect(result.reason).toContain("provenance does not match any recorded read");
   });
 
+  it("passes when a matching read's digest agrees with the reference's — parity holds", () => {
+    const result = evaluateGate(
+      "provenance",
+      provenanceFacts({
+        published: [
+          anchored({
+            provenance: { path: "./src/a.mjs", startLine: 1, endLine: 40, digest: READ_DIGEST },
+          }),
+        ],
+        quarantined: [],
+      }),
+    );
+    expect(result).toEqual({ gate: "provenance", passed: true });
+  });
+
+  it("fails when the reference's digest disagrees with the covering read — a content mismatch", () => {
+    const result = evaluateGate(
+      "provenance",
+      provenanceFacts({
+        published: [
+          anchored({
+            provenance: { path: "src/a.mjs", startLine: 1, endLine: 40, digest: "f".repeat(64) },
+          }),
+        ],
+        quarantined: [],
+      }),
+    );
+    expect(result.passed).toBe(false);
+    expect(result.reason).toBe(
+      "an unanchored finding remains in the publication set: " +
+        "src/a.mjs:2 off-by-one — provenance digest does not match the covering read's content",
+    );
+  });
+
   it("judges the published list it receives — a finding the strictness drop removed is no longer its business", () => {
     // The anchored set held a nit on src/drop.mjs too; the strictness drop
     // removed it before publication. The gate judges the final set: the
@@ -368,14 +569,14 @@ describe("gate provenance", () => {
           file: "src/b.mjs",
           line: 3,
           message: "unresolved claim",
-          provenance: { path: "src/b.mjs", startLine: 1, endLine: 30 },
+          provenance: { path: "src/b.mjs", startLine: 1, endLine: 30, digest: OTHER_DIGEST },
           id: "2",
           lifecycle: "unresolved",
           verdict: "uncertain",
           reason: "the evidence ran out",
         }),
       ],
-      ledger: [ledgerRead(), ledgerRead({ path: "src/b.mjs", endLine: 30 })],
+      ledger: [ledgerRead(), ledgerRead({ path: "src/b.mjs", endLine: 30, digest: OTHER_DIGEST })],
       quarantined: [],
     });
     expect(evaluateGate("provenance", backed)).toEqual({ gate: "provenance", passed: true });

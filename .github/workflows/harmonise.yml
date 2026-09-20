@@ -16,12 +16,15 @@ name: Harmonise
 # harmonise run may write is already pinned in code: files inside the
 # configured language patterns, one branch of its own naming, nothing else.
 #
-# The verification phase is complete: the first real pull request (README →
-# README.vi.md) was inspected against the safety checklist — source
-# untouched, links and badges intact, glossary preserved, structure held —
-# and merged through the queue with every check green. The weekly schedule
-# is what keeps the mirror in step without anyone asking; dispatch remains
-# for out-of-band runs, real or dry.
+# Status: the mirror's history is mixed — the harmonise action generated the
+# initial README.vi.md translation (PR #26, merged by hand), later updates
+# landed as human commits (#56, #216, #223) — but no harmonise state or
+# translation-memory file was ever committed on any ref, so the action has no
+# verified base for the pair today. A real run would classify it as unrecorded
+# and refuse it, leaving the disk untouched, until a maintainer adopts the
+# mirror through the action's own history. The weekly schedule therefore runs
+# dry-run by default (`inputs.dry-run || 'true'`): it reports drift and
+# proposes nothing; dispatch remains for out-of-band runs, real or dry.
 
 on:
   schedule:
@@ -79,6 +82,24 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token || github.token }}
           api-url: ${{ secrets.ECOMA_LLM_BASE_URL }}
           api-key: ${{ secrets.ECOMA_LLM_API_KEY }}
-          model: harmonise
+          model: glm-5.3-flash
           source-language: en
           dry-run: ${{ inputs.dry-run || 'true' }}
+
+      # The run record — outcome, pair accounting, pull request identity — as
+      # a downloadable file. `always()` keeps the record for runs whose action
+      # step failed; a run that died before any record could be written
+      # produced no file. The record directory is hidden by design, so
+      # `include-hidden-files: true` is load-bearing: upload-artifact prunes
+      # hidden files by default and the glob then matches zero files while
+      # the step still reports success (#378). `if-no-files-found: warn`
+      # keeps a declared write that lands nowhere loud instead of green over
+      # nothing.
+      - name: Upload the run record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harmonise-run-record
+          path: .harmonise-record/harmonise-record-*.json
+          include-hidden-files: true
+          if-no-files-found: warn

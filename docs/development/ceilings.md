@@ -17,6 +17,20 @@ silent. The wrapper frames, it does not protect: no ceiling rests on the framing
 and the ceilings that bite are exact match and the sanitiser downstream —
 [the doctrine](../doctrine.md) carries the reasoning.
 
+## `harmonise/src/chunks.mjs` — document chunking
+
+Harmonise translates a source document in per-chunk bounded payloads, not
+whole: each chunk is capped at `MAX_CHUNK_BYTES` (8 KiB of UTF-8) so its
+expected answer comes back complete inside a provider's output cap —
+24 KiB chunks produced empty answers and dropped placeholder tokens on
+the first real dogfood run — and a pair is capped at
+`MAX_CHUNKS_PER_PAIR` (32) chunks — a document needing more is refused
+at preparation, before any model call, as is any single unsplittable
+block (one fenced block, one paragraph) past the per-chunk bound. There
+is no whole-document size ceiling: a source larger than one chunk is
+partitioned deterministically and every chunk is translated. Chunked
+pairs multiply the composed retry ceiling below by their chunk count.
+
 ## `core/sanitise.mjs` — comment text
 
 Everything a model wrote that a human reads as comment text passes through here.

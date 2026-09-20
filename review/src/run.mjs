@@ -11,14 +11,30 @@
  * findings); PARTIAL says so prominently; dry-run writes nothing anywhere.
  */
 
+import { dirname, join } from "node:path";
+
 import { createWorkspace } from "#core/workspace.mjs";
+import { ArchitectureReaderError, readArchitectureReport } from "#core/architecture.mjs";
+import { oneLine } from "#core/one-line.mjs";
+import { sanitiseCommentText } from "#core/sanitise.mjs";
 import { createEvidence } from "#core/untrusted.mjs";
 import { markerLine, parseMarker, resolveOwnLogins, upsertComment } from "#core/comment.mjs";
 import { policyReader, policySourceAuditLine, resolvePolicySource } from "#core/policy.mjs";
-import { classificationInputs, classifyContext, evaluateApplicability } from "./applicability.mjs";
+import {
+  changeTotals,
+  classificationInputs,
+  classifyContext,
+  evaluateApplicability,
+} from "./applicability.mjs";
 import { loadConfigFile, validateConfig, loadDocuments } from "./config.mjs";
+import { DeterministicRefusalError, UnusableAnswerRefusalError } from "./refusal.mjs";
 
 import { buildInventory, selectActiveRules } from "./inventory.mjs";
+import {
+  architectureRiskFloors,
+  collectDecisionRefs,
+  resolveAdrContext,
+} from "./architecture-grounding.mjs";
 import { normaliseReadPath, parseDiffPaths, unifiedDiff } from "./coverage.mjs";
 import { createTools, TOOL_SPECS } from "./tools.mjs";
 import { classifyRisk } from "./risk.mjs";
@@ -27,6 +43,7 @@ import { buildPrompt } from "./prompt.mjs";
 import { MAX_CALL_ARGUMENT_BYTES, runLoop, reaskFinalAnswer, estimateTokens } from "./loop.mjs";
 import { evaluateGate, evaluateGates } from "./gates.mjs";
 import { parseAnswer, validateAnswer } from "./answer.mjs";
+
 import {
   applyVerdicts,
   parseVerdict,
@@ -35,15 +52,34 @@ import {
   VERIFIER_MAX_EVIDENCE_BYTES,
   VERIFIER_MAX_TOOL_CALLS,
 } from "./verify.mjs";
+import { CaptureRefusal, captureFindingEvidence, quotedEvidenceInWindow } from "./capture.mjs";
+import { buildCanonicalRecord, withRunPublication } from "./canonical.mjs";
+import { findingFingerprint, normalisePath, normaliseSubject } from "./identity.mjs";
 import { attachProvenance, readsFromRecordedReads } from "./provenance.mjs";
-import { renderComment, renderNothingToReview } from "./render.mjs";
+import { embedRecordBlock, previousRecord } from "./record.mjs";
+import { reconcile } from "./reconcile.mjs";
+import { MESSAGE_CHARS, renderComment, renderNothingToReview } from "./render.mjs";
 import {
   applicabilitySection,
+  architectureSection,
   assertFreshArtifact,
+  buildAbandonedArtifact,
   buildArtifact,
+  buildDryRunArtifact,
+  buildSkipRecord,
   buildSkippedArtifact,
   withCommentId,
 } from "./artifact.mjs";
+/**
+ * The bounded wait before the one corrective re-ask of the no-JSON answer
+ * class (#516): long enough for a seconds-long provider flake to clear,
+ * short enough to stay invisible on a healthy run. A constant, not a knob —
+ * a retry policy a user tunes per repository is a policy nobody can reason
+ * about across repositories.
+ *
+ * @type {20_000}
+ */
+export const UNUSABLE_ANSWER_BACKOFF_MS = 20_000;
 
 /**
  * The forge operations one review run makes, listed so a test doubles only
@@ -52,13 +88,13 @@ import {
  *
  * @typedef {object} ReviewForge
  * @property {() => Promise<{ defaultBranch: string, name: string, description: string }>} getRepository
- * @property {(number: number) => Promise<import("#core/forge.mjs").PullRequestSnapshot>} getPullRequest
  * @property {(branch: string) => Promise<{ sha: string }>} getRef resolves a branch tip, for the policy source
+ * @property {(number: number) => Promise<import("#core/forge.mjs").PullRequestSnapshot>} getPullRequest
  * @property {(number: number) => Promise<import("#core/forge.mjs").PullRequestFile[]>} listPullRequestFiles
+ * @property {(path: string, opts?: { ref?: string }) => Promise<{ content: string } | null>} getContents reads the resolved policy source — and, when architecture evidence names decision refs, the ADRs at that same pinned ref
  * @property {(number: number) => Promise<import("#core/forge.mjs").CommentEntry[]>} listComments
  * @property {(number: number, body: string) => Promise<{ id: number }>} createComment
  * @property {(id: number, body: string) => Promise<void>} updateComment
- * @property {(path: string) => Promise<{ content: string } | null>} getContents reads the resolved policy source
  * @property {(id: number) => Promise<void>} deleteComment
  * @property {() => Promise<{ login: string }>} whoami the token's writing identity
  */
@@ -77,6 +113,7 @@ export const PROMPT_HEADROOM = 0.5;
  * @property {number} contextWindow
  * @property {boolean} dryRun
  * @property {string} configPath
+ * @property {string} architectureReport workspace-relative path to the Archkeep delta report — empty keeps the run architecture-blind
  */
 
 /**
@@ -84,16 +121,33 @@ export const PROMPT_HEADROOM = 0.5;
  * @property {ReviewForge} forge
  * @property {import("#core/chat.mjs").Chat} chat
  * @property {() => number} now epoch milliseconds
+ * @property {(ms: number) => Promise<void>} sleep the bounded backoff between corrective re-asks — a real timer in production, injected in tests (the e2e law: no sleeps)
  * @property {(message: string) => void} info
+ * @property {(input: import("#core/architecture.mjs").ReadArchitectureInput) => import("#core/architecture.mjs").ArchitectureEvidence} [readArchitectureReport] the evidence reader, injectable for tests — the module's own boundary when a caller supplies none
  */
 
+/**
+ * The red-run facts `reviewPullRequest` has landed so far, stashed as they
+ * become true — the review twin of harmonise's `RedFacts` (#347). A `null`
+ * head or an absent member means the run died before the fact existed,
+ * never that there was none, and is what the entrypoint's boundary writer
+ * records when the run ends red before its own write site (#355).
+ *
+ * @typedef {object} ReviewRedFacts
+ * @property {string | null} headRef the head the snapshot read pinned, once it landed
+ * @property {number} [commentId] the comment's id, once an upsert returned one
+ * @property {import("./applicability.mjs").ExecutionContext} [applicability] the applicability context, once the classification derived it
+ * @property {import("./artifact.mjs").ArchitectureSection} [architecture] the retention-shaped architecture facts, once the evidence read landed — the outage rule: evidence before model means a run that dies red after the read still records it
+ */
 /**
  * @typedef {object} RunResult
  * @property {"skip" | "abandoned" | "nothing-to-review" | "published" | "published-without-artifact" | "dry-run"} outcome
  * @property {string} reason human-readable, logged by the caller
  * @property {number} [commentId]
- * @property {import("./artifact.mjs").RunArtifact | import("./artifact.mjs").SkippedRunArtifact} [artifact] the machine-readable run record — present when the run published or when a policy recorded a skipped run (the record is the skip's whole outcome); absent when the artifact file write failed after the comment was published (outcome `published-without-artifact`)
+ * @property {import("./artifact.mjs").RunArtifact | import("./artifact.mjs").SkippedRunArtifact | import("./artifact.mjs").SkipRecord | import("./artifact.mjs").AbandonedRunArtifact | import("./artifact.mjs").DryRunRunArtifact} [artifact] the machine-readable run record — present when the run published, when a policy recorded a skipped run (the record is the skip's whole outcome), when a skip path with no applicability fact left its durable record, or when an abandonment or dry-run wrote its reduced artifact; absent when the artifact file write failed after the comment was published (outcome `published-without-artifact`)
  * @property {import("./artifact.mjs").ApplicabilitySection} [applicability] the applicability fact, present when the review policy is active
+ * @property {import("#core/architecture.mjs").ArchitectureEvidence} [architecture] the frozen Archkeep evidence, present when the `architecture-report` input named a report and the reader boundary admitted it — held, never acted on, until its consumer lands
+ * @property {import("./canonical.mjs").CanonicalResult} [canonical] the canonical record the projections project from — present when the run published
  */
 /**
  * @param {object} input
@@ -103,6 +157,7 @@ export const PROMPT_HEADROOM = 0.5;
  * @param {Record<string, unknown>} input.event the parsed event payload
  * @param {Io} input.io
  * @param {number} input.pullRequestNumber
+ * @param {ReviewRedFacts} [input.red] the red-facts holder a caller that records red exits stashes into; optional, and a run that never reddens leaves it untouched
  * @returns {Promise<RunResult>}
  */
 export async function reviewPullRequest({
@@ -112,6 +167,7 @@ export async function reviewPullRequest({
   eventName,
   event,
   io,
+  red,
 }) {
   // Sampled once at the very start: core's newer-head guard compares the
   // comment's server-side update time against THIS moment, not write time.
@@ -124,6 +180,9 @@ export async function reviewPullRequest({
       ? `#${String(pullRequestNumber)} is ${snapshot.state}${snapshot.merged ? " and merged" : ""}`
       : undefined;
   const headSha = snapshot.head.sha;
+  // The red-run stash begins: from here on, a red exit names the head it
+  // was judging (#355).
+  if (red !== undefined) red.headRef = headSha;
 
   // ── Policy: resolve the source, then config, all before the first model
   // call and before any skip a policy would record. The base branch's tip
@@ -144,15 +203,48 @@ export async function reviewPullRequest({
   if (stateSkip === undefined || applicabilityOn) {
     io.info(policySourceAuditLine({ eventName, source, path: loaded.path }));
   }
-  const config = validateConfig(loaded.raw);
+  let config;
+  try {
+    config = validateConfig(loaded.raw);
+  } catch (cause) {
+    // validateConfig is pure over the parsed file (config.mjs's contract):
+    // every throw reaching here — its own or the applicability policy
+    // validator's — is a startup refusal (F-02), so the boundary retypes it
+    // once instead of every raise site carrying the class. The reader
+    // refusals that never reach this try (a configured path that is absent,
+    // a policy declared twice, a foreign schema major) stay plain errors —
+    // recorded `failed`, not `refused`, a deliberate difference from
+    // harmonise's loader, which retypes its reader failures too (#347) —
+    // because this reading call interleaves transport breaks a blanket
+    // retype would mislabel.
+    throw new DeterministicRefusalError(cause instanceof Error ? cause.message : String(cause), {
+      cause,
+    });
+  }
   const applicability = config.applicability;
 
   // ── Applicability: a code-owned state skip joins the audit story — the
   // record IS the skip's whole outcome. Under dry-run nothing is written,
   // so there it stays a log line, today's exact shape.
   if (stateSkip !== undefined) {
-    if (applicability === undefined || inputs.dryRun) {
+    if (inputs.dryRun) {
       return { outcome: "skip", reason: stateSkip };
+    }
+    if (applicability === undefined) {
+      // No policy either — the record still leaves the run: kind "state",
+      // through the same delivery the applicability family's records ride.
+      return {
+        outcome: "skip",
+        reason: stateSkip,
+        artifact: buildSkipRecord({
+          repository: `${context.owner}/${context.repo}`,
+          pullRequest: pullRequestNumber,
+          headRef: headSha,
+          reason: stateSkip,
+          kind: "state",
+          policy: { strictness: config.strictness, strategy: config.strategy, ...source },
+        }),
+      };
     }
     const derived = classifyContext(
       classificationInputs(
@@ -169,6 +261,7 @@ export async function reviewPullRequest({
         pullRequest: pullRequestNumber,
         headRef: headSha,
         reason: stateSkip,
+        policy: { strictness: config.strictness, strategy: config.strategy, ...source },
         applicability: applicabilitySection({
           context: derived.context,
           applicable: false,
@@ -197,7 +290,11 @@ export async function reviewPullRequest({
   let runIntensity;
   if (applicability !== undefined) {
     let classifiedPaths = null;
-    if (applicability.rules.some((rule) => rule.when.paths !== undefined)) {
+    if (
+      applicability.rules.some(
+        (rule) => rule.when.paths !== undefined || rule.when.changes !== undefined,
+      )
+    ) {
       earlyFiles = await io.forge.listPullRequestFiles(pullRequestNumber);
       // The classification matches the post-ignore path set; the budget has
       // no vote here — a diff past the budget still skips on a matching
@@ -208,18 +305,22 @@ export async function reviewPullRequest({
         maxDiffLines: Number.MAX_SAFE_INTEGER,
       }).reviewed.map((file) => file.filename);
     }
-    const derived = classifyContext(
-      classificationInputs(
-        event.pull_request,
-        `${context.owner}/${context.repo}`,
-        applicability.bots,
-      ),
+    const cls = classificationInputs(
+      event.pull_request,
+      `${context.owner}/${context.repo}`,
+      applicability.bots,
     );
+    const derived = classifyContext(cls);
+    const changeFacts = earlyFiles === undefined ? null : changeTotals(earlyFiles);
     const evaluated = evaluateApplicability({
       policy: applicability,
       context: derived.context,
       title: snapshot.title,
       branch: snapshot.head.ref,
+      base: snapshot.base.ref,
+      labels: snapshot.labels,
+      author: { login: cls.authorLogin, isBot: cls.authorType === "Bot" },
+      changes: changeFacts,
       paths: classifiedPaths,
     });
     runPosture = evaluated.posture;
@@ -234,6 +335,9 @@ export async function reviewPullRequest({
       basis: evaluated.basis,
       inputs: derived.inputs,
     });
+    // The red-run stash follows the classification: a run that dies past
+    // here records the context the policy judged it in (#355).
+    if (red !== undefined) red.applicability = derived.context;
     if (!evaluated.applicable) {
       if (inputs.dryRun) {
         return {
@@ -241,9 +345,31 @@ export async function reviewPullRequest({
           reason:
             `dry run: applicability rule '${evaluated.matchedRule}' matched — ` +
             `review intentionally not run; nothing written`,
+          artifact: buildDryRunArtifact({
+            repository: `${context.owner}/${context.repo}`,
+            pullRequest: pullRequestNumber,
+            headRef: headSha,
+            reason: `dry run: applicability rule '${evaluated.matchedRule}' matched — review intentionally not run`,
+            ...(applicabilityFact !== undefined
+              ? { applicability: applicabilityFact.context }
+              : {}),
+          }),
         };
       }
-      const skipReason = `#${String(pullRequestNumber)} matched applicability rule '${evaluated.matchedRule}' — review intentionally not run`;
+      // A size-anchored skip states its numbers: the reason carries the
+      // measured totals that decided it — deterministic numbers only,
+      // never title or login text.
+      const measuredRule =
+        changeFacts !== null
+          ? applicability.rules.find((rule) => rule.id === evaluated.matchedRule)
+          : undefined;
+      const measured =
+        changeFacts !== null && measuredRule?.when.changes !== undefined
+          ? ` (${String(changeFacts.lines)} changed lines across ${String(changeFacts.files)} files)`
+          : "";
+      const skipReason =
+        `#${String(pullRequestNumber)} matched applicability rule '${evaluated.matchedRule}'` +
+        `${measured} — review intentionally not run`;
       return {
         outcome: "skip",
         reason: skipReason,
@@ -252,10 +378,66 @@ export async function reviewPullRequest({
           pullRequest: pullRequestNumber,
           headRef: headSha,
           reason: skipReason,
+          policy: { strictness: config.strictness, strategy: config.strategy, ...source },
           applicability: applicabilityFact,
         }),
       };
     }
+  }
+
+  // ── Architecture evidence: read once, held frozen ────────────────────────
+  // The `architecture-report` input names the `archkeep delta` report the
+  // consumer's pinned architecture step left in the workspace, with the
+  // recipe's `run.json` manifest beside it — the sibling convention the
+  // integration recipe pins. Unset — the default — the run never hears of
+  // Archkeep: every byte of behavior is identical to a run that predates
+  // the input. Set, the reader boundary in core decides everything about
+  // those bytes — the protocol, the caps, the exit precedence, staleness —
+  // and this run's whole duty is to hold what it froze. The verdict itself
+  // gates nothing here; recording it is the read's entire effect this
+  // phase. The read sits before the documents load and long before any
+  // model call, so the evidence is in hand whatever the loop later does.
+  /** The frozen evidence the reader produced, once it read — held for its consumer, never acted on here. */
+  let architecture;
+  if (inputs.architectureReport !== "") {
+    const reader = io.readArchitectureReport ?? readArchitectureReport;
+    try {
+      architecture = reader({
+        workspace: createWorkspace({ root: context.workspace }),
+        reportPath: inputs.architectureReport,
+        manifestPath: join(dirname(inputs.architectureReport), "run.json"),
+        expect: { headSha },
+      });
+    } catch (error) {
+      if (error instanceof ArchitectureReaderError && error.arm === "validation") {
+        // Bytes that parse but disagree with the frozen protocol: the run
+        // declines to review against evidence it cannot trust — the typed
+        // class, so the red boundary records it `refused`.
+        throw new DeterministicRefusalError(error.message, { cause: error });
+      }
+      // The reader arm — absent beside a zero exit, past the cap, unreadable
+      // — is an honest infrastructure failure and stays a plain error: the
+      // run ends red as `failed`, never a refusal that claims the input was
+      // judged.
+      throw error;
+    }
+    io.info(
+      `review: architecture evidence ${architecture.verdict}` +
+        `${architecture.stale ? " — stale, verdict withheld as unknown" : ""}` +
+        `${architecture.incompleteness !== null ? ` (${architecture.incompleteness.reason})` : ""}`,
+    );
+  }
+  // The section is built once, at the read, and every later surface — the
+  // gate facts, the canonical record, the comment, the artifact, the red
+  // record — carries this same frozen object, so the surfaces cannot
+  // disagree: cross-surface identity by construction, never by
+  // re-derivation. Building it here is also the outage rule made real:
+  // evidence before model means a run that dies red after the read still
+  // records its facts.
+  const architectureFacts =
+    architecture === undefined ? undefined : architectureSection(architecture);
+  if (red !== undefined && architectureFacts !== undefined) {
+    red.architecture = architectureFacts;
   }
 
   // ── The intensity axis: a matched rule's strictness override becomes the
@@ -269,7 +451,10 @@ export async function reviewPullRequest({
   if (postureInstruction !== undefined) {
     postureDocument = documents.postureDocuments.get(postureInstruction);
     if (postureDocument === undefined) {
-      throw new Error(
+      // A config naming a posture whose document did not load is a
+      // deterministic startup refusal — the run declines to review without
+      // the policy's mode-scoped instructions rather than review half-instructed.
+      throw new DeterministicRefusalError(
         `the posture document '${postureInstruction}' did not survive loading — refusing ` +
           `rather than reviewing without the policy's mode-scoped instructions`,
       );
@@ -284,7 +469,10 @@ export async function reviewPullRequest({
     maxDiffLines: config.maxDiffLines,
   });
   if (inventory.excluded.length > 0) {
-    throw new Error(
+    // The diff-line budget is a declared ceiling (F-11): refusing past the
+    // break is the run declining to act, not a defect — the typed class,
+    // so the red boundary records it `refused` (#355).
+    throw new DeterministicRefusalError(
       `the diff counts ${String(inventory.countedDiffLines + inventory.excludedDiffLines)} lines ` +
         `against a ${String(config.maxDiffLines)}-line budget — the ${String(inventory.excluded.length)} ` +
         `file(s) past the break (${inventory.excluded[0]?.filename ?? ""} onward) are refused, not half-reviewed`,
@@ -292,14 +480,21 @@ export async function reviewPullRequest({
   }
 
   if (inventory.reviewed.length === 0) {
-    return nothingToReview({
-      pullRequestNumber,
-      headSha,
-      io,
-      dryRun: inputs.dryRun,
-      startedAt,
-      ...(applicabilityFact !== undefined ? { applicabilityFact } : {}),
-    });
+    return {
+      ...(await nothingToReview({
+        repository: `${context.owner}/${context.repo}`,
+        pullRequestNumber,
+        headSha,
+        io,
+        dryRun: inputs.dryRun,
+        startedAt,
+        source,
+        strictness: config.strictness,
+        strategy: config.strategy,
+        ...(applicabilityFact !== undefined ? { applicabilityFact } : {}),
+      })),
+      ...(architecture !== undefined ? { architecture } : {}),
+    };
   }
 
   // ── Coverage: the expected set, derived in code from the diff ───────────
@@ -332,9 +527,17 @@ export async function reviewPullRequest({
   // Per-file risk comes from the same deterministic classifier the plan
   // documents describe — one file per call, so each row is that file's
   // own plan. Config and classifier are the only inputs: nothing the
-  // model says can move a file between lanes.
+  // model says can move a file between lanes. Architecture evidence,
+  // when a run holds it, grounds a floor per named head site — code's
+  // decision again, additive-when-present: a blind run passes no floors
+  // and classifies exactly as it always has.
+  const architectureFloors =
+    architecture === undefined ? undefined : architectureRiskFloors(architecture);
   const lanes = assignLanes(
-    inventory.reviewed.map((file) => ({ path: file.filename, riskPlan: classifyRisk([file]) })),
+    inventory.reviewed.map((file) => ({
+      path: file.filename,
+      riskPlan: classifyRisk([file], architectureFloors),
+    })),
     { ...config, strictness: runStrictness },
   );
   const laneBudgets = laneBudget(lanes, inputs.maxTurns);
@@ -349,6 +552,18 @@ export async function reviewPullRequest({
   }
 
   const repository = await io.forge.getRepository();
+  // ── ADR context: the records behind intentional evolution, pinned ────────
+  // The decision refs the evidence's introduced items name, read through the
+  // policy forge at the resolved base tip — the same pin every config and
+  // document read rides, so a pull request cannot edit the ADRs that
+  // interpret its own diff. At most three, sorted; an absent ADR is a fact
+  // the prompt states as absent, never a guess. A reader that throws is an
+  // honest infrastructure failure and ends the run red, like any policy read.
+  const decisionRefs = architecture === undefined ? undefined : collectDecisionRefs(architecture);
+  const adrContext =
+    decisionRefs === undefined || decisionRefs.refs.length === 0
+      ? new Map()
+      : await resolveAdrContext({ reader: policy.getContents, refs: decisionRefs.refs });
   const { messages, evidence } = buildPrompt({
     repoName: `${context.owner}/${context.repo}`,
     repoDescription: repository.description,
@@ -369,6 +584,15 @@ export async function reviewPullRequest({
         : { name: runPosture, document: postureDocument },
     activeRules,
     ruleDocuments,
+    ...(architecture !== undefined && decisionRefs !== undefined
+      ? {
+          architecture: {
+            evidence: architecture,
+            adr: adrContext,
+            omittedRefs: decisionRefs.omitted,
+          },
+        }
+      : {}),
   });
 
   const workspace = createWorkspace({ root: context.workspace });
@@ -380,7 +604,10 @@ export async function reviewPullRequest({
 
   const estimated = estimateTokens(messages);
   if (estimated > PROMPT_HEADROOM * inputs.contextWindow) {
-    throw new Error(
+    // The prompt-headroom ceiling (F-11): a review that cannot fit is
+    // declined, never truncated — the typed class, so the red boundary
+    // records it `refused` (#355).
+    throw new DeterministicRefusalError(
       `the assembled prompt estimates at ${String(estimated)} tokens, past half the ` +
         `${String(inputs.contextWindow)}-token window — a review that cannot fit is refused, not truncated`,
     );
@@ -405,18 +632,39 @@ export async function reviewPullRequest({
   );
 
   let parsed = parseAnswer(outcome.candidate);
+  let reasks = 0;
   if (!parsed.ok && outcome.naturalStopped) {
-    // The one re-ask: natural stops only, once, tools withheld inside.
+    // The corrective re-asks: natural stops only, tools withheld inside.
+    // The first re-ask answers every shaped defect once. A second, bounded
+    // re-ask behind it answers only the no-JSON class (#516) — the
+    // provider-flake shape a job re-run has always recovered, recovered
+    // here instead. A shaped-but-invalid answer (a missing key, a wrong
+    // shape) is deliberately not retried: asking a third time does not
+    // teach the model the contract, it spends a call learning nothing.
     io.info("review: the first answer failed the contract — asking once more");
-    const second = await reaskFinalAnswer({
-      chat: io.chat,
-      model: inputs.model,
-      transcript: outcome.transcript,
-    });
-    parsed = parseAnswer(second);
+    reasks++;
+    parsed = parseAnswer(
+      await reaskFinalAnswer({
+        chat: io.chat,
+        model: inputs.model,
+        transcript: outcome.transcript,
+      }),
+    );
+    if (!parsed.ok && parsed.defect === "the answer holds no JSON object") {
+      io.info("review: the re-asked answer held no JSON object too — retrying once after backoff");
+      await io.sleep(UNUSABLE_ANSWER_BACKOFF_MS);
+      reasks++;
+      parsed = parseAnswer(
+        await reaskFinalAnswer({
+          chat: io.chat,
+          model: inputs.model,
+          transcript: outcome.transcript,
+        }),
+      );
+    }
   }
-  // Gate `conclusion` — the output contract held after at most the one
-  // re-ask. The refusal fires here, before validation, verification or
+  // Gate `conclusion` — the output contract held after at most the two
+  // re-asks. The refusal fires here, before validation, verification or
   // publication spend a single further call against an answer that never
   // satisfied the contract.
   const answer = parsed.ok
@@ -428,7 +676,19 @@ export async function reviewPullRequest({
   );
   if (answer === undefined || !conclusion.passed) {
     io.info(`review: gate ${conclusion.gate} failed — ${conclusion.reason}`);
-    throw new Error(`the final answer failed the output contract twice: ${conclusion.reason}`);
+    // F-09's off-sheet arm: the model's final answer never satisfied the
+    // contract, before validation, verification or publication spent a
+    // further call — a deterministic refusal the red boundary records
+    // `refused` (#355), never a half-reviewed publication. The no-JSON
+    // defect carries the subclass (#516): the boundary publishes its
+    // `refusal-class` output from it, the mechanically rerunnable cue.
+    const RefusalError =
+      !parsed.ok && parsed.defect === "the answer holds no JSON object"
+        ? UnusableAnswerRefusalError
+        : DeterministicRefusalError;
+    throw new RefusalError(
+      `the final answer failed the output contract ${reasks >= 2 ? "three times" : "twice"}: ${conclusion.reason}`,
+    );
   }
 
   const validated = validateAnswer({
@@ -447,19 +707,71 @@ export async function reviewPullRequest({
   for (const quarantined of anchored.quarantined) {
     io.info(
       `review: finding quarantined — unanchored: ${quarantined.finding.file}:${String(quarantined.finding.line)} ` +
-        `${quarantined.finding.message}`,
+        oneLine(quarantined.finding.message, { stripControlChars: true }),
     );
   }
   // Strictness is review policy, not a rendering detail: at low the nits
   // leave the published set here — each drop logged, concerns untouchable.
   const findings = applyStrictness(anchored.published, runStrictness, (line) => io.info(line));
 
-  // The verification pass sits between the nit-drop and rendering: planned
+  // The span gate sits between the nit-drop and the verification plan: a
+  // finding whose message quotes evidence must find that evidence within
+  // the window around its anchor — the wrong-anchor failure class quotes a
+  // span that lives elsewhere in the file. The judgment is code's, over
+  // the reviewed bytes the capture boundary reads, and it withholds
+  // through the quarantine channel (run contract: counted, named in the
+  // log, never in the canonical result, never run-fatal, no model call
+  // spent on it). The memo keeps the law at one bounded read per anchor —
+  // the capture before rendering reuses these bytes. A blank anchor line
+  // is left to the capture boundary's own law (#411), which judges it
+  // after the pass; a message that quotes nothing passes vacuously — no
+  // quoted evidence, no deterministic opinion.
+  /** The one bounded capture per (file, line): the gate's, then the capture's. */
+  const captures = new Map();
+  /** @type {(finding: import("./answer.mjs").Finding) => import("./capture.mjs").CapturedEvidence} */
+  const captureFor = (finding) => {
+    const key = `${finding.file}\u0000${String(finding.line)}`;
+    let captured = captures.get(key);
+    if (captured === undefined) {
+      try {
+        captured = captureFindingEvidence({ workspace, file: finding.file, line: finding.line });
+      } catch (cause) {
+        if (cause instanceof CaptureRefusal) {
+          throw new DeterministicRefusalError(cause.message, { cause });
+        }
+        throw cause;
+      }
+      captures.set(key, captured);
+    }
+    return captured;
+  };
+  /** @type {import("./answer.mjs").Finding[]} */
+  const plannable = [];
+  /** @type {Array<{ file: string, line: number }>} */
+  const withheldUnmatched = [];
+  for (const finding of findings) {
+    const captured = captureFor(finding);
+    if (
+      normaliseSubject(captured.subject) !== "" &&
+      !quotedEvidenceInWindow(finding.message, captured.window)
+    ) {
+      withheldUnmatched.push({ file: finding.file, line: finding.line });
+      continue;
+    }
+    plannable.push(finding);
+  }
+  for (const { file, line } of withheldUnmatched) {
+    io.info(
+      `review: finding withheld — its quoted evidence is absent from its anchor window: ${file}:${String(line)}`,
+    );
+  }
+
+  // The verification pass sits between the span gate and rendering: planned
   // findings each get their own bounded investigation, and verdicts assign
   // each one its lifecycle state — refuted and unresolved publish, labeled.
   // What it publishes is what renders and what the count names.
   const verified = await runVerificationPass({
-    findings,
+    findings: plannable,
     policy: { strategy: config.strategy, strictness: runStrictness },
     lanes,
     recordedReads,
@@ -469,7 +781,7 @@ export async function reviewPullRequest({
     model: inputs.model,
     info: (line) => io.info(`review: ${line}`),
   });
-  const published = verified.findings;
+  let published = verified.findings;
 
   // The declared gates decide the concluding posture — the loop's bound
   // accounting, the coverage condition, the publication invariants. The
@@ -498,6 +810,19 @@ export async function reviewPullRequest({
       ledger: readsFromRecordedReads(recordedReads),
     },
     verification: verified.accounting,
+    // The aware family's sixth slice: its presence selects the six-gate
+    // table, and its verdict basis is the reader's own facts — pinnedHead
+    // straight from the frozen evidence, headSha the head this run judges.
+    ...(architectureFacts !== undefined
+      ? {
+          architecture: {
+            verdict: architectureFacts.verdict,
+            stale: architectureFacts.stale,
+            pinnedHead: architectureFacts.provenance.head.commit,
+            headSha,
+          },
+        }
+      : {}),
   });
   for (const result of report.failed) {
     io.info(`review: gate ${result.gate} failed — ${result.reason}`);
@@ -506,17 +831,157 @@ export async function reviewPullRequest({
   const status = report.mayPublish
     ? { label: "Complete" }
     : { label: "Partial", reason: report.failed[0]?.reason ?? "the run's gates did not all pass" };
+
+  // ── The canonical result: one record, bound at the capture boundary ──
+  // Every finding the run will carry gets its evidence captured from the
+  // working tree at its own (file, line) anchor — the integration point
+  // [ADR 004](../../docs/adr/004-canonical-review-result.md) left outside
+  // the pure constructor, because the constructor does no I/O. The read
+  // itself already happened at the span gate: each capture here reuses the
+  // gate's memo, one bounded read per anchor for the whole run. A refused
+  // capture refuses the run RED, never skip-and-continue: a finding whose
+  // anchor cannot be captured has no digest, and a finding without a
+  // digest is not confirmed by anything. A capture the tree honours but
+  // whose span certifies nothing — a blank or whitespace-only anchor line
+  // — withholds the finding instead (#411): through the quarantine
+  // channel, counted, logged, never published, never run-fatal. A claim
+  // anchored on no span would enter the record with an empty identity,
+  // and the terminal the gates already determined must not be destroyed
+  // by its own record.
+  /** @type {Array<{ finding: import("./verify.mjs").VerifiedFinding, captured: import("./capture.mjs").CapturedEvidence }>} */
+  const capturedFindings = [];
+  /** @type {Array<{ file: string, line: number }>} */
+  const withheldUnspanned = [];
+  for (const finding of published) {
+    const captured = captureFor(finding);
+    if (normaliseSubject(captured.subject) === "") {
+      withheldUnspanned.push({ file: finding.file, line: finding.line });
+      continue;
+    }
+    capturedFindings.push({ finding, captured });
+  }
+  for (const { file, line } of withheldUnspanned) {
+    io.info(
+      `review: finding withheld — its anchor line carries no span to certify: ${file}:${String(line)}`,
+    );
+  }
+  const canonicalFindings = capturedFindings.map(({ finding, captured }) => ({
+    kind: finding.kind,
+    file: finding.file,
+    line: finding.line,
+    severity: finding.severity,
+    // The canonical record is the one place the model's claim text is
+    // sanitised on its way to every public surface: the comment renders its
+    // own copy, the SARIF projection carries `message.text` verbatim into the
+    // Code Scanning alert title, and the run artifact's validator re-caps the
+    // same field. Sanitising here (and only here) keeps those three byte-
+    // aligned with each other, and the ceiling holds — no mention parses, no
+    // structural token survives, no cap is a missing cap. Value at the
+    // identity is untouched: `message` is a rendering input, never an
+    // identity input (`canonical.mjs`), so fingerprints stay stable.
+    message: sanitiseCommentText(finding.message, { maxChars: MESSAGE_CHARS }).text,
+    subject: captured.subject,
+    lifecycle: finding.lifecycle ?? "unresolved",
+    ...(finding.verdict !== undefined ? { verdict: finding.verdict } : {}),
+    reason: finding.reason ?? "the verification policy did not schedule this finding",
+    evidence: { digest: captured.digest, excerpt: captured.excerpt },
+  }));
+  // The label join downstream walks the set the record was built from: the
+  // withheld findings left it here, so the published set is rebound to the
+  // survivors — alignment with `canonicalFindings` stays 1:1.
+  published = capturedFindings.map(({ finding }) => finding);
+  // The canonical verdict answers "was the review COMPLETE", a different
+  // question from "may the run publish" (the gates above). At low/medium
+  // strictness a run may publish with unread files — enforcement is not
+  // this action's job — so the verdict alone must carry the
+  // incompleteness (run-contract: it rides the verdict, never the state).
+  /** @type {boolean} every changed file read — undefined coverage counts as complete */
+  const coverageComplete =
+    outcome.coverage === undefined || outcome.coverage.uncovered.length === 0;
+  const canonical = buildCanonicalRecord({
+    head: headSha,
+    run: { state: "published", verdict: report.mayPublish && coverageComplete ? "pass" : "fail" },
+    findings: canonicalFindings,
+    coverage: outcome.coverage,
+    ...(architectureFacts !== undefined ? { architecture: architectureFacts } : {}),
+  });
+
+  // ── The cross-run reconciliation (ADR 004 decision 3) ──
+  // The previous canonical record is recovered from the marker comment the
+  // last published run left on the thread; record.mjs embeds it in the same
+  // upsert that publishes, so this read is the whole persistence story (the
+  // artifact file does not survive across runs). Guarded at every step: no
+  // own-marker comment — a foreign author's marker is nobody's history —
+  // or no readable block: a first run, and the comment renders unlabeled.
+  // The labels are comment prose and nothing else: the gate above, the
+  // SARIF projection and every exit read the current canonical record
+  // alone, never the reconciliation.
+  // Which comments are this run's own is a fact about the token, and it is
+  // resolved before any thread read: recovery applies the same ownership
+  // test the write does, so a forged marker can adopt nothing (#380). A
+  // failed identity read is a typed red run — never a guessed ownership.
+  const ownLogins = await resolveOwnLogins(io.forge);
+  const previous = previousRecord(
+    await io.forge.listComments(pullRequestNumber),
+    ACTION,
+    ownLogins,
+  );
+  const reconciled =
+    previous === undefined ? undefined : reconcile({ previous, current: canonical });
+  const labelOfFingerprint =
+    reconciled === undefined
+      ? undefined
+      : new Map(
+          canonical.findings.map((finding, index) => [
+            finding.fingerprint,
+            reconciled.current[index]?.reconciliation,
+          ]),
+        );
+  // canonical.findings is built from `published` in order but not to the
+  // same length: published findings sharing an identity collapse to one
+  // canonical finding. `reconciled.current` is aligned to
+  // canonical.findings, so the labels join by identity — the same
+  // `findingFingerprint` the canonical constructor collapses on — never
+  // by index: a collapsed duplicate carries its survivor's label, never a
+  // neighbour's. Reconcile stays the single source of the pairing.
+  const labelledFindings = published.map((finding, index) => {
+    const input = canonicalFindings[index];
+    const label =
+      input === undefined
+        ? undefined
+        : labelOfFingerprint?.get(
+            findingFingerprint({
+              file: normalisePath(input.file),
+              kind: input.kind,
+              subject: normaliseSubject(input.subject),
+            }),
+          );
+    return label === undefined ? finding : { ...finding, reconciliation: label };
+  });
+
   const body = renderComment({
     status: status.label,
     headSha,
     coverage: outcome.coverage,
     summary: validated.summary,
-    findings: published,
+    findings: labelledFindings,
     policySource: source,
     strictness: runStrictness,
     quarantinedCount: anchored.quarantined.length,
+    withheldUnspannedCount: withheldUnspanned.length,
+    withheldUnmatchedCount: withheldUnmatched.length,
+    ...(reconciled !== undefined ? { resolvedFindings: reconciled.previous } : {}),
+    ...(architectureFacts !== undefined ? { architecture: architectureFacts } : {}),
+    ...(reconciled?.architecture !== undefined
+      ? { architectureNote: reconciled.architecture.note }
+      : {}),
     ...(status.label === "Partial" ? { partialReason: status.reason } : {}),
   });
+  // The body that gets written: the prose plus the record block the next
+  // run reconciles against, appended by this same upsert so the thread
+  // never carries a stale record. The dry-run log shows the same bytes the
+  // run would have written.
+  const publishedBody = `${body}${embedRecordBlock(canonical)}\n`;
 
   // ── Before publication: the guard that makes stale reviews unreachable ──
   const fresh = await io.forge.getPullRequest(pullRequestNumber);
@@ -526,16 +991,32 @@ export async function reviewPullRequest({
       reason:
         `#${String(pullRequestNumber)} moved while it was being reviewed ` +
         `(now ${fresh.state} at ${fresh.head.sha.slice(0, 12)}) — nothing written`,
+      artifact: buildAbandonedArtifact({
+        repository: `${context.owner}/${context.repo}`,
+        pullRequest: pullRequestNumber,
+        headRef: headSha,
+        reason: `#${String(pullRequestNumber)} moved while it was being reviewed (now ${fresh.state}) — nothing written`,
+        ...(applicabilityFact !== undefined ? { applicability: applicabilityFact.context } : {}),
+      }),
+      ...(architecture !== undefined ? { architecture } : {}),
     };
   }
 
   if (inputs.dryRun) {
-    io.info(`review: dry run — the comment that would have been published:\n${body}`);
-    return { outcome: "dry-run", reason: "dry run: nothing written" };
+    io.info(`review: dry run — the comment that would have been published:\n${publishedBody}`);
+    return {
+      outcome: "dry-run",
+      reason: "dry run: nothing written",
+      artifact: buildDryRunArtifact({
+        repository: `${context.owner}/${context.repo}`,
+        pullRequest: pullRequestNumber,
+        headRef: headSha,
+        reason: "dry run: nothing written",
+        ...(applicabilityFact !== undefined ? { applicability: applicabilityFact.context } : {}),
+      }),
+      ...(architecture !== undefined ? { architecture } : {}),
+    };
   }
-  // The identity read sits behind every skip and dry-run gate: paid only by
-  // a run about to write.
-  const ownLogins = await resolveOwnLogins(io.forge, (message) => io.info(`review: ${message}`));
 
   // The artifact is the run's machine-readable record, built from the same
   // final facts the comment renders — BEFORE the comment, so every refusal
@@ -559,7 +1040,7 @@ export async function reviewPullRequest({
     pullRequest: pullRequestNumber,
     headRef: headSha,
     outcome: { classification: "published", reason },
-    policy: { strictness: runStrictness, strategy: config.strategy },
+    policy: { strictness: runStrictness, strategy: config.strategy, ...source },
     risk: lanes,
     findings: publishedAnchored,
     verification: {
@@ -572,6 +1053,7 @@ export async function reviewPullRequest({
     phases: outcome.phaseLog,
     provenance: {},
     ...(applicabilityFact !== undefined ? { applicability: applicabilityFact } : {}),
+    ...(architectureFacts !== undefined ? { architecture: architectureFacts } : {}),
   });
 
   // The built record is validated against a read taken here — before the
@@ -586,6 +1068,14 @@ export async function reviewPullRequest({
       reason:
         `#${String(pullRequestNumber)} moved while it was being reviewed ` +
         `(${cause instanceof Error ? cause.message : String(cause)}) — nothing written`,
+      artifact: buildAbandonedArtifact({
+        repository: `${context.owner}/${context.repo}`,
+        pullRequest: pullRequestNumber,
+        headRef: headSha,
+        reason: `#${String(pullRequestNumber)} moved while it was being reviewed — nothing written`,
+        ...(applicabilityFact !== undefined ? { applicability: applicabilityFact.context } : {}),
+      }),
+      ...(architecture !== undefined ? { architecture } : {}),
     };
   }
 
@@ -593,11 +1083,36 @@ export async function reviewPullRequest({
     store: io.forge,
     action: ACTION,
     issueNumber: pullRequestNumber,
-    buildBody: (marker) => `${marker}\n${body}`,
+    buildBody: (marker) => `${marker}\n${publishedBody}`,
     ownLogins,
     head: headSha,
     startedAt,
   });
+  if (upsert.outcome === "abandoned") {
+    // The concurrent-run rule kept this run's hands off a comment another
+    // run already owns: nothing of this run's was written, so the run ends
+    // abandoned — never published — and its artifact names no comment id,
+    // because the one it saw belongs to the run that won the thread.
+    return {
+      outcome: "abandoned",
+      reason:
+        `#${String(pullRequestNumber)}'s review comment is owned by a concurrent run ` +
+        `(comment ${String(upsert.foreignId)}) — nothing written`,
+      artifact: buildAbandonedArtifact({
+        repository: `${context.owner}/${context.repo}`,
+        pullRequest: pullRequestNumber,
+        headRef: headSha,
+        reason: `#${String(pullRequestNumber)}'s review comment is owned by a concurrent run — nothing written`,
+        ...(applicabilityFact !== undefined ? { applicability: applicabilityFact.context } : {}),
+      }),
+      ...(architecture !== undefined ? { architecture } : {}),
+    };
+  }
+  // The red-run stash follows the comment: a run that dies past here — the
+  // identity attach, the write-time freshness read — records the comment
+  // that stands (#355). Every typed refusal fires before any write, so a
+  // `refused` record can never name one.
+  if (red !== undefined) red.commentId = upsert.id;
   const record = withCommentId(artifact, upsert.id);
 
   // The comment's newer-head rule extends to the artifact, and the guard
@@ -616,6 +1131,15 @@ export async function reviewPullRequest({
         `#${String(pullRequestNumber)} moved while its review was being published ` +
         `(comment ${String(upsert.id)} stands) — the artifact is not written: ` +
         (cause instanceof Error ? cause.message : String(cause)),
+      artifact: buildAbandonedArtifact({
+        repository: `${context.owner}/${context.repo}`,
+        pullRequest: pullRequestNumber,
+        headRef: headSha,
+        reason: `#${String(pullRequestNumber)} moved while its review was being published — comment ${String(upsert.id)} stands`,
+        commentId: upsert.id,
+        ...(applicabilityFact !== undefined ? { applicability: applicabilityFact.context } : {}),
+      }),
+      ...(architecture !== undefined ? { architecture } : {}),
     };
   }
   return {
@@ -623,6 +1147,11 @@ export async function reviewPullRequest({
     reason,
     commentId: upsert.id,
     artifact: record,
+    // The publication fact is the one thing the record could not produce when
+    // it was built — the write had not happened yet. Attach the real
+    // outcome: what this run's upsert actually did to the thread.
+    canonical: withRunPublication(canonical, upsert.outcome),
+    ...(architecture !== undefined ? { architecture } : {}),
   };
 }
 
@@ -645,7 +1174,8 @@ function applyStrictness(findings, strictness, info) {
   for (const finding of findings) {
     if (finding.severity === "nit") {
       info(
-        `review: nit dropped at low strictness — ${finding.file}:${String(finding.line)} ${finding.message}`,
+        `review: nit dropped at low strictness — ${finding.file}:${String(finding.line)} ` +
+          oneLine(finding.message, { stripControlChars: true }),
       );
       continue;
     }
@@ -667,7 +1197,7 @@ function applyStrictness(findings, strictness, info) {
  * into the run log.
  *
  * @param {object} input
- * @param {import("./answer.mjs").Finding[]} input.findings the post-nit-drop set
+ * @param {import("./answer.mjs").Finding[]} input.findings the span gate's survivors — the post-nit-drop set minus its quoted-evidence mismatches
  * @param {{ strategy: import("./config.mjs").Strategy, strictness: import("./config.mjs").Strictness }} input.policy the config's strategy and strictness — the gate's mode policy is derived from both
  * @param {import("./lanes.mjs").LaneAssignment[]} input.lanes the lanes code assigned before the loop
  * @param {ReadonlyMap<string, string>} input.recordedReads the loop's captured read bytes
@@ -774,7 +1304,7 @@ const VERIFIER_BUDGET_INSTRUCTION =
  *  - transport failure is `uncertain` (existing rule).
  *
  * @param {{ item: import("./verify.mjs").VerificationItem, chat: import("#core/chat.mjs").Chat, model: string, workspace: import("#core/workspace.mjs").Workspace, ignore: string[], info: (line: string) => void }} input
- * @returns {Promise<{ verdict: import("./verify.mjs").Verdict, reason: string }>}
+ * @returns {Promise<{ verdict: import("./verify.mjs").Verdict, reason: string, kind?: import("./vocabulary.mjs").FindingKind }>}
  */
 async function oneVerdict({ item, chat, model, workspace, ignore, info }) {
   const evidence = createEvidence();
@@ -851,10 +1381,10 @@ async function oneVerdict({ item, chat, model, workspace, ignore, info }) {
  * @param {import("./verify.mjs").VerificationItem} item
  * @param {import("./verify.mjs").ParsedVerdict | import("./verify.mjs").RefusedVerdict} parsed
  * @param {(line: string) => void} info
- * @returns {{ verdict: import("./verify.mjs").Verdict, reason: string }}
+ * @returns {{ verdict: import("./verify.mjs").Verdict, reason: string, kind?: import("./vocabulary.mjs").FindingKind }}
  */
 function settle(item, parsed, info) {
-  if (parsed.ok) return { verdict: parsed.verdict, reason: parsed.reason };
+  if (parsed.ok) return { verdict: parsed.verdict, kind: parsed.kind, reason: parsed.reason };
   info(
     `verification pass — the answer to finding ${item.id} was refused (${parsed.defect}); ` +
       `it counts as uncertain`,
@@ -887,17 +1417,22 @@ function wireDefect(item, detail, info) {
 /**
  * The universe emptied: an existing marker gets a deterministic clearing
  * body so stale findings do not outlive their relevance; with no marker,
- * a green log line is the whole result.
+ * a green log line is the whole result. Either way the run leaves a durable
+ * record — kind "nothing-to-review" — unless dry-run suppressed the write.
  *
- * @param {{ pullRequestNumber: number, headSha: string, io: Io, dryRun: boolean, startedAt: number, applicabilityFact?: import("./artifact.mjs").ApplicabilitySection }} input
+ * @param {{ repository: string, pullRequestNumber: number, headSha: string, io: Io, dryRun: boolean, startedAt: number, source: import("#core/policy.mjs").PolicySource, strictness: import("./config.mjs").Strictness, strategy: import("./config.mjs").Strategy, applicabilityFact?: import("./artifact.mjs").ApplicabilitySection }} input
  * @returns {Promise<RunResult>}
  */
 async function nothingToReview({
+  repository,
   pullRequestNumber,
   headSha,
   io,
   dryRun,
   startedAt,
+  source,
+  strictness,
+  strategy,
   applicabilityFact,
 }) {
   // Same publication guard as the main path: the clearing update is a
@@ -907,11 +1442,18 @@ async function nothingToReview({
     return {
       outcome: "abandoned",
       reason: `#${String(pullRequestNumber)} moved while it was being reviewed — nothing written`,
+      artifact: buildAbandonedArtifact({
+        repository,
+        pullRequest: pullRequestNumber,
+        headRef: headSha,
+        reason: `#${String(pullRequestNumber)} moved while it was being reviewed — nothing written`,
+        ...(applicabilityFact !== undefined ? { applicability: applicabilityFact.context } : {}),
+      }),
     };
   }
   // Same gate as the write below: the identity read is paid only when a
   // marker comment may actually be claimed.
-  const ownLogins = await resolveOwnLogins(io.forge, (message) => io.info(`review: ${message}`));
+  const ownLogins = await resolveOwnLogins(io.forge);
   const comments = await io.forge.listComments(pullRequestNumber);
   for (const comment of [...comments].sort((a, b) => b.id - a.id)) {
     const marker = parseMarker(comment.body);
@@ -923,9 +1465,21 @@ async function nothingToReview({
       const body = `${markerLine(ACTION, marker.id ?? "", headSha)}\n${renderNothingToReview(headSha)}`;
       if (dryRun) {
         io.info(`review: dry run — the clearing update that would have been written:\n${body}`);
-        return { outcome: "dry-run", reason: "dry run: universe empty, nothing written" };
+        return {
+          outcome: "dry-run",
+          reason: "dry run: universe empty, nothing written",
+          artifact: buildDryRunArtifact({
+            repository,
+            pullRequest: pullRequestNumber,
+            headRef: headSha,
+            reason: "dry run: universe empty, nothing written",
+            ...(applicabilityFact !== undefined
+              ? { applicability: applicabilityFact.context }
+              : {}),
+          }),
+        };
       }
-      await upsertComment({
+      const clearing = await upsertComment({
         store: io.forge,
         action: ACTION,
         issueNumber: pullRequestNumber,
@@ -934,9 +1488,41 @@ async function nothingToReview({
         head: headSha,
         startedAt,
       });
+      if (clearing.outcome === "abandoned") {
+        // The clearing update is a write, and the newer-head rule governs
+        // writes: a concurrent run owns the thread, and the marker stands.
+        // The run ends abandoned and writes no skip record — a cleared
+        // record would describe a thread this run did not clear, and the
+        // next run would trust it over the comment that is really there.
+        return /** @type {RunResult} */ ({
+          outcome: "abandoned",
+          reason:
+            `#${String(pullRequestNumber)}'s review comment is owned by a concurrent run ` +
+            `(comment ${String(clearing.foreignId)}) stands — the marker was not cleared`,
+          artifact: buildAbandonedArtifact({
+            repository,
+            pullRequest: pullRequestNumber,
+            headRef: headSha,
+            reason:
+              `#${String(pullRequestNumber)}'s review comment is owned by a concurrent run ` +
+              `— the marker was not cleared`,
+            ...(applicabilityFact !== undefined
+              ? { applicability: applicabilityFact.context }
+              : {}),
+          }),
+        });
+      }
       return /** @type {RunResult} */ ({
         outcome: "nothing-to-review",
         reason: "universe empty — marker cleared",
+        artifact: buildSkipRecord({
+          repository,
+          pullRequest: pullRequestNumber,
+          headRef: headSha,
+          reason: "universe empty — marker cleared",
+          kind: "nothing-to-review",
+          policy: { strictness, strategy, ...source },
+        }),
         ...(applicabilityFact !== undefined ? { applicability: applicabilityFact } : {}),
       });
     }
@@ -944,6 +1530,20 @@ async function nothingToReview({
   return /** @type {RunResult} */ ({
     outcome: "skip",
     reason: "universe empty and no prior review comment — nothing to do",
+    // The dry-run guard is here and not above: with no marker there is no
+    // write to suppress, only the record, so the record is what dry-run drops.
+    ...(!dryRun
+      ? {
+          artifact: buildSkipRecord({
+            repository,
+            pullRequest: pullRequestNumber,
+            headRef: headSha,
+            reason: "universe empty and no prior review comment — nothing to do",
+            kind: "nothing-to-review",
+            policy: { strictness, strategy, ...source },
+          }),
+        }
+      : {}),
     ...(applicabilityFact !== undefined ? { applicability: applicabilityFact } : {}),
   });
 }

@@ -11,17 +11,19 @@ import { describe, expect, it } from "vitest";
 
 import { HttpError } from "#core/transport-errors.mjs";
 
+import { MAX_CHUNK_BYTES, MAX_CHUNKS_PER_PAIR } from "./chunks.mjs";
 import { buildInventory } from "./inventory.mjs";
 import { parseAssetLayout, parseLanguagePattern } from "./patterns.mjs";
 import {
-  MAX_SOURCE_BYTES,
   pairBlockShape,
   planFrontmatterGuard,
+  planPair,
   preparePair,
   sanitizeTranslationHtml,
   translatePair,
 } from "./plan.mjs";
 import { RefusalError } from "./recovery.mjs";
+import { DeterministicRefusalError } from "./refusal.mjs";
 
 describe("sanitizeTranslationHtml", () => {
   it("strips script tags from prose", () => {
@@ -236,9 +238,11 @@ describe("translatePair", () => {
    * and counts the requests it received.
    *
    * @param {string[]} bodies
+   * @param {string} [finishReason] the finish reason every answer carries —
+   *   "length" is a provider that cut the answer short (#449)
    * @returns {import("#core/chat.mjs").Chat & { calls: () => number }}
    */
-  function chatWith(bodies) {
+  function chatWith(bodies, finishReason = "stop") {
     let cursor = 0;
     let calls = 0;
     return /** @type {import("#core/chat.mjs").Chat & { calls: () => number }} */ ({
@@ -247,7 +251,7 @@ describe("translatePair", () => {
         const body = bodies[Math.min(cursor, bodies.length - 1)];
         cursor++;
         calls++;
-        return { content: body ?? "", toolCalls: [], finishReason: "stop" };
+        return { content: body ?? "", toolCalls: [], finishReason };
       },
     });
   }
@@ -284,7 +288,9 @@ describe("translatePair", () => {
       lang: "vi",
       sourcePath: "manual/dev.md",
       target: { path: "manual/vi/dev.md", state: "missing" },
-      sourceText,
+      sourceChunk: sourceText,
+      chunkIndex: 0,
+      chunkCount: 1,
       inventory: inventoryFor(["manual/dev.md", "manual/api.md", "manual/vi/api.md"]),
       config,
     });
@@ -293,9 +299,11 @@ describe("translatePair", () => {
   /** @param {import("./plan.mjs").PreparedPair} prepared @param {string} answerBody */
   function translate(prepared, answerBody) {
     return translatePair({
-      prepared,
-      sourceLanguage: "en",
+      chunks: [prepared],
+      sourceText,
       existingText: undefined,
+      frontmatter: undefined,
+      sourceLanguage: "en",
       model: "gpt-x",
       chat: chatWith([answerBody]),
       evidence,
@@ -308,7 +316,9 @@ describe("translatePair", () => {
     const prepared = prepare();
     const chat = chatWith([proposes(prepared.protectedText)]);
     const result = await translatePair({
-      prepared,
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
       sourceLanguage: "en",
       existingText: undefined,
       model: "gpt-x",
@@ -329,7 +339,9 @@ describe("translatePair", () => {
     );
     const chat = chatWith([evil, evil]);
     const pending = translatePair({
-      prepared,
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
       sourceLanguage: "en",
       existingText: undefined,
       model: "gpt-x",
@@ -345,6 +357,69 @@ describe("translatePair", () => {
     expect(chat.calls()).toBe(1);
   });
 
+  it("refuses an answer in the wrong script on the first attempt, typed refusal for the boundary", async () => {
+    const prepared = prepare();
+    const foreign = proposes("# 開発ガイド\n\nAPI を参照してください。\n");
+    const chat = chatWith([foreign]);
+    const pending = translatePair({
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    await expect(pending).rejects.toThrowError(
+      /script gate: target language "vi" requires Latin to hold the majority/,
+    );
+    // The typed class is the record's outcome: an all-pairs wrong-script set
+    // records `refused`, and this same-answer-never-retries verdict is a
+    // refusal under the recovery policy either way.
+    await expect(pending).rejects.toBeInstanceOf(DeterministicRefusalError);
+    expect(chat.calls()).toBe(1);
+  });
+  it("keeps a protection refusal's typed class for the boundary", async () => {
+    const prepared = preparePair({
+      slug: "dev",
+      lang: "vi",
+      sourcePath: "manual/dev.md",
+      target: { path: "manual/vi/dev.md", state: "missing" },
+      sourceChunk: "Alpha keeps logs 30 days. Beta must ship weekly.\n",
+      chunkIndex: 0,
+      chunkCount: 1,
+      inventory: inventoryFor(["manual/dev.md"]),
+      config: /** @type {import("./config.mjs").HarmoniseConfig} */ ({
+        ...config,
+        glossary: ["logs 30 days", "ship weekly"],
+      }),
+    });
+    const [first, second] = /** @type {[string, string]} */ ([...prepared.protection.spans.keys()]);
+    const transposed = prepared.protectedText
+      .replace(first, "@@A@@")
+      .replace(second, first)
+      .replace("@@A@@", second);
+    const chat = chatWith([proposes(transposed), proposes(transposed)]);
+    const pending = translatePair({
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    await expect(pending).rejects.toBeInstanceOf(DeterministicRefusalError);
+    await expect(pending).rejects.toThrowError(/does not preserve the protected content's order/);
+    expect(chat.calls()).toBe(1);
+  });
+
   it("passes a transport-layer error through untagged", async () => {
     const chat = /** @type {import("#core/chat.mjs").Chat} */ ({
       async complete() {
@@ -356,7 +431,9 @@ describe("translatePair", () => {
       },
     });
     const pending = translatePair({
-      prepared: prepare(),
+      chunks: [prepare()],
+      sourceText,
+      frontmatter: undefined,
       sourceLanguage: "en",
       existingText: undefined,
       model: "gpt-x",
@@ -376,20 +453,140 @@ describe("translatePair", () => {
     const result = await translate(prepared, proposes(prepared.protectedText));
     expect(result.outcome).toBe("proposal");
   });
-  it("refuses a sanitised proposal past the byte cap, naming the count", async () => {
-    const prepared = prepare();
-    const filler = "Ordinary prose sentences carry the payload past the cap. ";
-    const big =
-      prepared.protectedText + filler.repeat(Math.ceil((MAX_SOURCE_BYTES + 1) / filler.length));
-    await expect(translate(prepared, proposes(big))).rejects.toThrowError(
-      new RegExp(
-        "^the translated document is " +
-          `${String(new TextEncoder().encode(big).byteLength)} bytes, past the ` +
-          `${String(MAX_SOURCE_BYTES)}-byte cap$`,
-      ),
-    );
+  it("passes each chunk's real fragment position into the chunked call's system prompt", async () => {
+    // The chunked path carries the fragment-position layer into every
+    // request: the first chunk is named fragment 1, the last is named
+    // fragment N. Build a chat double that captures the request messages
+    // instead of judging the answer, so the wiring itself is pinned.
+    const chunk = (/** @type {string} */ sourceChunk, /** @type {number} */ chunkIndex) =>
+      preparePair({
+        slug: "dev",
+        lang: "vi",
+        sourcePath: "manual/dev.md",
+        target: { path: "manual/vi/dev.md", state: "missing" },
+        sourceChunk,
+        chunkIndex,
+        chunkCount: 2,
+        inventory: inventoryFor(["manual/dev.md"]),
+        config,
+      });
+    const chunks = [chunk("Alpha prose A.\n", 0), chunk("Beta prose B.\n", 1)];
+    const answers = chunks.map((prepared) => proposes(prepared.protectedText));
+    /** @type {import("#core/chat.mjs").ChatMessage[][]} */
+    const requested = [];
+    const capturing = /** @type {import("#core/chat.mjs").Chat} */ ({
+      async complete(request) {
+        requested.push(request.messages);
+        return {
+          content: answers[requested.length - 1],
+          toolCalls: [],
+          finishReason: "stop",
+        };
+      },
+    });
+    const result = await translatePair({
+      chunks,
+      sourceText: "Alpha prose A.\n\nBeta prose B.\n",
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat: capturing,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    expect(result.outcome).toBe("proposal");
+    expect(requested).toHaveLength(2);
+    const [first, second] = requested;
+    const firstSystem = /** @type {string} */ (first?.[0]?.content);
+    const secondSystem = /** @type {string} */ (second?.[0]?.content);
+    expect(firstSystem).toContain("The document below is fragment 1 of 2 of a larger document.");
+    expect(secondSystem).toContain("The document below is fragment 2 of 2 of a larger document.");
   });
 
+  it("leaves the single-chunk prompt without any fragment layer", async () => {
+    // A pair that fits one chunk behaves exactly as the pipeline always
+    // has: no fragment layer in the system prompt it sends.
+    const prepared = prepare();
+    /** @type {import("#core/chat.mjs").ChatMessage[][]} */
+    const requested = [];
+    const capturing = /** @type {import("#core/chat.mjs").Chat} */ ({
+      async complete(request) {
+        requested.push(request.messages);
+        return { content: proposes(prepared.protectedText), toolCalls: [], finishReason: "stop" };
+      },
+    });
+    const result = await translatePair({
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat: capturing,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    expect(result.outcome).toBe("proposal");
+    expect(requested).toHaveLength(1);
+    const system = /** @type {string} */ (requested[0]?.[0]?.content);
+    expect(system).not.toContain("fragment");
+  });
+
+  it("translates a chunked pair chunk by chunk, reassembling in order", async () => {
+    // One chat request per chunk; the parts come back joined in chunk
+    // order and every chunk's summary rides along.
+    const chunk = (/** @type {string} */ sourceChunk, /** @type {number} */ chunkIndex) =>
+      preparePair({
+        slug: "dev",
+        lang: "vi",
+        sourcePath: "manual/dev.md",
+        target: { path: "manual/vi/dev.md", state: "missing" },
+        sourceChunk,
+        chunkIndex,
+        chunkCount: 2,
+        inventory: inventoryFor(["manual/dev.md"]),
+        config,
+      });
+    const chunks = [chunk("Alpha prose A.\n", 0), chunk("Beta prose B.\n", 1)];
+    const chat = chatWith([
+      proposes("Alpha prose translated A.\n"),
+      proposes("Beta prose translated B.\n"),
+    ]);
+    const result = await translatePair({
+      chunks,
+      sourceText: "Alpha prose A.\n\nBeta prose B.\n",
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    expect(chat.calls()).toBe(2);
+    expect(result.outcome).toBe("proposal");
+    if (result.outcome !== "proposal") throw new Error("expected a proposal");
+    expect(result.text).toBe("Alpha prose translated A.\nBeta prose translated B.\n");
+    expect(result.summary).toBe("kept in step kept in step");
+  });
+
+  it("accepts a translation past the old whole-document byte cap", async () => {
+    // The chunk budget bounds how much source a pair may carry, not how
+    // much prose a valid translation may return: a structurally sound
+    // reassembly over 32 KiB is a proposal, no cap error.
+    const prepared = prepare();
+    const filler = "Ordinary prose sentences carry the payload past the cap. ";
+    const big = prepared.protectedText + filler.repeat(Math.ceil((32 * 1024) / filler.length));
+    expect(new TextEncoder().encode(big).byteLength).toBeGreaterThan(32 * 1024);
+    const result = await translate(prepared, proposes(big));
+    expect(result.outcome).toBe("proposal");
+    if (result.outcome !== "proposal") throw new Error("expected a proposal");
+    expect(result.text).toBe(big);
+  });
   it("records a noop when the sanitised proposal is byte-identical to what it replaces", async () => {
     // The glossary mints a placeholder, so the answer echoing the protected
     // text differs from the published bytes by one token; restoration and
@@ -406,13 +603,17 @@ describe("translatePair", () => {
       lang: "vi",
       sourcePath: "manual/dev.md",
       target: { path: "manual/vi/dev.md", state: "existing" },
-      sourceText,
+      sourceChunk: sourceText,
+      chunkIndex: 0,
+      chunkCount: 1,
       inventory: inventoryFor(["manual/dev.md"]),
       config: glossaryConfig,
     });
     expect(prepared.protectedText).not.toBe(sourceText);
     const result = await translatePair({
-      prepared,
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
       sourceLanguage: "en",
       existingText: sourceText,
       model: "gpt-x",
@@ -423,6 +624,84 @@ describe("translatePair", () => {
     });
     expect(result.outcome).toBe("noop");
     expect(result.summary).toBe("kept in step");
+  });
+
+  it("refuses a provider-truncated answer before parsing, unretried (#449)", async () => {
+    const prepared = prepare();
+    // A body whose parseable prefix would otherwise reach the judge — the cut
+    // is what fails the pair, not the body's shape.
+    const cut =
+      '{"drift":true,"summary":"kept in step","content":"' + prepared.protectedText.slice(0, 8);
+    const chat = chatWith([cut], "length");
+    const pending = translatePair({
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    await expect(pending).rejects.toThrowError(
+      "the provider truncated its response (finish_reason: length) — " +
+        "the model's output is incomplete and cannot be judged as a translation",
+    );
+    // The never-retried class: a RefusalError under the recovery policy, and
+    // not a DeterministicRefusalError — the run's record keeps it a defect
+    // line, the provider's cut, not a ceiling this action declined under.
+    await expect(pending).rejects.toBeInstanceOf(RefusalError);
+    await expect(pending).rejects.not.toBeInstanceOf(DeterministicRefusalError);
+    expect(chat.calls()).toBe(1);
+  });
+
+  it("keeps failing an identical body on the invalid-answer path when the provider did not cut it", async () => {
+    const prepared = prepare();
+    const chat = chatWith(["not json at all", "not json at all"]);
+    const pending = translatePair({
+      chunks: [prepared],
+      sourceText,
+      frontmatter: undefined,
+      sourceLanguage: "en",
+      existingText: undefined,
+      model: "gpt-x",
+      chat,
+      evidence,
+      repository: { name: "acme/docs", description: "Documentation" },
+      documents: { languages: {} },
+    });
+    // The control: finish_reason stop means the body is judged on its own
+    // bytes — a generic invalid-answer failure, never a truncation claim.
+    await expect(pending).rejects.toThrowError(/the model's answer/);
+    await expect(pending).rejects.not.toThrowError(/truncated/u);
+    expect(chat.calls()).toBe(1);
+  });
+});
+
+describe("planPair", () => {
+  it("refuses a document past the per-pair chunk budget, naming the count", () => {
+    const sectionBytes = MAX_CHUNK_BYTES / 2;
+    const paragraphs = Array.from({ length: MAX_CHUNKS_PER_PAIR + 1 }, () =>
+      "y".repeat(sectionBytes),
+    );
+    const result = planPair(paragraphs.join("\n\n"), undefined);
+    expect(result.refusal).toBe(
+      `the document needs ${String(MAX_CHUNKS_PER_PAIR + 1)} chunks, past the ` +
+        `${String(MAX_CHUNKS_PER_PAIR)}-chunk execution budget — split the document`,
+    );
+    expect(result.chunks).toEqual([]);
+  });
+
+  it("refuses an unsplittable block past one chunk, naming its byte count", () => {
+    const text = "```\n" + "x".repeat(MAX_CHUNK_BYTES) + "\n```\n";
+    const result = planPair(text, undefined);
+    expect(result.refusal).toBe(
+      `an unsplittable block of ${String(new TextEncoder().encode(text).byteLength)} bytes ` +
+        "does not fit one chunk — shrink or split it",
+    );
+    expect(result.chunks).toEqual([]);
   });
 });
 
@@ -474,7 +753,9 @@ describe("preparePair asset layouts", () => {
       lang: "vi",
       sourcePath: "manual/dev.md",
       target: { path: "manual/vi/dev.md", state: "missing" },
-      sourceText: "![d](imgs/diagram.png)\n",
+      sourceChunk: "![d](imgs/diagram.png)\n",
+      chunkIndex: 0,
+      chunkCount: 1,
       inventory: inventoryFor(
         ["manual/dev.md", "manual/assets/vi/imgs/diagram.png"],
         ["assets/{lang}/{dir}/{base}.{ext}"],
@@ -492,7 +773,9 @@ describe("preparePair asset layouts", () => {
       lang: "vi",
       sourcePath: "manual/dev.md",
       target: { path: "manual/vi/dev.md", state: "missing" },
-      sourceText: "![d](imgs/diagram.png)\n",
+      sourceChunk: "![d](imgs/diagram.png)\n",
+      chunkIndex: 0,
+      chunkCount: 1,
       inventory: inventoryFor(["manual/dev.md"], ["assets/{lang}/{dir}/{base}.{ext}"]),
       config,
     });
@@ -510,7 +793,9 @@ describe("preparePair asset layouts", () => {
       lang: "vi",
       sourcePath: "manual/dev.md",
       target: { path: "manual/vi/dev.md", state: "existing" },
-      sourceText: "![d](imgs/diagram.png)\n",
+      sourceChunk: "![d](imgs/diagram.png)\n",
+      chunkIndex: 0,
+      chunkCount: 1,
       inventory: inventoryFor(
         ["manual/dev.md", "manual/vi/dev.md", "manual/assets/vi/imgs/diagram.png"],
         ["assets/{lang}/{dir}/{base}.{ext}"],
@@ -520,7 +805,9 @@ describe("preparePair asset layouts", () => {
     expect(prepared.protectedText).toContain("../assets/vi/imgs/diagram.png");
 
     const result = await translatePair({
-      prepared,
+      chunks: [prepared],
+      sourceText: "![d](imgs/diagram.png)\n",
+      frontmatter: undefined,
       sourceLanguage: "en",
       existingText: "old\n",
       model: "gpt-x",

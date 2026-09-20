@@ -26,7 +26,11 @@ on:
     types: [opened, edited, reopened, labeled]
   pull_request:
     types: [opened, edited, synchronize, reopened, labeled]
-  workflow_dispatch:
+  # There is no workflow_dispatch: the entrypoint refuses every event but
+  # `issues` and `pull_request` (run contract F-01), and a dispatched run has
+  # no thread to classify — it would go red at the event gate and write its
+  # `failed` record. The first dry runs come from real threads instead; the
+  # rollout ladder in docs/dogfood.md is written that way.
 
 # `labeled` is the queue-marker lifecycle event (item 1 of #224): the issue
 # forms apply `needs triage`, and the action classifies on `labeled` and
@@ -79,5 +83,24 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           api-url: ${{ secrets.ECOMA_LLM_BASE_URL }}
           api-key: ${{ secrets.ECOMA_LLM_API_KEY }}
-          model: triage
+          model: glm-5.3-flash
           dry-run: false
+
+      # The run record — event, thread, policy pin, the decision when one was
+      # made, the terminal state in the run contract's vocabulary and the
+      # reason — as a downloadable file. `always()` keeps the record for runs
+      # that skipped, failed or never reached the model; a run that died
+      # before anything could be recorded may write no file. The record
+      # directory is hidden by design, so `include-hidden-files: true` is
+      # load-bearing: upload-artifact prunes hidden files by default and the
+      # glob then matches zero files while the step still reports success
+      # (#378). `if-no-files-found: warn` keeps a declared write that lands
+      # nowhere loud instead of green over nothing.
+      - name: Upload the run record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: triage-run-record
+          path: .triage-record/triage-record-*.json
+          include-hidden-files: true
+          if-no-files-found: warn

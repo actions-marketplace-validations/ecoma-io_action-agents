@@ -21,7 +21,7 @@ refuted and unresolved findings publish in their own sections.
 Add a workflow file under `.github/workflows/`. The minimal form:
 
 ```yaml
-- uses: ecoma-io/action-agents/review@v0.5
+- uses: ecoma-io/action-agents/review@v0.12
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     api-url: ${{ vars.LLM_API_URL }}
@@ -29,7 +29,7 @@ Add a workflow file under `.github/workflows/`. The minimal form:
     model: ${{ vars.LLM_MODEL }}
 ```
 
-Pin to a floating minor (`@v0.5`), an exact version (`@v0.5.0`) or a commit SHA.
+Pin to a floating minor (`@v0.12`), an exact version (`@v0.12.0`) or a commit SHA.
 See [Getting started](getting-started.md#pinning) for the tradeoffs.
 
 The action is referenced as the directory `review` in the repository.
@@ -43,22 +43,33 @@ re-worded description does not change the code under review. There is no
 All inputs listed below. Shared inputs are documented in the
 [development configuration page](../development/configuration.md).
 
-| Input                | Required | Default            | What it does                                              |
-| -------------------- | -------- | ------------------ | --------------------------------------------------------- |
-| `github-token`       | yes      | —                  | Token for GitHub API calls.                               |
-| `api-url`            | yes      | —                  | Base URL of an OpenAI-compatible endpoint.                |
-| `api-key`            | no       | —                  | Key for that endpoint. Leave unset for keyless endpoints. |
-| `model`              | yes      | —                  | Model id to ask.                                          |
-| `request-timeout-ms` | no       | `30000`            | Per-attempt timeout in milliseconds.                      |
-| `config-path`        | no       | `""`               | Override the config file location.                        |
-| `max-turns`          | no       | `30`               | Ceiling on agent turns.                                   |
-| `context-window`     | no       | `128000`           | Token budget of the configured model.                     |
-| `dry-run`            | no       | `false`            | Review and log, comment nothing.                          |
-| `artifact-path`      | no       | `.review-artifact` | Directory for the machine-readable run record.            |
+| Input                 | Required | Default            | What it does                                                                                                     |
+| --------------------- | -------- | ------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `github-token`        | yes      | —                  | Token for GitHub API calls.                                                                                      |
+| `api-url`             | yes      | —                  | Base URL of an OpenAI-compatible endpoint.                                                                       |
+| `api-key`             | no       | —                  | Key for that endpoint. Leave unset for keyless endpoints.                                                        |
+| `model`               | yes      | —                  | Model id to ask.                                                                                                 |
+| `request-timeout-ms`  | no       | `120000`           | Per-attempt timeout in milliseconds.                                                                             |
+| `config-path`         | no       | `""`               | Override the config file location.                                                                               |
+| `max-turns`           | no       | `30`               | Ceiling on agent turns.                                                                                          |
+| `context-window`      | no       | `128000`           | Token budget of the configured model.                                                                            |
+| `dry-run`             | no       | `false`            | Review and log, comment nothing.                                                                                 |
+| `artifact-path`       | no       | `.review-artifact` | Directory for the machine-readable run record.                                                                   |
+| `architecture-report` | no       | `""`               | Workspace path to an `archkeep delta` report, recorded as architecture evidence. Empty stays architecture-blind. |
 
 **`max-turns`**: the agent loop reads files (tools), reflects, and decides what
 to read next. Reaching the ceiling ends the review and says so in the comment;
 it never posts a partial review as if it were complete.
+
+**Unread changed files**: before the reviewer's natural stop is accepted while
+changed files remain unread, the loop sends one corrective message listing
+them and offers the reading tools again for another round. The list is the
+coverage ledger's own — paths only, computed in code, never the reviewer's
+self-report — and the notice fires once per run: a second stop is accepted
+wherever coverage then stands, and a run a bound ended (`max-turns`, the tool
+ceilings) never reaches it. The notice is effort, not enforcement: a review
+that still ends with files unread records the `fail` verdict wherever it
+publishes.
 
 **`context-window`**: the token budget of the configured model. The agent
 compacts its transcript before reaching it. Set this to match your model's
@@ -70,8 +81,10 @@ nothing. Flip to `true` during initial evaluation.
 
 **`artifact-path`**: directory inside `GITHUB_WORKSPACE` where the
 machine-readable run record is written (JSON file named after the reviewed
-commit). The action refuses to resolve this outside the workspace. When the
-review publishes nothing, no file is written.
+commit). The action refuses to resolve this outside the workspace. A run that
+ends red still leaves its record — a `refused` or `failed` file naming what
+killed it — unless it died before it held the facts an artifact is built
+from, or the record write itself failed.
 
 ## Config file
 
@@ -145,9 +158,15 @@ ignore: [
 
 #### `maxDiffLines`
 
-The maximum counted diff lines (additions + deletions) the action processes. A
-diff exceeding this ceiling stops the review before the first model call. Raise
-it for large repositories:
+A resource budget for the review run, not a PR-size rule. It is the maximum
+counted diff lines (additions + deletions, over the post-ignore universe) the
+action processes. A diff exceeding it is **refused** before the first model
+call — recorded `refused`, red — rather than half-reviewed. It bounds how much
+of a diff a review reads; it is not a judgement of whether a pull request is
+too big, and it is not merge policy — merge enforcement is entirely a consumer
+ruleset decision (ADR 006). The `applicability` axis is the separate question
+of whether a pull request consumes a review run at all (see below); a budget
+refusal is never reclassified into an eligibility skip.
 
 ```json5
 maxDiffLines: 10000,
@@ -156,8 +175,11 @@ maxDiffLines: 10000,
 #### `rules`
 
 An array of per-file-group instruction documents. Each rule has an `include`
-glob list and an `instruction` path. Rules are evaluated in order; the first
-matching rule's instruction is used for that file.
+glob list and an `instruction` path. Rules are additive, not first-match:
+every rule whose `include` matches at least one reviewed file is active, in
+config order, and each contributes its instruction document — several rules
+may apply at once, and none overrides another. A rule matching nothing is
+dormancy, not an error.
 
 ```json5
 rules: [
@@ -256,6 +278,21 @@ without reading any review content:
         run: false,
       },
       {
+        // Any GitHub-attested bot not in the allowlist above.
+        id: "unlisted-bots",
+        when: { author: { isBot: true } },
+        run: false,
+      },
+      {
+        // An explicit eligibility decision to not review pull requests past
+        // this many pre-ignore changed lines — never a way to turn the
+        // scope budget's refusal green. A diff past the budget that this
+        // rule does not catch is refused (red) as capacity.
+        id: "oversized",
+        when: { changes: { lines: { gt: 8000 } } },
+        run: false,
+      },
+      {
         id: "stricter-external",
         context: "external",
         posture: "standard",
@@ -270,17 +307,27 @@ without reading any review content:
 
 #### Rule fields
 
-| Field         | Required | What it does                                                                                         |
-| ------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `id`          | yes      | Name the audit record carries.                                                                       |
-| `context`     | no       | Matches only this execution context. Absent matches every context.                                   |
-| `when`        | no       | Conditions: `title` (regex), `branch` (regex), `paths` (glob array). Combined conjunctively.         |
-| `run`         | no       | Whether review applies. Defaults to `true`.                                                          |
-| `posture`     | no       | Non-standard posture: `"maintainer"` or `"automation"`. Present only with a deviation from standard. |
-| `instruction` | no       | The posture document's path alongside a non-standard posture.                                        |
-| `intensity`   | no       | The strictness override: `{ strictness: "high" }`.                                                   |
+| Field         | Required | What it does                                                                                                                                                                                                                                                                                                                                      |
+| ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`          | yes      | Name the audit record carries.                                                                                                                                                                                                                                                                                                                    |
+| `context`     | no       | Matches only this execution context. Absent matches every context.                                                                                                                                                                                                                                                                                |
+| `when`        | no       | Conditions: `title`, `branch` and `base` (regex sources), `paths` (glob array), `labels` (exact names, any-of), `author` (`isBot: true` and/or `equals` logins), `changes` (`lines`/`files`, each `{ gt: N }` over the **pre-ignore** totals — an explicit eligibility decision, never a reclassification of the budget). Combined conjunctively. |
+| `run`         | no       | Whether review applies. Defaults to `true`.                                                                                                                                                                                                                                                                                                       |
+| `posture`     | no       | Non-standard posture: `"maintainer"` or `"automation"`. Present only with a deviation from standard.                                                                                                                                                                                                                                              |
+| `instruction` | no       | The posture document's path alongside a non-standard posture.                                                                                                                                                                                                                                                                                     |
+| `intensity`   | no       | The strictness override: `{ strictness: "high" }`.                                                                                                                                                                                                                                                                                                |
 
-A rule that sets `run: false` skips review entirely. A rule that sets a
+A rule that sets `run: false` skips review entirely — but only when the rule
+is anchored: a pinned non-`external` `context`, `when.author.isBot: true`
+(bot-ness is GitHub's own attestation — `user.type` — and cannot be faked by
+a pull request's contents), or `when.changes` (an explicit eligibility
+decision to not review a change past a pre-ignore size you choose; the skip
+records the rule and its measured totals so it is never mistaken for "no
+review needed"). A size rule never reclassifies the scope budget's refusal —
+a diff past `maxDiffLines` is refused (red) as capacity, and only the rule you
+actually declare skips green ([the semantics are frozen](../run-contract.md#the-semantics-are-frozen); the recipe below
+shows the deliberate form). A skip rule naming `external` or anchored only on
+a title, branch, base, path or label convention is refused at startup. A rule that sets a
 non-standard `posture` must also set an `instruction` path for that posture's
 document.
 
@@ -309,13 +356,32 @@ workflow choice.
 
 **Marker comment**: one comment per pull request, created or updated in place by
 its marker. The comment carries the review's findings with their verification
-states — confirmed, refuted, unresolved — policy and risk table, gate outcomes,
-and the phase log.
+states — confirmed, refuted, unresolved — under the run's status banner
+(Complete or Partial, with the reason when partial), the examined-files count,
+and a provenance line naming the policy source the run read. It also embeds the
+published run's canonical record as a machine-readable block, so the next run
+can reconcile against it.
+
+**Cross-run labels**: when the previous marker comment carried a readable
+record, code compares the two published records and tags every finding
+`[new]`, `[persisting]`, `[moved]` or `[resolved]`, adds a one-line comparison
+count under the summary, and lists the findings that resolved where they
+retired. The labels are informational prose over the same facts the artifact
+already carries: they never change the recorded verdict, the SARIF projection
+or any exit code, and a missing or unreadable previous record simply renders
+the comment as a first run.
 
 **Run artifact** (when `dry-run` is `false`): a machine-readable JSON file
 written inside the workspace at `artifact-path`, named after the reviewed commit.
-The file carries the same facts the comment renders. Upload it as a workflow
-artifact to keep the record across runs:
+The file carries what the comment renders plus what it does not: the policy the
+run ran under, the per-file risk table, the declared run gates' outcomes and
+the phase log. Every bound verdict also records the sha256 of the exact
+evidence window it judged plus a bounded retention excerpt of it, so a
+consumer can re-check the content behind the verdict. Skipped runs leave a
+record too — a skip record naming which skip path wrote it, under the same
+upload glob — and so does a red exit: a `refused` record when one of the run's
+own ceilings declined to act, a `failed` record for anything else. Upload the
+records as a workflow artifact to keep them across runs:
 
 ```yaml
 - name: Upload the run artifact
@@ -324,22 +390,132 @@ artifact to keep the record across runs:
   with:
     name: review-run-artifact
     path: .review-artifact/review-artifact-*.json
-    if-no-files-found: ignore
+    include-hidden-files: true
+    if-no-files-found: warn
 ```
+
+The record's `schemaVersion` is `5` for the bare family and `6` once an
+applicability policy is active. An architecture-aware run — one whose
+`architecture-report` input names a report — emits the same two shapes as
+`7` and `8`: the gate table gains `architecture` after `verification` and
+the record carries the architecture section, while architecture-blind runs
+stay on `5` and `6`, byte-identical to a run that never heard of Archkeep.
+A breaking shape change moves the number —
+the red-terminal shapes moved the bare family from `4` to `5`, green
+artifacts included — so tooling that consumes records should follow the
+family rather than hard-pin a number that cannot move. The
+[run contract](../run-contract.md) states the rule.
+
+File names state the outcome before a consumer opens the file: a red exit
+uploads as `review-artifact-refused-<head sha>.json` or
+`review-artifact-failed-<head sha>.json`, and a run that died before it
+resolved a head writes `no-head` in the sha's place — retention tooling that
+parses shas out of these names must tolerate `no-head`.
+
+**Job outputs**: `sarif-path` — present after a published review whose SARIF
+write succeeded, the path of the projection written under the runner's temp
+directory (never inside the workspace, which the checkout owns) — and
+`artifact-file`, the exact record file the run wrote, set at every terminal
+that declares a record, a red run's refused or failed record included. A
+failed SARIF write is a logged loss that never disguises itself as success;
+a terminal that declares no record leaves `artifact-file` empty and logs
+that it did. The red boundary sets `refusal-class` to `model-output-unusable`
+only when the run was refused because the provider's final answer held no
+JSON object on every attempt — the transient class a re-run recovers
+(#516) — and leaves it unset on every other terminal, green or red, so an
+empty value never reads as a lost record.
+
+**Merge enforcement**: review declares none
+([ADR 006](../adr/006-code-scanning-merge-enforcement.md)) — there is no
+`gate-mode` input, no `gate-verdict` output, and no check run. What the
+action produces is a record and its projections, and what any of them does
+at a merge is the consumer's decision, made in GitHub's own protection
+surfaces:
+
+- The recorded verdict — `pass`, `fail`, `unknown`, and `unknown` and `fail`
+  never pass — is a recording, not an enforcement: an incomplete review
+  publishes its `fail` through every surface review owns and stays a green
+  run. Nothing review writes blocks a merge.
+- The SARIF projection publishes confirmed findings only — a refuted claim
+  was answered wrong and an unresolved one carries no verdict, and neither
+  enters Code Scanning. An `unresolved` finding is recorded in the comment
+  and the artifact and is no longer merge-blocking.
+- A repository that wants confirmed findings to block merges points its Code
+  Scanning protection rules — or its branch ruleset's code-scanning
+  requirement — at the upload below. Thresholds, per-tool scoping and alert
+  dismissal are that ruleset's vocabulary, never an input of this action. A
+  repository that opts out still gets the visibility: the alerts exist in
+  the Security tab either way.
+- The dogfood opts out: this repository's `main` ruleset does **not** require
+  the review tool (only CodeQL and Semgrep OSS, at `errors`; ADR 006's
+  2026-09-08 addendum). Requiring the tool is the consumer's choice — but a
+  requirer must account for the runs that produce no SARIF at all (`sarif-path`
+  exists only after a published review; skip/refused/failed terminals upload
+  nothing), because GitHub's "Require code scanning results" rule treats
+  **no analysis for the commit** as the required check not satisfied, not as
+  clean. The dogfood's own deadlock on 2026-09-08 — a find-free maintenance PR
+  blocked forever with zero alerts because the review job skipped — is the
+  evidence that drove this posture (ADR 006 addendum).
+
+The upload is the consumer's step:
+
+```yaml
+- id: review
+  uses: ecoma-io/action-agents/review@v0.12
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    api-url: ${{ vars.LLM_API_URL }}
+    api-key: ${{ secrets.LLM_API_KEY }}
+    model: ${{ vars.LLM_MODEL }}
+- name: Upload the review's SARIF
+  if: steps.review.outputs.sarif-path != ''
+  uses: github/codeql-action/upload-sarif@v4
+  with:
+    sarif_file: ${{ steps.review.outputs.sarif-path }}
+    category: review
+```
+
+`sarif-path` exists only after a published review, and the bare `if:` — no
+`always()` — skips the upload on every other terminal, so a refused, failed,
+abandoned, skipped or dry-run run uploads nothing; the failed review step
+has already made the job red. If the upload step itself fails, the job is
+red with it — the enforcement input never silently disappears. A published
+run with no confirmed findings uploads an empty analysis, which Code
+Scanning records as no alerts: a no-findings or incomplete review is
+indistinguishable from clean to Code Scanning, which is the point —
+enforcement attaches to findings, and completeness is spoken about only by
+review's own surfaces (the `fail` verdict, the partial posture, the run
+artifact), never merge-enforced. To turn the alerts into a merge
+requirement, add a code scanning protection rule for the tool
+`ecoma-io/action-agents/review` (Settings → Code security → Code scanning →
+Protection rules), or a `Require code scanning results` requirement naming
+that tool in the branch ruleset, at the threshold the repository wants.
+The consuming job needs `security-events: write` (the SARIF upload is the one
+projection that leaves the repository); the action itself needs no grant beyond
+a read of the working tree. Pin `upload-sarif` by full SHA in a real
+workflow; the tag here is only for reading.
 
 ## Cost and budget controls
 
-| Control              | Default  | Effect                                                              |
-| -------------------- | -------- | ------------------------------------------------------------------- |
-| `max-turns`          | `30`     | Ceiling on agent turns. More turns = more model calls.              |
-| `context-window`     | `128000` | Token budget before compaction. Match to your model.                |
-| `maxDiffLines`       | `5000`   | Ceiling on diff size. Large diffs stop before the first model call. |
-| `dry-run`            | `false`  | Review and log, comment nothing. Model calls still count.           |
-| `request-timeout-ms` | `30000`  | Per-attempt timeout for one provider call.                          |
+| Control              | Default  | Effect                                                                                    |
+| -------------------- | -------- | ----------------------------------------------------------------------------------------- |
+| `max-turns`          | `30`     | Ceiling on agent turns. More turns = more model calls.                                    |
+| `context-window`     | `128000` | Token budget before compaction. Match to your model.                                      |
+| `maxDiffLines`       | `5000`   | Resource budget on counted diff lines (post-ignore). Past it: refused, not half-reviewed. |
+| `dry-run`            | `false`  | Review and log, comment nothing. Model calls still count.                                 |
+| `request-timeout-ms` | `120000` | Per-attempt timeout for one provider call.                                                |
 
 The agent loop reads one file per tool call. The number of model calls depends
 on the diff size and the model's decisions about what to read. The `max-turns`
-ceiling is the hard stop.
+ceiling is the hard stop. A response the provider declares truncated
+(`finish_reason: length`) — on any ask of the agent loop, or on the one
+corrective re-ask a structurally invalid final answer earns — is an incomplete
+answer: it fails the run before anything judges it, no prefix of it is parsed
+into findings, and truncation is never re-asked; the terminal state is
+`failed` (a provider defect), not `refused`. The verification pass is
+deliberately not covered by that rule: an answer that fails to parse there — a
+truncated one included — or a verification call that fails degrades only the
+affected findings to `uncertain`, and the review continues.
 
 ## Hard ceilings
 
@@ -355,16 +531,21 @@ These are enforced in code across every action. See the
 
 ## Failure modes
 
-| Symptom                                       | Cause                                        | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| --------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "Run would publish nothing — read-only token" | Fork's pull request with no write token.     | `review` is designed for same-repo PRs. Under `pull_request` a fork gets a read-only token and no secrets, so the action cannot run on forks at all. Reaching for `pull_request_target` is the trap: that trigger runs the base repository's workflow with full secrets, and **combining it with a checkout of `github.event.pull_request.head.sha` is the "pwn request" pattern** that hands an attacker your secrets regardless of which action you then call. If you use `pull_request_target`, never check out the head SHA and never run the pull request's code — but prefer not using it at all; a PAT does not make reviewing a fork safe. |
-| "Diff exceeds maxDiffLines"                   | The pull request diff is too large.          | Raise `maxDiffLines`, or split the PR.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| "Config file exceeds 64 KiB"                  | Config file too large.                       | Reduce it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| "Document exceeds 8 KiB"                      | A rule or instruction document is too large. | Shorten it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| "No config file at PATH"                      | `config-path` set to a non-existent path.    | Fix the path or remove it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| "schemaVersion Y is not supported"            | Config declares an unknown schema version.   | Update the action tag or downgrade `schemaVersion`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| "max-turns reached"                           | The agent loop hit the ceiling.              | Raise `max-turns`, or split the PR into smaller reviews.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Provider unreachable                          | The `api-url` endpoint did not respond.      | Check the endpoint and the timeout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Symptom                                                                                                                                                                   | Cause                                                                                                                                                                                                   | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "Run would publish nothing — read-only token"                                                                                                                             | Fork's pull request with no write token.                                                                                                                                                                | `review` is designed for same-repo PRs. Under `pull_request` a fork gets a read-only token and no secrets, so the action cannot run on forks at all. Reaching for `pull_request_target` is the trap: that trigger runs the base repository's workflow with full secrets, and **combining it with a checkout of `github.event.pull_request.head.sha` is the "pwn request" pattern** that hands an attacker your secrets regardless of which action you then call. If you use `pull_request_target`, never check out the head SHA and never run the pull request's code — but prefer not using it at all; a PAT does not make reviewing a fork safe. |
+| "the diff counts … lines against a …-line budget"                                                                                                                         | The pull request diff is past `maxDiffLines`.                                                                                                                                                           | The review run's budget was exceeded; it is refused (red) rather than half-reviewed — recorded `refused`, which is a capacity outcome, not an eligibility one. Raise the budget for _this repository_ (it is a resource budget, not a PR-size rule — see above), or split the pull request. Only a deliberate, declared policy decision to not review large pull requests at all makes a green skip legitimate — see [Skip oversized pull requests, deliberately](#skip-oversized-pull-requests-deliberately) — and it is a last resort, never the default escape from a refusal. This is a config decision, not a rule about PR size.             |
+| "the assembled prompt estimates at … tokens, past half the …-token window"                                                                                                | The assembled prompt cannot fit half the configured context window.                                                                                                                                     | The run's prompt would exceed half the configured window; it is refused (red) rather than truncated — recorded `refused`. Point `context-window` at a model with a larger window, or split the pull request into contexts a run can hold. Not a rule about PR size. The estimate counts the diff, the config documents, the title and the description's first 8 KiB — never the thread's comments (#527).                                                                                                                                                                                                                                          |
+| "the final answer failed the output contract twice" / "… three times"                                                                                                     | The provider's final answer was not the contract JSON, on every attempt — the first answer, the corrective re-ask, and (when that answer also held no JSON object) the one bounded retry after backoff. | Usually transient at the provider. The run publishes the `refusal-class` output `model-output-unusable` on this exact class — branch on it (or re-run the job) mechanically; if re-runs keep refusing, check the endpoint's model and protocol. Recorded `refused`.                                                                                                                                                                                                                                                                                                                                                                                |
+| "the posture document '…' does not exist on branch '…'", or "… is … bytes, past the …-byte cap"                                                                           | A non-standard posture rule's `instruction` document is missing or oversized at the policy source.                                                                                                      | Add the document, or bring it under the 8 KiB cap. Recorded `failed` — the loader's own error.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| "Config file exceeds 64 KiB"                                                                                                                                              | Config file too large.                                                                                                                                                                                  | Reduce it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| "Document exceeds 8 KiB"                                                                                                                                                  | A rule or instruction document is too large.                                                                                                                                                            | Shorten it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| "No config file at PATH"                                                                                                                                                  | `config-path` set to a non-existent path.                                                                                                                                                               | Fix the path or remove it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| "schemaVersion Y is not supported"                                                                                                                                        | Config declares an unknown schema version.                                                                                                                                                              | Update the action tag or downgrade `schemaVersion`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| "max-turns reached"                                                                                                                                                       | The agent loop hit the ceiling.                                                                                                                                                                         | Raise `max-turns`. A capped run concludes **partial** (published with the bound named) — it is a capacity outcome, not a PR-size rule.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Provider unreachable                                                                                                                                                      | The `api-url` endpoint did not respond.                                                                                                                                                                 | Check the endpoint and the timeout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| "the provider truncated its response (finish_reason: length)", or "the provider truncated the corrective re-ask response (finish_reason: length)"                         | The provider hit its output cap mid-answer and declared the answer incomplete — on an ask of the loop, or on the corrective re-ask.                                                                     | Raise the provider-side output budget (e.g. `max_tokens`), then re-run — a cut answer is never parsed into findings or re-asked. Recorded `failed` — a provider defect, not one of the run's own ceilings.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| "verification pass — the answer to finding … was refused (…); it counts as uncertain", or "verification pass — the call for finding … failed (…); it counts as uncertain" | The verification pass's answer for a finding did not parse — a provider-truncated answer included — or the call itself failed.                                                                          | Nothing to fix — the degradation is fail-closed by design. The affected findings count as `uncertain` and publish as unresolved, marked `unverified:` with the verdict's reason; a verification answer can never confirm, widen or enable a write. Under a `strict` policy or the `adversarial` strategy the unresolved findings end the review PARTIAL (verdict `fail`); otherwise they publish with the accounting riding the report. Re-run the job for a fresh verification pass.                                                                                                                                                              |
 
 ## Recipes
 
@@ -374,7 +555,7 @@ The action runs with built-in defaults: strictness `medium`, strategy `standard`
 language `en`. No config file needed.
 
 ```yaml
-- uses: ecoma-io/action-agents/review@v0.5
+- uses: ecoma-io/action-agents/review@v0.12
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     api-url: ${{ vars.LLM_API_URL }}
@@ -411,7 +592,7 @@ match `^build\(deps\)`.
 ```json5
 {
   applicability: {
-    bots: ["dependabot[bot]"],
+    bots: ["deploy-key-rotation[bot]"],
     rules: [
       {
         id: "skip-dependabot",
@@ -420,6 +601,87 @@ match `^build\(deps\)`.
           title: "^build\\(deps\\)",
         },
         run: false,
+      },
+    ],
+  },
+}
+```
+
+### Skip every bot you do not allowlist
+
+`author.isBot` reads the GitHub-attested `user.type` — not a title convention,
+not a login guess — so one rule covers dependabot, release tooling and anything
+else GitHub classifies as a bot. Allowlisted bots never reach this rule: the
+`automation` context matches first via `bots`.
+
+```json5
+{
+  applicability: {
+    bots: [],
+    rules: [
+      {
+        id: "unlisted-bots",
+        when: { author: { isBot: true } },
+        run: false,
+      },
+    ],
+  },
+}
+```
+
+### Skip oversized pull requests, deliberately
+
+This recipe is an **explicit eligibility decision** to not review pull requests
+past a size you choose — not a way to make large diffs green. It is a `run:
+false` applicability rule, so classification runs **before** the `maxDiffLines`
+refusal: a matching pull request ends green with a skip record naming the rule
+and its measured totals (`9000 changed lines across 12 files`); a pull request
+that matches no rule still reaches the budget refusal exactly as it does today.
+Without this decision, a diff past `maxDiffLines` is refused (red) — capacity
+outcome, stated as such.
+
+Two things to read before you add it:
+
+- **The guard reads the pre-ignore totals; `maxDiffLines` counts the
+  post-ignore universe.** An ignored giant file (a lockfile, generated output)
+  counts toward the guard but not the budget. Set this threshold on the change
+  you actually mean to skip reviewing, and note that a pull request the ignore
+  set has already shrunk to something reviewable may be under your threshold
+  precisely because it is reviewable.
+- **A skip means "intentionally not reviewed" — never "no review needed."**
+  A consumer must be able to tell the intentional skip apart from something
+  the review should have looked at. The skip record carries the rule id and
+  the measured numbers, so the record says which.
+
+```json5
+{
+  maxDiffLines: 5000,
+  applicability: {
+    rules: [
+      {
+        id: "oversized",
+        when: { changes: { lines: { gt: 8000 } } },
+        run: false,
+      },
+    ],
+  },
+}
+```
+
+### Label-gated review for draft-quality branches
+
+Exact, case-sensitive label names matched any-of. A pull request missing
+labels does not match — absence costs review, never saves it.
+
+```json5
+{
+  applicability: {
+    rules: [
+      {
+        id: "triaged-only",
+        context: "maintainer",
+        when: { labels: ["needs-review"] },
+        intensity: { strictness: "high" },
       },
     ],
   },
@@ -437,8 +699,209 @@ Keep the machine-readable record for every run, including failed ones.
   with:
     name: review-run-artifact
     path: .review-artifact/review-artifact-*.json
-    if-no-files-found: ignore
+    include-hidden-files: true
+    if-no-files-found: warn
 ```
+
+### Architecture evidence — record an Archkeep delta
+
+`architecture-report` names the report a pinned Archkeep step left in the
+workspace, and the run records what it says as the architecture section of
+its artifact — recorded, never enforced: architecture violations do not
+become review findings, enter no SARIF, and flip no verdict. Empty — the
+default — keeps every run architecture-blind and byte-identical to today.
+
+The action neither spawns, installs nor imports Archkeep: the recipe below
+is yours, in your workflow, before the action runs. Five of its lines are
+normative — the [run contract](../run-contract.md) states them, and a
+consumer's copy is judged against them:
+
+1. **Clear, then delete.** The evidence directory is cleared before capture,
+   and the report file is deleted on any delta exit outside `{1, 3}` — the
+   exits where Archkeep died without a coherent envelope, which is the
+   planted-file channel: Archkeep leaves `--output` files untouched when a
+   run dies before building one, so stale bytes beside a dead run would
+   otherwise be read as its verdict. On `1` and `3` the envelope is the
+   verdict carrier and stays. The exit file is append-only, so a plant can
+   only ever contribute a nonzero exit line: plants can make evidence look
+   worse, never better.
+2. **Tolerate exactly `{1, 3}`.** Exit `1` (verdict: fail) and exit `3` (no
+   verdict) are recorded, not red. Exit `2` — a usage error, a mis-wiring,
+   not a verdict — and everything else redden the step.
+3. **Capture steps never `||`, never `continue-on-error`.** A failed capture
+   is a red run: evidence absent, review never starts. When a capture
+   flakes, the fix is never `continue-on-error: true` — that reopens the
+   planted-file channel law 1 closes.
+4. **The baseline commit is the live merge-base, fetched.** Never the
+   payload's `base.sha` alone — it can be stale, and a moved base makes the
+   delta attribute other people's merged changes to this pull request as
+   `introduced`: loud but wrong. The fetch strategy must make the commit
+   resolvable; `fetch-depth: 0` below is that.
+5. **The manifest is freshly written** from the append-only exit file,
+   overwriting any plant, at the end of the evidence steps.
+
+**Provider-backed workspaces need a bridge.** The recipe judges the pull
+request's head in a worktree of its own — a committed tree with no
+`node_modules` — so if your project graph or analyzers need a
+workspace-local tool, the global install alone dies at the capture:
+Archkeep's Moon provider looks for `moon` in the analyzed tree's
+`node_modules/.bin` and then on PATH, and neither answers; on a Vue tree
+`vue/compiler-sfc` resolves from Archkeep's own install location
+(archkeep#939) and every `.vue` file measures as unanalyzed. The exit is
+`3` — law 3 makes that a red run, correctly. The bridge: install the merge
+preview's own dependencies (`pnpm install --frozen-lockfile`), put its
+`node_modules/.bin` on PATH for the Archkeep steps, and — where a module
+rather than a binary is what fails to resolve — point `NODE_PATH` at its
+`node_modules`. Disclose the skew where you write the bridge: the merge
+preview's tooling judges both sides of the delta, so a pull request that
+bumps the tool judges the baseline with the new version — acceptable for
+review evidence because the verdict is recorded, never enforced, and both
+commits and both policy fingerprints stay pinned. Measured on the
+organization's own dogfood: two of the four repositories carry the Moon
+bridge, one carries Moon plus `vue/compiler-sfc`, and the static-map
+repository needs none.
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      # Law 4: fetch-depth 0 makes the merge-base commit resolvable — a
+      # depth-1 checkout makes the baseline step dead on arrival.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      # Pinned by you — the action never learns this ran.
+      - run: npm install --global @ecoma-io/archkeep@0.29.0
+
+      # Law 1, first half: clear planted evidence before capture.
+      - run: rm -rf .archkeep && mkdir .archkeep
+
+      # Laws 3-4: the baseline snapshot at the live merge-base of the pull
+      # request's head. Never add `|| true` or `continue-on-error` here: a
+      # failed capture is a red run, and the review never starts.
+      - name: Capture the baseline
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base_sha="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
+          git worktree add --detach ../archkeep-base "$base_sha"
+          (cd ../archkeep-base && archkeep delta --capture --output "$GITHUB_WORKSPACE/.archkeep/base.json")
+          printf '%s\n' "$base_sha" > .archkeep/base-commit
+
+      # Laws 1-2: the delta at the pull request's head — the commit the
+      # action pins its expectation to. Judge it in a worktree of its own:
+      # the workspace checkout is the merge preview, and a report judged
+      # there pins a different head than the action expects, which reads as
+      # stale evidence on every run.
+      - name: Run the delta
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git worktree add --detach ../archkeep-head "$HEAD_SHA"
+          set +e
+          (cd ../archkeep-head && archkeep delta "$GITHUB_WORKSPACE/.archkeep/base.json" --format json --output "$GITHUB_WORKSPACE/.archkeep/delta.json") 2> .archkeep/delta.stderr
+          code=$?
+          set -e
+          case "$code" in
+            0) ;;
+            1|3) printf 'exit=%s\n' "$code" >> .archkeep/exit ;;
+            *) rm -f .archkeep/delta.json; exit "$code" ;;
+          esac
+
+      # Law 5: the manifest, freshly written from the append-only exit
+      # file. The last nonzero exit line wins — a plant can make evidence
+      # look worse, never better; an empty file means the step exited zero.
+      - name: Write the manifest
+        run: |
+          exit_code="$(grep -oE 'exit=[0-9]+' .archkeep/exit 2>/dev/null | cut -d= -f2 | grep -v '^0$' | tail -n 1)"
+          [ -n "$exit_code" ] || exit_code=0
+          jq -n \
+            --argjson exitCode "$exit_code" \
+            --arg stderrDigest "$(sha256sum .archkeep/delta.stderr | cut -d' ' -f1)" \
+            --arg baseCommit "$(cat .archkeep/base-commit)" \
+            --arg headCommit "$(git -C ../archkeep-head rev-parse HEAD)" \
+            '{exitCode: $exitCode, stderrDigest: $stderrDigest,
+              base: {capturePath: "base.json", commit: $baseCommit},
+              head: {commit: $headCommit}}' > .archkeep/run.json
+
+      - uses: ecoma-io/action-agents/review@v0.12
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          api-url: ${{ vars.LLM_API_URL }}
+          api-key: ${{ secrets.LLM_API_KEY }}
+          model: ${{ vars.LLM_MODEL }}
+          architecture-report: .archkeep/delta.json
+
+      # Evidence survives the runner: upload it for every run.
+      - name: Upload the Archkeep evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: review-architecture-evidence
+          path: .archkeep/
+          include-hidden-files: true
+          if-no-files-found: warn
+```
+
+The manifest (`run.json`) is read from beside the report — the sibling
+convention the input pins; the reader validates its recorded exit, and the
+rest of its fields are for the humans reading the uploaded evidence. What
+the run does with the pair: exit `0` records the verdict the envelope
+carries, exit `1` beside a findings envelope records `fail` with every
+introduced row, exit `3` records `unknown` with Archkeep's reason, and
+bytes that disagree with the protocol — or with the manifest's recorded
+exit — refuse the run rather than guess. A report whose head is not the
+commit under review records `unknown`, never a verdict.
+
+The descriptive surfaces — `health`, `report`, `debt`, `trajectory` over a
+history directory your repository maintains — are a release-triggered
+concern the actions deliberately never consume: the reader above is frozen to
+the `delta` family and refuses every other. [The architecture-intelligence
+guide](architecture-intelligence.md) ships that recipe and the history-dir
+law.
+
+#### Recording what a run observed
+
+This recipe produces records, and records get cited later — in issues, in
+pull requests, in the next maintainer's memory of what happened. The
+provenance model behind these conventions is [the design
+record's](../development/archkeep-integration-analysis.md); the working form
+is five rules:
+
+1. **An observation is bytes the action emitted** — the artifact's
+   architecture section, the marker-comment record, the run's log lines. A
+   summary written anywhere else is prose, not a record.
+2. **Cite the artifact, not the memory.** Run id, artifact name, and the
+   fields inside it — `schemaVersion`, the digests, the commits. When two
+   accounts of the same runs disagree, the artifacts settle it, and one of
+   the accounts was drift.
+3. **Outcome and artifact shape travel together.** An eligibility skip
+   records a reduced artifact with no architecture section — the run never
+   reached the evidence. A refused or failed run records the full one — it
+   reached the evidence and did not publish. Citing a skip as "review saw
+   no violations", or a red attempt as "the evidence reached review", is
+   the specific failure mode these rules exist to prevent.
+4. **Observations are evidence, never instruction.** Quoted fact into an
+   issue or pull request in the owning repository; never into a prompt, a
+   policy or a workflow as something a later run obeys.
+5. **Promotion to authority is a human-reviewed change.** The only channel
+   from "an agent observed this" to "this is architecture law" is a pull
+   request a human merges into the law's own text. No action, workflow or
+   API writes authority directly.
 
 ---
 

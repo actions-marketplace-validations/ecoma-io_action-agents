@@ -10,9 +10,47 @@
  * operates on, while triage and harmonise only ever read double-quoted JSON.
  * The two were identical until review grew that difference; this module is
  * the double-quote-only home the two simple actions import.
+ *
+ * Every refusal carries the answer's shape class in its message — empty, no
+ * object, or bytes that do not parse — as a typed `AnswerShapeError`, so a
+ * caller can tell a provider that fumbled the one question it was asked
+ * from a model that answered and answered wrong, without ever logging the
+ * answer itself (#261). The class is carried as a word too (`shape`), so a
+ * caller that records which fumble happened never matches message bytes.
  */
 
 import { json5Parse } from "./json5-parse.mjs";
+
+/**
+ * The shape class an unusable answer is, as a machine-readable word — the
+ * same classes the message names in prose, typed so a caller records the
+ * class without matching the message's bytes.
+ *
+ * @typedef {"empty" | "no-object" | "unparseable"} AnswerShape
+ */
+
+/**
+ * The answer never presented the JSON object the prompt asked for. The
+ * class a pipeline reads when deciding whether the question may be asked
+ * once more: an empty answer or prose is a provider fumble, while a
+ * parseable answer that misses its contract is a decision — and a decision
+ * is never this error, and never retried.
+ */
+export class AnswerShapeError extends Error {
+  /**
+   * @param {string} message the shape class, named for the run log — the
+   *   answer's own bytes never appear in it
+   * @param {AnswerShape} [shape] the same class as a word, for a caller
+   *   that records which fumble happened; `unparseable` when a caller
+   *   re-wraps without knowing better
+   */
+  constructor(message, shape = "unparseable") {
+    super(message);
+    this.name = "AnswerShapeError";
+    /** @type {AnswerShape} */
+    this.shape = shape;
+  }
+}
 
 /**
  * JSON5 with the fences stripped and a bare object located — everything a
@@ -25,14 +63,17 @@ import { json5Parse } from "./json5-parse.mjs";
  */
 export function parseJsonish(content) {
   const trimmed = stripFences(content.trim());
+  if (trimmed === "") {
+    throw new AnswerShapeError("the model's answer was empty", "empty");
+  }
   const attempt = extractObject(trimmed);
   if (attempt === null) {
-    throw new Error("the model's answer holds no JSON object");
+    throw new AnswerShapeError("the model's answer holds no JSON object", "no-object");
   }
   try {
     return json5Parse(attempt);
   } catch (cause) {
-    const error = new Error("the model's answer does not parse as JSON");
+    const error = new AnswerShapeError("the model's answer does not parse as JSON", "unparseable");
     error.cause = cause;
     throw error;
   }

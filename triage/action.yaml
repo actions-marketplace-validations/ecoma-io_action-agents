@@ -23,9 +23,9 @@ inputs:
     description: >-
       Per-attempt timeout in milliseconds for one provider call. The attempt
       must complete the whole completion; raise it for endpoints that
-      legitimately take longer than 30 seconds to answer in full.
+      legitimately take longer than two minutes to answer in full.
     required: false
-    default: "30000"
+    default: "120000"
   config-path:
     description: Overrides `.github/action-agents/triage/triage.json5` / `.json`, read from the resolved policy source (the default branch, or a pull request's base branch). When set, only that path is read and the default locations are not consulted; a path that does not exist there is a startup error. # consumer path
     required: false
@@ -38,6 +38,28 @@ inputs:
     description: Decide and log, write nothing. Defaults to true, so a first run cannot surprise anyone.
     required: false
     default: "true"
+  verify:
+    description: >-
+      Opt-in verification of the decision before anything is written: one
+      bounded model call re-checks each proposed operation — identified by an
+      id the code mints, never by model text — against the same evidence the
+      decision was derived from, and every operation the verifier refutes or
+      cannot confirm is downgraded to a refusal. The pass can only prevent
+      writes, never cause them; downgrading every operation ends the run
+      `refused` with nothing written. No verify answer is ever re-asked. Off
+      by default; a dry run never requests verification.
+    required: false
+    default: "false"
+  record-path:
+    description: >-
+      Directory inside the workspace where the machine-readable run record is
+      written at every terminal point — a landed mutation, a dry run, an
+      event-gate skip, a failure. The record carries the run's own facts:
+      event, thread, policy pin, the decision (when one was made), the
+      terminal state in the run contract's vocabulary, and the reason. The
+      write never leaves the workspace, and `.git` is refused outright.
+    required: false
+    default: ".triage-record"
 
 runs:
   using: node24

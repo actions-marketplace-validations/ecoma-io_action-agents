@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 
 import { protectDocument, restoreDocument } from "./protect.mjs";
+import { DeterministicRefusalError } from "./refusal.mjs";
 
 /** A stable run id so tests can name tokens exactly. @returns {string} */
 const fixedId = () => "0123456789abcdef";
@@ -359,5 +360,212 @@ describe("restoration", () => {
 
     expect(protection.glossaryHits).toBe(1);
     expect(restoreDocument(protection.text, protection)).toBe(source);
+  });
+});
+
+describe("placeholder order", () => {
+  /** @param {number} n @returns {string} */
+  const g = (n) => `[[harmonise:0123456789abcdef:g${String(n)}]]`;
+  /** @param {number} n @returns {string} */
+  const s = (n) => `[[harmonise:0123456789abcdef:s${String(n)}]]`;
+
+  it("refuses a candidate that swaps two single-occurrence placeholders", () => {
+    const { protection } = protect("Alpha keeps logs 30 days. Beta must ship weekly.\n", {
+      glossary: ["logs 30 days", "ship weekly"],
+    });
+    const candidate = `Alpha keeps ${g(2)}. Beta must ${g(1)}.\n`;
+    expect(() => restoreDocument(candidate, protection)).toThrow(
+      `placeholder ${g(2)} appears before ${g(1)} — the candidate does not preserve the protected content's order`,
+    );
+    expect(() => restoreDocument(candidate, protection)).toThrow(DeterministicRefusalError);
+  });
+
+  it("refuses the issue's transposition repro", () => {
+    const { protection } = protect("Alpha keeps logs 30 days. Beta must ship weekly.", {
+      glossary: ["logs 30 days", "ship weekly"],
+    });
+    const swapped = protection.text
+      .replace(g(1), "@@A@@")
+      .replace(g(2), g(1))
+      .replace("@@A@@", g(2));
+    expect(() => restoreDocument(swapped, protection)).toThrow(
+      `placeholder ${g(2)} appears before ${g(1)} — the candidate does not preserve the protected content's order`,
+    );
+  });
+
+  it("refuses a singleton swapped with a repeated token's first occurrence", () => {
+    const { protection } = protect(
+      "Alpha keeps logs 30 days. Beta must ship weekly. Gamma cites ship weekly again.\n",
+      { glossary: ["logs 30 days", "ship weekly"] },
+    );
+    // g(1) is required once, g(2) twice: counts match, yet the first g(2)
+    // landing before g(1) means the protected bytes come back swapped (#358).
+    const candidate = `Alpha keeps ${g(2)}. Beta must ${g(1)}. Gamma cites ${g(2)} again.\n`;
+    expect(() => restoreDocument(candidate, protection)).toThrow(
+      `placeholder ${g(2)} appears before ${g(1)} — the candidate does not preserve the protected content's order`,
+    );
+    expect(() => restoreDocument(candidate, protection)).toThrow(DeterministicRefusalError);
+  });
+
+  it("restores a repeated token in place beside its singleton neighbour", () => {
+    const { protection } = protect(
+      "Alpha keeps logs 30 days. Beta must ship weekly. Gamma cites ship weekly again.\n",
+      { glossary: ["logs 30 days", "ship weekly"] },
+    );
+    expect(restoreDocument(protection.text, protection)).toBe(
+      "Alpha keeps logs 30 days. Beta must ship weekly. Gamma cites ship weekly again.\n",
+    );
+  });
+
+  it("restores an in-order candidate byte-for-byte", () => {
+    const source = "Alpha keeps logs 30 days. Beta must ship weekly.\n";
+    const { protection } = protect(source, { glossary: ["logs 30 days", "ship weekly"] });
+    expect(restoreDocument(`Alpha keeps ${g(1)}. Beta must ${g(2)}.\n`, protection)).toBe(source);
+  });
+
+  it("pins a repeated token's first occurrence and lets its later ones land by counts alone", () => {
+    const { protection } = protect(
+      "Alpha keeps logs 30 days. Beta must logs 30 days. Gamma will ship weekly.\n",
+      { glossary: ["logs 30 days", "ship weekly"] },
+    );
+    // Document order is g(1), g(1), g(2): the first g(1) must precede the
+    // first g(2), but where the second g(1) lands is counts' business.
+    const clustered = `First ${g(1)}. Then ${g(1)} and ${g(2)}.\n`;
+    expect(restoreDocument(clustered, protection)).toBe(
+      "First logs 30 days. Then logs 30 days and ship weekly.\n",
+    );
+    const firstSwapped = `First ${g(2)}. Then ${g(1)} and ${g(1)}.\n`;
+    expect(() => restoreDocument(firstSwapped, protection)).toThrow(
+      `placeholder ${g(2)} appears before ${g(1)} — the candidate does not preserve the protected content's order`,
+    );
+  });
+
+  it("restores a singleton relocated past a repeated token's second occurrence", () => {
+    const { protection } = protect(
+      "Alpha keeps logs 30 days. Beta must ship weekly. Gamma cites logs 30 days again.\n",
+      { glossary: ["logs 30 days", "ship weekly"] },
+    );
+    // Document order is g(1), g(2), g(1); the candidate's is g(1), g(1),
+    // g(2). The first occurrences keep their order, so the walk passes and
+    // the counts re-seat the tokens — leaving the singleton's clause past
+    // g(1)'s second occurrence: the accepted residual of pinning firsts.
+    const candidate = `Alpha keeps ${g(1)}. Beta must ${g(1)}. Gamma cites ${g(2)} again.\n`;
+    expect(restoreDocument(candidate, protection)).toBe(
+      "Alpha keeps logs 30 days. Beta must logs 30 days. Gamma cites ship weekly again.\n",
+    );
+  });
+
+  it("refuses transposed skip placeholders and passes in-order ones", () => {
+    const source =
+      "<!-- harmonise:skip -->\nfirst kept\n\nprose\n\n<!-- harmonise:skip -->\nsecond kept\n";
+    const { protection } = protect(source);
+    const swapped = protection.text
+      .replace(s(1), "@@A@@")
+      .replace(s(2), s(1))
+      .replace("@@A@@", s(2));
+    expect(() => restoreDocument(swapped, protection)).toThrow(
+      `placeholder ${s(2)} appears before ${s(1)} — the candidate does not preserve the protected content's order`,
+    );
+    expect(restoreDocument(protection.text, protection)).toBe(source);
+  });
+
+  it("keeps one order across skip and glossary placeholders", () => {
+    const source = "<!-- harmonise:skip -->\nkept verbatim\n\nThe repository grows.\n";
+    const { protection } = protect(source, { glossary: ["repository"] });
+    const swapped = `The ${g(1)} grows.\n\n${s(1)}\n`;
+    expect(() => restoreDocument(swapped, protection)).toThrow(
+      `placeholder ${g(1)} appears before ${s(1)} — the candidate does not preserve the protected content's order`,
+    );
+    expect(restoreDocument(`${s(1)}\n\nThe ${g(1)} grows tall.\n`, protection)).toBe(
+      "<!-- harmonise:skip -->\nkept verbatim\n\nThe repository grows tall.\n",
+    );
+  });
+
+  it("pins the order key: the protected text is document order, the spans map is not", () => {
+    const { protection } = protect(
+      "<!-- harmonise:skip -->\na\n\nx\n\n<!-- harmonise:skip -->\nb\n",
+    );
+    expect(protection.text.indexOf(s(1))).toBeLessThan(protection.text.indexOf(s(2)));
+    expect([...protection.spans.keys()]).toEqual([s(2), s(1)]);
+  });
+});
+
+describe("a multilingual README's protected header", () => {
+  // The convention this repository dogfoods (#506): title, then badges, then
+  // a language selector, then canonical content — badges and selector each
+  // inside their own skip region. These tests pin the shapes every README and
+  // translation now carries.
+
+  /** @param {number} n @returns {string} */
+  const g = (n) => `[[harmonise:0123456789abcdef:g${String(n)}]]`;
+  /** @param {number} n @returns {string} */
+  const s = (n) => `[[harmonise:0123456789abcdef:s${String(n)}]]`;
+
+  /** A minimal README shaped exactly like the convention's header. @type {string} */
+  const readme = [
+    "<!-- harmonise:skip-start -->",
+    '<p align="center">',
+    '  <a href="https://github.com/ecoma-io/action-agents/actions"><img src="badge.svg" alt="CI" /></a>',
+    "</p>",
+    "<!-- harmonise:skip-end -->",
+    "",
+    "<!-- harmonise:skip-start -->",
+    '<a href="README.md">English</a> | <a href="README.vi.md">Tiếng Việt</a>',
+    "<!-- harmonise:skip-end -->",
+    "",
+    "# Action Agents",
+    "",
+    "Keep repositories in step with harmonise.",
+    "",
+  ].join("\n");
+
+  it("protects the badges and selector regions whole, in document order", () => {
+    const { protection } = protect(readme, { glossary: ["harmonise"] });
+
+    expect(protection.skippedSpans).toBe(2);
+    expect(protection.text).not.toContain("badge.svg");
+    expect(protection.text).not.toContain("Tiếng Việt");
+    expect(protection.text.indexOf(s(1))).toBeLessThan(protection.text.indexOf(s(2)));
+    // Glossary replacement reaches prose but never the regions' interior.
+    expect(protection.text).toContain(`Keep repositories in step with ${g(1)}.`);
+  });
+
+  it("restores the header byte-for-byte", () => {
+    const { protection } = protect(readme, { glossary: ["harmonise"] });
+
+    expect(restoreDocument(protection.text, protection)).toBe(readme);
+  });
+
+  it("treats back-to-back regions as two spans, not one merged region", () => {
+    const adjacent =
+      "<!-- harmonise:skip-start -->\nbadges\n<!-- harmonise:skip-end -->\n<!-- harmonise:skip-start -->\nselector\n<!-- harmonise:skip-end -->\n";
+    const { protection } = protect(adjacent);
+
+    expect(protection.skippedSpans).toBe(2);
+    expect(restoreDocument(protection.text, protection)).toBe(adjacent);
+  });
+
+  it("passes a README without regions through untouched", () => {
+    const plain = "# Action Agents\n\nNo header machinery at all.\n";
+    const { protection } = protect(plain, { glossary: ["harmonise"] });
+
+    expect(protection.skippedSpans).toBe(0);
+    expect(protection.glossaryHits).toBe(0);
+    expect(restoreDocument(protection.text, protection)).toBe(plain);
+  });
+
+  it("is idempotent: a second protect–restore pass on the restored bytes is identical", () => {
+    const first = protect(readme, { glossary: ["harmonise"] }).protection;
+    const once = restoreDocument(first.text, first);
+    const second = protect(once, { glossary: ["harmonise"] }).protection;
+    const twice = restoreDocument(second.text, second);
+
+    expect(twice).toBe(readme);
+    expect(second.text).toBe(first.text);
+  });
+
+  it("refuses a header whose region is never closed", () => {
+    const unclosed = "<!-- harmonise:skip-start -->\nbadges\n\n# Action Agents\n";
+    expect(() => protect(unclosed)).toThrow(DeterministicRefusalError);
   });
 });

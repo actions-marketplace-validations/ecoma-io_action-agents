@@ -14,6 +14,8 @@ import { oneLine } from "#core/one-line.mjs";
 import { warning } from "#core/runtime.mjs";
 import { sanitiseCommentText } from "#core/sanitise.mjs";
 
+import { RECORD_PREFIX, recordBlock } from "./provenance.mjs";
+
 /** The rationale's cap in the marker comment and the run log, in characters. */
 export const RATIONALE_CHARS = 300;
 
@@ -25,8 +27,11 @@ export const RATIONALE_CHARS = 300;
  *
  * @typedef {object} Removal
  * @property {string} name
- * @property {"size" | "marker" | "owned"} reason
+ * @property {typeof REMOVAL_REASONS[number]} reason
  */
+
+/** The vocabulary a removal's `reason` may carry, frozen; the run record's validator holds its copy from here so the two cannot drift. */
+export const REMOVAL_REASONS = /** @type {const} */ (["size", "marker", "owned", "supersede"]);
 
 /**
  * A code-derived signal a sheet-mode issue run posts as a comment: the
@@ -51,8 +56,9 @@ export const RATIONALE_CHARS = 300;
  */
 
 /**
- * The mutation plan. `mutate.mjs` executes exactly its `add`, `remove` and
- * `comment` — nothing else, so a decision can never reach assign, close,
+ * The mutation plan. `mutate.mjs` executes exactly the operations
+ * `decisionWriteOps` derives from it — its `add`, `remove`, `comment` and
+ * `signal` — nothing else, so a decision can never reach assign, close,
  * merge, review or any surface `SECURITY.md` forbids.
  *
  * @typedef {object} Decision
@@ -61,12 +67,90 @@ export const RATIONALE_CHARS = 300;
  *   `comment` → no sheet; upsert the classification comment
  * @property {string[]} add labels to add — idempotent, deduped
  * @property {Removal[]} remove labels to remove, each with its reason
- * @property {string[]} refusals off-sheet names refused, for the audit trail
+ * @property {string[]} refusals refused operations, for the audit trail — the off-sheet label names the policy refused, and the `verification downgraded '…'` lines the verification pass refused
  * @property {DecisionLog[]} logs lines the executor emits verbatim
  * @property {string} rationale the model's one-line rationale, for the run log
  * @property {{ classification: string, rationale: string } | undefined} comment present only when `kind === "comment"`
+ * @property {string[] | null} [record] the classification-role labels this run applies, when it applies any — carried as the version-1 record block inside the upserted classification comment so a later run can prove what THIS action applied (issue #498); `null` when nothing qualifies
  * @property {Signal | null} [signal] a code-composed signal comment a sheet-mode issue run may post; absent for runs that post none
  */
+
+/**
+ * One concrete write operation a decision names: the forge primitive, the
+ * code-minted id the verification plan and the record quote, what the write
+ * acts on (the run log's name for it), and the op in the action's own words
+ * (what the verifier is told).
+ *
+ * @typedef {object} DecisionWriteOp
+ * @property {"removeLabel" | "addLabels" | "upsertComment"} write the forge primitive the executor issues
+ * @property {string} opId `remove:<label>`, `add:<label>`, the bare `comment` or the bare `signal`
+ * @property {string} target what the operation acts on
+ * @property {string} description
+ */
+
+/** The code-minted id of the signal comment's one write. */
+export const SIGNAL_OP_ID = "signal";
+
+/**
+ * The concrete write operations a decision names, in the order the executor
+ * applies them: removals first, then the adds, then the one comment a
+ * decision may carry — the classification or the signal. This function is
+ * the single source of a decision's write surface: the verification plan is
+ * minted from it (`verify.mjs`) and the executor builds its forge calls from
+ * it (`mutate.mjs`), so the two cannot diverge — a write that exists for one
+ * exists for the other, under the same code-minted id. Pure: a decision and
+ * its rendered plan always agree.
+ *
+ * The adds are one entry per label even though the executor batches them
+ * into a single write: each label is judged — and confirmed or downgraded —
+ * on its own, and the batch the executor sends is built from exactly the
+ * entries that survived.
+ *
+ * @param {Decision} decision
+ * @returns {DecisionWriteOp[]}
+ */
+export function decisionWriteOps(decision) {
+  /** @type {DecisionWriteOp[]} */
+  const ops = [];
+  for (const removal of decision.remove) {
+    ops.push({
+      write: "removeLabel",
+      opId: `remove:${removal.name}`,
+      target: removal.name,
+      description: `remove the label '${removal.name}' (${removal.reason})`,
+    });
+  }
+  for (const label of decision.add) {
+    ops.push({
+      write: "addLabels",
+      opId: `add:${label}`,
+      target: label,
+      description: `apply the label '${label}'`,
+    });
+  }
+  // The classification comment a decision may carry is twofold: the no-sheet
+  // classification (`kind === "comment"`) and, on a sheet-mode run, the
+  // record comment whose embedded block names the classification labels this
+  // run applied (issue #498) — the proof a later run supersedes against.
+  // Both upsert the same one comment surface under the same code-minted id.
+  if (decision.kind === "comment" || (decision.record?.length ?? 0) > 0) {
+    ops.push({
+      write: "upsertComment",
+      opId: "comment",
+      target: "classification comment",
+      description: "upsert the classification comment the decision composed",
+    });
+  }
+  if (decision.signal != null) {
+    ops.push({
+      write: "upsertComment",
+      opId: SIGNAL_OP_ID,
+      target: "signal comment",
+      description: "upsert the code-composed signal comment the decision composed",
+    });
+  }
+  return ops;
+}
 
 /**
  * The marker comment written when there is no sheet — the whole of what the
@@ -80,11 +164,11 @@ export const RATIONALE_CHARS = 300;
 export function commentBody(answer, marker) {
   const classification = sanitiseCommentText(oneLine(answer.classification), {
     maxChars: RATIONALE_CHARS,
-    forbidden: [marker],
+    forbidden: [marker, RECORD_PREFIX],
   });
   const rationale = sanitiseCommentText(oneLine(answer.rationale), {
     maxChars: RATIONALE_CHARS,
-    forbidden: [marker],
+    forbidden: [marker, RECORD_PREFIX],
   });
   for (const note of [...classification.notes, ...rationale.notes]) {
     warning(`sanitiser: ${note}`);
@@ -100,6 +184,30 @@ export function commentBody(answer, marker) {
   ]
     .filter((line, index, all) => !(line === "" && all[index - 1] === ""))
     .join("\n");
+}
+
+/**
+ * The classification comment a sheet-mode run upserts: the labels it applied
+ * as the human-readable line, and — the reason the comment exists at all —
+ * the version-1 record block naming those labels, which a later run reads as
+ * the proof that THIS action applied them (issue #498). Every fragment is
+ * code-minted: the model's rationale has no route into the record, because
+ * the record is evidence about the action, never model prose.
+ *
+ * @param {{ labels: string[] }} parts
+ * @param {string} marker
+ * @returns {string}
+ */
+export function classificationRecordBody({ labels }, marker) {
+  return [
+    marker,
+    "",
+    `**${labels.join(" + ")}**`,
+    "",
+    recordBlock(labels),
+    "",
+    "_Classified by the `triage` action — the record line above is the action's own account of the labels it applied; a later run may replace a classification this record proves, never a label it cannot._",
+  ].join("\n");
 }
 
 /**
@@ -125,7 +233,7 @@ export function signalBody(signal, marker) {
     signal.needsMoreInfo.length > 0
       ? sanitiseCommentText(oneLine(signal.needsMoreInfo.join(", ")), {
           maxChars: 80,
-          forbidden: [marker],
+          forbidden: [marker, RECORD_PREFIX],
         }).text
       : "";
   if (signal.needsMoreInfo.length > 0 || signal.modelJudgedQuality) {
@@ -143,7 +251,7 @@ export function signalBody(signal, marker) {
   if (signal.related !== null) {
     const title = sanitiseCommentText(oneLine(signal.related.title), {
       maxChars: 80,
-      forbidden: [marker],
+      forbidden: [marker, RECORD_PREFIX],
     }).text;
     lines.push(
       "",
@@ -174,6 +282,7 @@ export function renderDryRun(decision) {
   const replace = decision.remove.filter((removal) => removal.reason === "size");
   const clearMarker = decision.remove.filter((removal) => removal.reason === "marker");
   const owned = decision.remove.filter((removal) => removal.reason === "owned");
+  const superseded = decision.remove.filter((removal) => removal.reason === "supersede");
   const parts = [`dry run — would add [${decision.add.join(", ")}]`];
   if (replace.length > 0) {
     parts.push(
@@ -190,9 +299,19 @@ export function renderDryRun(decision) {
       ` and remove [${owned.map((removal) => removal.name).join(", ")}] (triage-owned label replaced by the derived priority)`,
     );
   }
+  if (superseded.length > 0) {
+    parts.push(
+      ` and remove [${superseded.map((removal) => removal.name).join(", ")}] (a classification this action's own record shows it applied is replaced)`,
+    );
+  }
+  if ((decision.record?.length ?? 0) > 0) {
+    parts.push(
+      " and upsert the classification comment (the action's record of the labels it applied)",
+    );
+  }
   if (decision.signal != null) {
     parts.push(
-      ` and post a signal comment: ${signalBody(decision.signal, "<!-- action-agents:triage:dry-run -->").replace(/\n/g, " ")}`,
+      ` and post a signal comment: ${signalBody(decision.signal, "<!-- action-agents:triage-signal:dry-run -->").replace(/\n/g, " ")}`,
     );
   }
   return [parts.join("")];

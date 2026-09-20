@@ -20,6 +20,10 @@
  *   - a response without tool calls while reading turns remain is a natural
  *     stop, and its content is the candidate — the only path a corrective
  *     re-ask may ever follow;
+ *   - before such a stop is accepted with changed files still unread, ONE
+ *     ledger-derived notice names the files and the phase's tools come
+ *     back for another round — once per run, never past a bound, and a
+ *     second stop is accepted wherever coverage then stands;
  *   - before every request, the token estimate is checked: past 80% of the
  *     window the transcript is compacted deterministically — system and task
  *     messages kept, everything later replaced by one state message built
@@ -32,6 +36,7 @@
  * not a turn to hand back.
  */
 
+import { ChatError } from "#core/chat.mjs";
 import { coverageReport, normaliseReadPath } from "./coverage.mjs";
 import { FIRST_PHASE, nextPhase, phaseTools } from "./phases.mjs";
 
@@ -147,6 +152,8 @@ export async function runLoop({
   const phaseLog = [];
   /** @type {string[]} */
   const log = [];
+  /** The uncovered-files notice's once-guard: it fires at most one time per run. */
+  let nudgedUncovered = false;
 
   /**
    * The machine's input, rebuilt from the ledger at every update — the
@@ -196,11 +203,41 @@ export async function runLoop({
         `compacted the transcript to ${String(estimateTokens(transcript))} estimated tokens`,
       );
     }
-    const response = await chat.complete({
-      model,
-      messages: [...transcript, ...pending],
-      ...(offeredTools === undefined ? {} : { tools: offeredTools }),
-    });
+    let response;
+    try {
+      response = await chat.complete({
+        model,
+        messages: [...transcript, ...pending],
+        ...(offeredTools === undefined ? {} : { tools: offeredTools }),
+      });
+    } catch (cause) {
+      if (cause instanceof ChatError && cause.kind === "unusable-answer") {
+        // A parseable completion whose message carries no content — the
+        // reasoning-only or empty-answer class (#499). It is not a malformed
+        // body: the ask was answered, just not with content. Heard as an
+        // empty natural stop, it takes the one path a corrective re-ask may
+        // ever follow, and the run's window judges it exactly like a
+        // structurally invalid answer — no second retry mechanism here. A
+        // truncated response with content stays terminal below.
+        log.push(
+          "the provider answered with no content — heard as an empty natural stop for the corrective re-ask",
+        );
+        response = { content: "", toolCalls: [], finishReason: undefined };
+      } else {
+        throw cause;
+      }
+    }
+    // Provider-declared truncation is model/provider failure, not review
+    // capacity or applicability. A truncated response cannot become a
+    // natural-stop candidate, a bound-finalisation candidate, or anything
+    // the gates can judge; it fails the run before any downstream surface
+    // (comment, artifact, SARIF) can project incomplete model text.
+    if (response.finishReason === "length") {
+      throw new Error(
+        "the provider truncated its response (finish_reason: length) — " +
+          "the model's output is incomplete and cannot be judged as a review answer",
+      );
+    }
     return { response, transcript };
   }
 
@@ -209,12 +246,34 @@ export async function runLoop({
     transcript = currentTranscript;
 
     if (response.toolCalls.length === 0) {
+      const coverage = readCoverage(expected, ledger);
+      // A natural stop with changed files still unread is heard once: the
+      // ledger's own uncovered list goes back as ONE user message and the
+      // phase's tools come with it — this is not a bound, reading turns
+      // remain, and a model told what it has not read can go read it. The
+      // guard makes it fire once; a second stop is accepted wherever
+      // coverage then stands, and a bound exit never reaches this arm.
+      if (!nudgedUncovered && coverage.uncovered.length > 0) {
+        nudgedUncovered = true;
+        if (response.content !== "") {
+          transcript.push({ role: "assistant", content: response.content });
+        }
+        transcript.push({
+          role: "user",
+          content: uncoveredFilesNotice(coverage.uncovered, coverage.total),
+        });
+        log.push(
+          `natural stop with ${String(coverage.uncovered.length)} changed file(s) unread — ` +
+            "the uncovered-files notice went out once; the tools are offered again",
+        );
+        continue;
+      }
       // Natural stop while reading turns remain: the candidate speaks now.
       return {
         candidate: response.content,
         naturalStopped: true,
         bound: undefined,
-        coverage: readCoverage(expected, ledger),
+        coverage,
         phase,
         readingTurns: ledger.readingTurns,
         toolCalls: ledger.toolCalls,
@@ -405,19 +464,64 @@ async function conclude({
  * @returns {Promise<string>}
  */
 export async function reaskFinalAnswer({ chat, model, transcript }) {
-  const response = await chat.complete({
-    model,
-    messages: [
-      ...transcript,
-      {
-        role: "user",
-        content:
-          "That answer does not satisfy the output contract. Answer again: only the JSON object " +
-          "the contract specifies — findings and summary — with no prose around it.",
-      },
-    ],
-  });
+  let response;
+  try {
+    response = await chat.complete({
+      model,
+      messages: [
+        ...transcript,
+        {
+          role: "user",
+          content:
+            "That answer does not satisfy the output contract. Answer again: only the JSON object " +
+            "the contract specifies — findings and summary — with no prose around it.",
+        },
+      ],
+    });
+  } catch (cause) {
+    if (cause instanceof ChatError && cause.kind === "unusable-answer") {
+      // The corrective re-ask came back contentless too — the budget's
+      // second strike. Returned empty, it fails the parse like any other
+      // invalid answer and the conclusion gate refuses the run.
+      response = { content: "", toolCalls: [], finishReason: undefined };
+    } else {
+      throw cause;
+    }
+  }
+  // Provider-declared truncation on the corrective re-ask is the same
+  // failure as truncation on any other response: the model produced an
+  // incomplete answer and it cannot be judged as a review.
+  if (response.finishReason === "length") {
+    throw new Error(
+      "the provider truncated the corrective re-ask response (finish_reason: length) — " +
+        "the model's output is incomplete and cannot be judged as a review answer",
+    );
+  }
   return response.content;
+}
+
+/**
+ * The one corrective message a natural stop with unread changed files
+ * receives. It is code-authored from the ledger — the same record the
+ * verdict will later judge on, so the model cannot talk its way to
+ * complete — and it carries files, never conclusions: paths only, nothing
+ * quoted from them, nothing about what to find or conclude. What the model
+ * does with the list is effort; the verdict stays code's.
+ *
+ * @param {string[]} uncovered expected paths with no read on record, byte-wise sorted
+ * @param {number} total the expected set's size
+ * @returns {string}
+ */
+function uncoveredFilesNotice(uncovered, total) {
+  return (
+    `[coverage check] The read ledger shows ${String(uncovered.length)} of ${String(total)} ` +
+    `changed file(s) with no read on record:\n` +
+    uncovered.map((path) => `- ${JSON.stringify(path).slice(0, 300)}`).join("\n") +
+    "\n\n" +
+    "Changed files left unread make the review incomplete, and an incomplete review is " +
+    "no pass. The reading tools are offered again: read the files listed above, then " +
+    "answer under the output contract."
+  );
 }
 
 /**

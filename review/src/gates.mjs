@@ -35,7 +35,7 @@ import { STRATEGY, STRICTNESS } from "./vocabulary.mjs";
 /** @typedef {import("./provenance.mjs").LedgerRead} LedgerRead */
 
 /**
- * @typedef {"conclusion" | "bound" | "coverage" | "provenance" | "verification"} GateName
+ * @typedef {"conclusion" | "bound" | "coverage" | "provenance" | "verification" | "architecture"} GateName
  */
 
 /**
@@ -51,6 +51,48 @@ import { STRATEGY, STRICTNESS } from "./vocabulary.mjs";
 export const GATES = /** @type {readonly GateName[]} */ (
   Object.freeze(["conclusion", "bound", "coverage", "provenance", "verification"])
 );
+
+/**
+ * The declared gates of the architecture family — the six-gate table an
+ * architecture-aware run's artifact carries, `architecture` appended after
+ * `verification` (#529). The gate couples to the family, never to the input:
+ * a conditional gate row is unimplementable against the frozen-table law
+ * (I11), and a `passed: true` for an unrun gate would be a missing fact
+ * reading as a pass. The family selection is structural — a facts bundle
+ * that carries an `architecture` slice is the aware family's, and one that
+ * does not never sees the gate.
+ *
+ * @type {readonly GateName[]}
+ */
+export const ARCHITECTURE_GATES = /** @type {readonly GateName[]} */ (
+  Object.freeze([...GATES, "architecture"])
+);
+
+/**
+ * The gate predicate, verbatim from the run contract: the `architecture`
+ * gate passes iff **evidence-established** — verdict ∈ {pass, fail} ∧ head
+ * pinned ∧ not stale. Never `verdict === pass`: Archkeep's `fail`
+ * (introduced violations exist) leaves review's verdict untouched while the
+ * artifact records it — review's `fail` keeps its "could not complete"
+ * meaning exactly because the predicate is not "found problems". `unknown`
+ * (stale or incomplete) fails the gate, so an architecture-aware review can
+ * never publish `pass` over unestablished architecture facts.
+ *
+ * @param {object} facts the predicate's three conjuncts, as facts the run recorded
+ * @param {"pass" | "fail" | "unknown"} facts.verdict
+ * @param {boolean} facts.stale
+ * @param {string | null} facts.pinnedHead the commit the report pins — null when it pins none
+ * @param {string} facts.headSha the commit this run reviews
+ * @returns {boolean}
+ */
+export function architectureEvidenceEstablished({ verdict, stale, pinnedHead, headSha }) {
+  return (
+    (verdict === "pass" || verdict === "fail") &&
+    pinnedHead !== null &&
+    pinnedHead === headSha &&
+    !stale
+  );
+}
 
 /**
  * The typed refusal: the fact bundle did not match the declared shape. A
@@ -131,12 +173,21 @@ export class GateFactsError extends Error {
  */
 
 /**
+ * @typedef {object} ArchitectureGateFacts the frozen evidence's verdict basis
+ * @property {"pass" | "fail" | "unknown"} verdict the reader's recorded verdict
+ * @property {boolean} stale whether the head provenance failed to pin
+ * @property {string | null} pinnedHead the commit the report pins — null when it pins none
+ * @property {string} headSha the commit this run reviews
+ */
+
+/**
  * @typedef {object} RunFacts the run's facts, one slice per declared gate
  * @property {ConclusionFacts} conclusion
  * @property {BoundFacts} bound
  * @property {CoverageFacts} coverage
  * @property {ProvenanceFacts} provenance
  * @property {VerificationFacts} verification
+ * @property {ArchitectureGateFacts} [architecture] the aware family's sixth slice — its presence selects the six-gate table
  */
 
 /**
@@ -226,9 +277,11 @@ function assertedFinding(entry) {
  * Why a published finding's provenance does not anchor it to the ledger,
  * or nothing when it does. The attached reference must be well formed, name
  * the finding's own file at the normalised spelling, cover the finding's
- * line, and match a recorded read exactly — path and span together. The
- * reference rides on the finding, so it is a claim; only the ledger's own
- * entries are evidence, and a claim no recorded read backs anchors nothing.
+ * line, and match a recorded read exactly — path and span together, and the
+ * digest with it: a reference whose digest disagrees with the covering read
+ * is a content mismatch, not an anchor. The reference rides on the finding,
+ * so it is a claim; only the ledger's own entries are evidence, and a claim
+ * no recorded read backs anchors nothing.
  *
  * @param {Record<string, unknown>} finding an `assertedFinding` entry
  * @param {LedgerRead[]} ledger the validated ledger
@@ -258,11 +311,17 @@ function unanchoredBecause(finding, ledger) {
   if (line < startLine || line > endLine) {
     return `${name} — provenance span ${String(startLine)}-${String(endLine)} misses the anchor line`;
   }
-  const backed = ledger.some(
+  const covering = ledger.find(
     (read) => read.path === path && read.startLine === startLine && read.endLine === endLine,
   );
-  if (!backed) {
+  if (covering === undefined) {
     return `${name} — provenance does not match any recorded read`;
+  }
+  // The reference's coordinates resolve to a recorded read; the digest is the
+  // content check. A mismatch is the one way an anchored claim can still be
+  // about bytes the ledger does not hold — reported, never coerced into a pass.
+  if (record["digest"] !== covering.digest) {
+    return `${name} — provenance digest does not match the covering read's content`;
   }
   return undefined;
 }
@@ -659,7 +718,80 @@ const GATE_EVALUATORS = Object.freeze({
   coverage: evaluateCoverage,
   provenance: evaluateProvenance,
   verification: evaluateVerification,
+  architecture: evaluateArchitecture,
 });
+
+/**
+ * The architecture family's sixth gate: evidence-established, or refused
+ * with the conjunct that failed named. The facts are the frozen reader's own
+ * — never model text, never producer prose — so the refusal sentences are
+ * code-composed throughout. Unlike the other five, this gate never judges a
+ * blind run: it is only ever evaluated as part of the architecture family's
+ * six-gate table, selected structurally by the facts bundle carrying the
+ * `architecture` slice at all.
+ *
+ * @param {unknown} slice
+ * @returns {GateVerdict}
+ */
+function evaluateArchitecture(slice) {
+  const facts = assertedObject("architecture", slice);
+  const verdict = facts["verdict"];
+  if (verdict !== "pass" && verdict !== "fail" && verdict !== "unknown") {
+    throw new GateFactsError(
+      "architecture facts: 'verdict' must be one of 'pass', 'fail', 'unknown'",
+    );
+  }
+  const stale = facts["stale"];
+  if (typeof stale !== "boolean") {
+    throw new GateFactsError("architecture facts: 'stale' must be a boolean");
+  }
+  const pinnedHead = facts["pinnedHead"];
+  if (pinnedHead !== null && typeof pinnedHead !== "string") {
+    throw new GateFactsError("architecture facts: 'pinnedHead' must be a string or null");
+  }
+  const headSha = facts["headSha"];
+  if (typeof headSha !== "string" || headSha.length === 0) {
+    throw new GateFactsError("architecture facts: 'headSha' must be a non-empty string");
+  }
+  if (
+    architectureEvidenceEstablished({
+      verdict,
+      stale,
+      pinnedHead: /** @type {string | null} */ (pinnedHead),
+      headSha,
+    })
+  ) {
+    return { passed: true };
+  }
+  if (verdict === "unknown") {
+    if (!stale) {
+      return {
+        passed: false,
+        reason: "the architecture evidence is incomplete — no architecture verdict was established",
+      };
+    }
+    return {
+      passed: false,
+      reason:
+        pinnedHead === null
+          ? "the architecture evidence is stale — it pins no head commit, so its verdict is withheld as unknown"
+          : "the architecture evidence is stale — it pins a head other than the one this review judged, so its verdict is withheld as unknown",
+    };
+  }
+  if (stale) {
+    return {
+      passed: false,
+      reason: `the architecture evidence records verdict '${verdict}' while marked stale — contradictory facts, never a pass`,
+    };
+  }
+  return {
+    passed: false,
+    reason:
+      pinnedHead === null
+        ? `the architecture evidence records verdict '${verdict}' but pins no head commit — never a pass for this head`
+        : `the architecture evidence records verdict '${verdict}' pinned to another head — never a pass for the reviewed head`,
+  };
+}
 
 /**
  * One gate over its own slice — the early edge, for a refusal that must
@@ -674,7 +806,7 @@ export function evaluateGate(name, facts) {
   const evaluator = GATE_EVALUATORS[name];
   if (evaluator === undefined) {
     throw new GateFactsError(
-      `unknown gate '${String(name)}' — the declared set is ${GATES.join(", ")}`,
+      `unknown gate '${String(name)}' — the declared set is ${ARCHITECTURE_GATES.join(", ")}`,
     );
   }
   const verdict = evaluator(facts);
@@ -687,23 +819,27 @@ export function evaluateGate(name, facts) {
  * The declared gates over the run's facts: one result per gate in the
  * declared order, the failures in that same order, and the overall verdict.
  * Fail-closed: a bundle that is not the declared shape, an unknown key, or a
- * missing slice is a `GateFactsError` — a missing fact is never a pass.
+ * missing slice is a `GateFactsError` — a missing fact is never a pass. The
+ * declared set is the family's: a bundle carrying an `architecture` slice is
+ * the architecture family's six, and one without it is the blind family's
+ * five — the gate couples to the family, never to the input.
  *
  * @param {unknown} runFacts the run's facts, one slice per declared gate
  * @returns {GateReport}
  */
 export function evaluateGates(runFacts) {
   const facts = assertedObject("run", runFacts);
+  const declared = "architecture" in facts ? ARCHITECTURE_GATES : GATES;
   for (const key of Object.keys(facts)) {
-    if (!GATES.includes(/** @type {GateName} */ (key))) {
+    if (!declared.includes(/** @type {GateName} */ (key))) {
       throw new GateFactsError(
-        `run facts: unknown gate '${key}' — the declared set is ${GATES.join(", ")}`,
+        `run facts: unknown gate '${key}' — the declared set is ${declared.join(", ")}`,
       );
     }
   }
   /** @type {GateResult[]} */
   const results = [];
-  for (const name of GATES) {
+  for (const name of declared) {
     const slice = facts[name];
     if (slice === undefined) {
       throw new GateFactsError(

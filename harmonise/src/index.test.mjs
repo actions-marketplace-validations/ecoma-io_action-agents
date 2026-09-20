@@ -13,7 +13,8 @@
 //      under the declared policy, an unknown failure once, and an auth
 //      failure never.
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -28,7 +29,7 @@ import {
   TransportError,
 } from "#core/transport-errors.mjs";
 
-import { ACTION, DELAY_MS, main, readInputs, run } from "./index.mjs";
+import { ACTION, assertOwnedBranch, DELAY_MS, main, readInputs, run } from "./index.mjs";
 import { contentFingerprint, policyFingerprint, TRANSFORMATION_VERSION } from "./fingerprint.mjs";
 import { LEGACY_STATE_PATH, renderState, statePath, STATE_SCHEMA_VERSION } from "./state.mjs";
 import {
@@ -41,7 +42,13 @@ import {
   TM_SCHEMA_VERSION,
 } from "./tm.mjs";
 import { DEFAULT_POLICY, DELAY_CLASSES } from "./recovery.mjs";
-import { MAX_SOURCE_BYTES } from "./plan.mjs";
+import { DeterministicRefusalError } from "./refusal.mjs";
+import { chunkDocument, MAX_CHUNK_BYTES, MAX_CHUNKS_PER_PAIR } from "./chunks.mjs";
+
+import { harmoniseRecordSchemaVersion, serialiseHarmoniseRecord } from "./run-record.mjs";
+// Multi-chunk fixtures size sections at half the ceiling: two half-ceiling
+// sections never share a chunk, so split counts hold at any retune.
+const sectionBytes = MAX_CHUNK_BYTES / 2;
 
 /**
  * A real event payload file on disk: the default `readEvent` in the entry
@@ -80,12 +87,16 @@ const TM_PATH = tmPath("en");
 /**
  * The policy digest every default-fixture config hashes to: an empty
  * glossary, no instruction prose, no per-language instructions, the current
- * pipeline version — exactly what `run` folds into its own policy digest.
+ * pipeline version, and the model identity the suite's inputs carry
+ * (`gpt-x` at `https://api.example/v1`) — exactly what `run` folds into its
+ * own policy digest, model identity included (#252).
  */
 const POLICY = policyFingerprint({
   glossary: [],
   languageInstructions: {},
   transformationVersion: TRANSFORMATION_VERSION,
+  model: "gpt-x",
+  apiUrl: "https://api.example/v1",
 });
 
 /**
@@ -341,17 +352,31 @@ const evidence = {
 
 /**
  * An Io whose forge is given and whose chat echoes by default; explicit
- * answers replace the echo.
+ * answers replace the echo. The record write is a spy collecting every
+ * record the run composed — the file's path is a fact of the wiring, not
+ * of the pipeline under test here.
  *
  * @param {ReturnType<typeof forge>} forgeDouble
  * @param {(string | Error)[]} [answers]
+ * @returns {{ forge: any, chat: any, evidence: any, sleep: (ms: number) => Promise<void>, writeRecord: (input: { record: any }) => string, records: any[] }}
  */
 function io(forgeDouble, answers = []) {
   const chatDouble =
     answers.length > 0
       ? chat(answers)
       : /** @type {any} */ ({ calls: () => 0, ...{}, ...echoingChat() });
-  return /** @type {any} */ ({ forge: forgeDouble, chat: chatDouble, evidence });
+  /** @type {any[]} */
+  const records = [];
+  return /** @type {any} */ ({
+    forge: forgeDouble,
+    chat: chatDouble,
+    evidence,
+    writeRecord: (/** @type {{ record: any }} */ { record }) => {
+      records.push(record);
+      return `harmonise-record-${record.headSha}.json`;
+    },
+    records,
+  });
 }
 
 /** @returns {ReturnType<typeof import("#core/runtime.mjs").readContext>} */
@@ -361,7 +386,9 @@ function context() {
     repo: "action-agents",
     eventName: "workflow_dispatch",
     eventPath: EVENT_PATH,
-    workspace: "/work",
+    // A real directory: the run record's write is confined to the workspace
+    // root, so the ceiling must resolve against somewhere that exists.
+    workspace: mkdtempSync(join(tmpdir(), "harmonise-workspace-")),
     apiUrl: "https://api.github.com",
   };
 }
@@ -410,8 +437,8 @@ describe("readInputs", () => {
     expect(readInputs(runner).dryRun).toBe(true);
   });
 
-  it("defaults request-timeout-ms to 30000 when the input is absent", () => {
-    expect(readInputs(runner).requestTimeoutMs).toBe(30_000);
+  it("defaults request-timeout-ms to 120000 when the input is absent", () => {
+    expect(readInputs(runner).requestTimeoutMs).toBe(120_000);
   });
 
   it("refuses a request-timeout-ms that is not a number", () => {
@@ -887,21 +914,90 @@ describe("run", () => {
     expect(ioDouble.chat.calls()).toBe(1);
   });
 
-  it("skips a pair whose existing translation is past the cap", async () => {
+  it("translates a source past the old whole-document cap chunk by chunk", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // Two half-chunk paragraphs span more than one chunk under the chunker
+    // — one model call per chunk, the answers reassembled in order.
+    const source = `${"y".repeat(sectionBytes)}\n\n${"y".repeat(sectionBytes)}`;
+    const chunks = chunkDocument(source).chunks;
+    expect(chunks.length).toBe(2);
+    const chatDouble = chat(chunks.map((chunk) => proposes(chunk)));
+    const ioDouble = /** @type {any} */ ({
+      forge: forge(makeRepo({ documents: { "manual/dev.md": source } })),
+      chat: chatDouble,
+      evidence,
+    });
+
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+    expect(chatDouble.calls()).toBe(2);
+    expect(logged(log)).toMatch(/translated vi manual\/dev\.md/);
+  });
+
+  it("skips a source past the per-pair chunk budget, naming the count", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const paragraphs = Array.from({ length: MAX_CHUNKS_PER_PAIR + 1 }, () =>
+      "y".repeat(sectionBytes),
+    );
     const ioDouble = io(
       forge(
         makeRepo({
           documents: {
             "manual/dev.md": "# Dev\n\nFine.\n",
-            "manual/vi/dev.md": "x".repeat(33 * 1024),
+            "manual/big.md": paragraphs.join("\n\n"),
           },
         }),
+        makeInventory(["manual/dev.md", "manual/big.md"]),
       ),
     );
 
-    const error = await run(readInputs(runner), context(), ioDouble).catch((cause) => cause);
-    expect(error.message).toMatch(/every pair skipped/);
-    expect(error.message).toMatch(/existing translation is 33792 bytes, past the 32768-byte cap/);
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+    const out = logged(log);
+    expect(out).toMatch(
+      new RegExp(
+        `skipped vi manual\\/big\\.md: the document needs ${String(MAX_CHUNKS_PER_PAIR + 1)} chunks, ` +
+          `past the ${String(MAX_CHUNKS_PER_PAIR)}-chunk execution budget — split the document`,
+      ),
+    );
+    expect(out).toMatch(/translated vi manual\/dev\.md/);
+  });
+
+  it("runs the model path when the existing translation is past the old whole-document cap", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The old cap refused a published translation past 32 KiB outright; the
+    // chunked pipeline has no such ceiling — a translation several
+    // chunk-frames large retranslates whole, and whether the old bytes ride
+    // along as prompt context is the evidence frame's business, not a
+    // pair-skipping cap.
+    const published = "x".repeat(MAX_CHUNK_BYTES * 4);
+    const chatDouble = chat([proposes("# Dev\n\nNouvelle prose.\n")]);
+    const ioDouble = /** @type {any} */ ({
+      forge: forge(
+        makeRepo({
+          documents: {
+            "manual/dev.md": "# Dev\n\nFine.\n",
+            "manual/vi/dev.md": published,
+          },
+          state: renderState([
+            {
+              schemaVersion: STATE_SCHEMA_VERSION,
+              sourcePath: "manual/dev.md",
+              destinationPath: "manual/vi/dev.md",
+              language: "vi",
+              sourceFingerprint: contentFingerprint("# Dev\n\nOld prose.\n"),
+              translationFingerprint: contentFingerprint(published),
+              policyFingerprint: POLICY,
+              transformationVersion: TRANSFORMATION_VERSION,
+            },
+          ]),
+        }),
+      ),
+      chat: chatDouble,
+      evidence,
+    });
+
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+    expect(chatDouble.calls()).toBe(1);
+    expect(logged(log)).toMatch(/translated vi manual\/dev\.md/);
   });
 
   it("refuses a malformed answer without spending a retry", async () => {
@@ -917,6 +1013,42 @@ describe("run", () => {
     expect(error.message).toMatch(/does not parse as JSON|holds no JSON object/);
     expect(error.message).toMatch(/classified refusal, give-up/);
     expect(chatDouble.calls()).toBe(1);
+  });
+
+  it("fails a provider-truncated answer naming truncation, unretried (#449)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let calls = 0;
+    const chatDouble = /** @type {any} */ ({
+      calls: () => calls,
+      async complete() {
+        calls++;
+        // A body cut mid-string: without the guard this dies as a generic
+        // invalid-answer failure that names nothing but the body's shape.
+        return {
+          content: '{"drift":true,"summary":"kept in s',
+          toolCalls: [],
+          finishReason: "length",
+        };
+      },
+    });
+    const ioDouble = io(forge(makeRepo()));
+    ioDouble.chat = chatDouble;
+
+    const error = await run(readInputs(runner), context(), ioDouble).catch((cause) => cause);
+    // The honest cause in the run's own verdict: the pair line names the
+    // provider's cut, and the recovery policy spent nothing re-asking it.
+    expect(error.message).toMatch(/every pair failed/);
+    expect(error.message).toMatch(/the provider truncated its response \(finish_reason: length\)/);
+    expect(error.message).toMatch(/classified refusal, give-up/);
+    expect(chatDouble.calls()).toBe(1);
+    // The record carries the same honest cause as a failed run — a defect
+    // line, not a refusal ceiling this action declined under.
+    expect(ioDouble.records).toHaveLength(1);
+    expect(ioDouble.records[0].outcome).toBe("failed");
+    expect(ioDouble.records[0].reason).toContain(
+      "the provider truncated its response (finish_reason: length)",
+    );
+    expect(ioDouble.records[0].pairs).toMatchObject({ failed: 1 });
   });
 
   it("refuses an answer whose content is whitespace only", async () => {
@@ -943,6 +1075,51 @@ describe("run", () => {
     expect(error.message).toMatch(/every pair failed/);
     expect(error.message).toMatch(/lost protected content|appears 0 times/);
     expect(ioDouble.chat.calls()).toBe(1);
+  });
+
+  it("fails a run whose answer transposes two count-1 placeholders, as a refusal", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let calls = 0;
+    const chatDouble = /** @type {any} */ ({
+      calls: () => calls,
+      async complete(/** @type {any} */ request) {
+        calls++;
+        const user = request.messages[request.messages.length - 1]?.content ?? "";
+        const start = user.indexOf("[source-document]\n") + "[source-document]\n".length;
+        const next = user.indexOf("\n\n[", start);
+        const source = next === -1 ? user.slice(start) : user.slice(start, next);
+        const [first, second] = [
+          ...source.matchAll(/\[\[harmonise:[0-9a-f]{16}:[a-z]\d+\]\]/g),
+        ].map((match) => match[0]);
+        // A fluent translation that swapped the two placeholders' positions.
+        const transposed = source
+          .replace(first, "@@A@@")
+          .replace(second, first)
+          .replace("@@A@@", second);
+        return {
+          content: JSON.stringify({ drift: true, summary: "kept in step", content: transposed }),
+          toolCalls: [],
+          finishReason: undefined,
+        };
+      },
+    });
+    const ioDouble = /** @type {any} */ ({
+      forge: forge(
+        makeRepo({
+          config: makeConfig({ glossary: ["repository", "guides"] }),
+          documents: { "manual/dev.md": "# Dev\n\nThe repository holds guides.\n" },
+        }),
+      ),
+      chat: chatDouble,
+      evidence,
+    });
+
+    const error = await run(readInputs(runner), context(), ioDouble).catch((cause) => cause);
+    expect(error).toBeInstanceOf(DeterministicRefusalError);
+    expect(error.message).toMatch(/every pair failed/);
+    expect(error.message).toMatch(/does not preserve the protected content's order/);
+    expect(error.message).toMatch(/classified refusal, give-up/);
+    expect(chatDouble.calls()).toBe(1);
   });
 
   it("fails a pair whose answer corrupts Markdown structure", async () => {
@@ -1113,6 +1290,29 @@ describe("run", () => {
       expect(DEFAULT_MAX_ATTEMPTS).toBe(3);
       expect((DEFAULT_POLICY.transport.retries + 1) * DEFAULT_MAX_ATTEMPTS).toBe(9);
     });
+
+    it("spends the pair's retry budget across a multi-chunk pair, restarting from the first chunk", async () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const source = `${"y".repeat(sectionBytes)}\n\n${"y".repeat(sectionBytes)}`;
+      const [first, second] = chunkDocument(source).chunks;
+      // Chunk one translates, chunk two meets a 503: the retry re-runs the
+      // whole pair — chunk one again, the answer repeats cleanly — before
+      // both chunks answer and the reassembly passes the whole-document
+      // gates.
+      assert.ok(first !== undefined, "chunk one answer expected");
+      assert.ok(second !== undefined, "chunk two answer expected");
+      const chatDouble = chat([proposes(first), overloaded(), proposes(first), proposes(second)]);
+      const { ioDouble, sleeps } = sleeping(
+        makeRepo({ documents: { "manual/dev.md": source } }),
+        chatDouble,
+      );
+
+      await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+
+      expect(chatDouble.calls()).toBe(4);
+      expect(sleeps).toEqual([DELAY_MS.short]);
+      expect(logged(log)).toMatch(/translated vi manual\/dev\.md/);
+    });
   });
 
   describe("DELAY_MS — the caller's delay mapping", () => {
@@ -1164,13 +1364,42 @@ describe("run", () => {
     );
   });
 
-  it("refuses a documents filter that narrows everything away", async () => {
+  it("refuses a positive documents glob that matches nothing, naming it", async () => {
     const ioDouble = io(forge(makeRepo()));
     const inputs = { ...readInputs(runner), documents: ["nope/**/*.md"] };
 
+    // A positive glob is a selection claim; when nothing on the branch can
+    // match it the entry is dead, and the refusal names it instead of the
+    // run silently keeping fewer documents in step than the workflow named.
     await expect(run(inputs, context(), ioDouble)).rejects.toThrow(
-      /narrows 1 source documents to none/,
+      /'nope\/\*\*\/\*\.md', which matches none/,
     );
+  });
+
+  it("refuses the one dead glob among live ones, naming the dead one", async () => {
+    const ioDouble = io(forge(makeRepo(), makeInventory(["manual/dev.md"])));
+    const inputs = { ...readInputs(runner), documents: ["manual/dev.md", "manual/lost.md"] };
+
+    await expect(run(inputs, context(), ioDouble)).rejects.toThrow(
+      /'manual\/lost\.md', which matches none/,
+    );
+  });
+
+  it("lets a negated glob match nothing — excluding an empty set is vacuous", async () => {
+    const ioDouble = io(forge(makeRepo(), makeInventory(["manual/dev.md"])));
+    const inputs = { ...readInputs(runner), documents: ["!manual/absent.md"] };
+
+    // The negation passes the alive check and the net selection is empty, so
+    // the run ends at the nothing-selected refusal — the narrow gate's own
+    // word, never the positive-glob one.
+    await expect(run(inputs, context(), ioDouble)).rejects.toThrow(/narrows .* to none/);
+  });
+
+  it("lets a positive glob negated away later reach the nothing-selected refusal", async () => {
+    const ioDouble = io(forge(makeRepo(), makeInventory(["manual/dev.md"])));
+    const inputs = { ...readInputs(runner), documents: ["manual/dev.md", "!manual/**"] };
+
+    await expect(run(inputs, context(), ioDouble)).rejects.toThrow(/narrows .* to none/);
   });
 
   it("goes red when every pair fails preparation, naming the defect", async () => {
@@ -1179,7 +1408,7 @@ describe("run", () => {
         makeRepo({
           documents: {
             // An unclosed region is malformed: preparation must refuse it.
-            "manual/dev.md": "<!-- harmonise:skip-start -->\nnever closed\n",
+            "manual/dev.md": "<!-- harmonise:skip-start -->\n",
           },
         }),
       ),
@@ -1190,49 +1419,16 @@ describe("run", () => {
     expect(error.message).toMatch(/never closed/);
   });
 
-  it("skips an oversized source with its reason while healthy pairs prepare", async () => {
+  it("skips an unsplittable oversize source with its reason while healthy pairs prepare", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const ioDouble = io(
       forge(
         makeRepo({
           documents: {
             "manual/dev.md": "# Dev\n\nFine.\n",
-            // 33 KiB: past the deterministic cap.
-            "manual/big.md": "x".repeat(33 * 1024),
+            // Several chunk-frames in one paragraph: unsplittable.
+            "manual/big.md": "x".repeat(MAX_CHUNK_BYTES * 4),
           },
-        }),
-        makeInventory(["manual/dev.md", "manual/big.md"]),
-      ),
-    );
-
-    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
-    const out = logged(log);
-    expect(out).toMatch(/skipped vi manual\/big\.md: 33792 bytes, past the 32768-byte cap/);
-    expect(out).toMatch(/translated vi manual\/dev\.md/);
-  });
-
-  it("accepts a source document of exactly the 32 KiB cap — the boundary is inclusive", async () => {
-    expect(MAX_SOURCE_BYTES).toBe(32768);
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    const source = "x".repeat(MAX_SOURCE_BYTES);
-    expect(new TextEncoder().encode(source).byteLength).toBe(MAX_SOURCE_BYTES);
-    const ioDouble = io(
-      forge(makeRepo({ documents: { "manual/big.md": source } }), makeInventory(["manual/big.md"])),
-    );
-
-    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
-    expect(logged(log)).toMatch(/translated vi manual\/big\.md/);
-  });
-
-  it("skips a source document of exactly one byte past the cap, naming the limit", async () => {
-    expect(MAX_SOURCE_BYTES).toBe(32768);
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    const source = "x".repeat(MAX_SOURCE_BYTES + 1);
-    expect(new TextEncoder().encode(source).byteLength).toBe(MAX_SOURCE_BYTES + 1);
-    const ioDouble = io(
-      forge(
-        makeRepo({
-          documents: { "manual/dev.md": "# Dev\n\nFine.\n", "manual/big.md": source },
         }),
         makeInventory(["manual/dev.md", "manual/big.md"]),
       ),
@@ -1242,11 +1438,53 @@ describe("run", () => {
     const out = logged(log);
     expect(out).toMatch(
       new RegExp(
-        `skipped vi manual/big\\.md: ${String(MAX_SOURCE_BYTES + 1)} bytes, past the ` +
-          `${String(MAX_SOURCE_BYTES)}-byte cap`,
+        `skipped vi manual\\/big\\.md: an unsplittable block of ` +
+          `${String(MAX_CHUNK_BYTES * 4)} bytes does not fit one chunk — shrink or split it`,
       ),
     );
     expect(out).toMatch(/translated vi manual\/dev\.md/);
+  });
+
+  it("keeps a source of exactly the chunk ceiling one chunk — the boundary is inclusive", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const source = "q".repeat(MAX_CHUNK_BYTES);
+    expect(Buffer.byteLength(source)).toBe(MAX_CHUNK_BYTES);
+    const chatDouble = chat([proposes(source)]);
+    const ioDouble = /** @type {any} */ ({
+      forge: forge(
+        makeRepo({ documents: { "manual/big.md": source } }),
+        makeInventory(["manual/big.md"]),
+      ),
+      chat: chatDouble,
+      evidence,
+    });
+
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+    expect(chatDouble.calls()).toBe(1);
+    expect(logged(log)).toMatch(/translated vi manual\/big\.md/);
+  });
+
+  it("splits a source one blank-separated block past the chunk ceiling into two chunks", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // MAX − 2 q's leaves exactly the ceiling for the first chunk once the
+    // separator rides along: a split point at the blank line, two chunks,
+    // two calls.
+    const source = `${"q".repeat(MAX_CHUNK_BYTES - 2)}\n\n${"z".repeat(100)}`;
+    const chunks = chunkDocument(source).chunks;
+    expect(chunks.length).toBe(2);
+    const chatDouble = chat(chunks.map((chunk) => proposes(chunk)));
+    const ioDouble = /** @type {any} */ ({
+      forge: forge(
+        makeRepo({ documents: { "manual/big.md": source } }),
+        makeInventory(["manual/big.md"]),
+      ),
+      chat: chatDouble,
+      evidence,
+    });
+
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+    expect(chatDouble.calls()).toBe(2);
+    expect(logged(log)).toMatch(/translated vi manual\/big\.md/);
   });
 
   it("goes red when every pair skips — work existed and none was attempted", async () => {
@@ -1280,9 +1518,10 @@ describe("run", () => {
     );
 
     // A failed pair is a failed run even when others carried — but the
-    // healthy pair's line is still reported before the red.
+    // healthy pair's line is still reported before the red. The accounting
+    // counts pair-targets, so the vanished source fails once per language.
     await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(
-      /1 pair\(s\) failed[\s\S]*manual\/lost\.md: gone from the branch/,
+      /2 pair\(s\) failed[\s\S]*fr manual\/lost\.md: gone from the branch[\s\S]*vi manual\/lost\.md: gone from the branch/,
     );
     expect(logged(log)).toMatch(/translated vi manual\/dev\.md/);
   });
@@ -1727,6 +1966,48 @@ describe("run with recorded state", () => {
     expect(error.message).toMatch(/never recorded publishing/);
     expect(chatDouble.calls()).toBe(0);
     expect(forgeDouble.writes).toEqual([]);
+  });
+
+  it("proceeds with an adopted pair — the record lifts the refusal, the model still runs", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The refusal above is only for *unrecorded* pairs. A hand-adopted
+    // record (#476) carries the same shape a publication writes — its policy
+    // fingerprint an opaque placeholder, never a digest fold of a real
+    // policy — and that is enough for the gate: manual-edit protection has
+    // a recorded publication to stand on, so the pair proceeds. The
+    // placeholder can never equal this run's folded digest, so the pair is
+    // policy-stale every run and the model is consulted exactly as before:
+    // adoption never overwrites the human's file, and it never refuses.
+    const chatDouble = chat([proposes("# Dev\n\nNouvelle prose.\n")]);
+    const forgeDouble = forge(
+      makeRepo({
+        documents: { "manual/dev.md": SOURCE, "manual/vi/dev.md": TRANSLATED },
+        state: renderState([
+          {
+            schemaVersion: STATE_SCHEMA_VERSION,
+            sourcePath: "manual/dev.md",
+            destinationPath: "manual/vi/dev.md",
+            language: "vi",
+            sourceFingerprint: contentFingerprint(SOURCE),
+            translationFingerprint: contentFingerprint(TRANSLATED),
+            policyFingerprint: contentFingerprint("adopted by hand"),
+            transformationVersion: TRANSFORMATION_VERSION,
+          },
+        ]),
+      }),
+    );
+    const ioDouble = /** @type {any} */ ({ forge: forgeDouble, chat: chatDouble, evidence });
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, context(), ioDouble),
+    ).resolves.toBeUndefined();
+
+    expect(chatDouble.calls()).toBe(1);
+    const out = logged(log);
+    expect(out).not.toMatch(/every pair failed/);
+    expect(out).not.toMatch(/manual-edit protection refused/);
+    expect(out).toMatch(/translated vi manual\/dev\.md/);
+    expect(forgeDouble.writes.map((w) => w.op)).toContain("upsertPullRequest");
   });
 });
 
@@ -2981,6 +3262,532 @@ describe("run with a bounded-concurrency pool", () => {
   });
 });
 
+describe("the run record (#297)", () => {
+  const SOURCE = "# Dev\n\nProse.\n";
+  const TRANSLATED = "# Dev\n\nTraduit.\n";
+  it("a published run writes its record — the terminal state, the pair accounting and the pull request", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = io(forgeDouble);
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, context(), ioDouble),
+    ).resolves.toBeUndefined();
+
+    expect(ioDouble.records).toHaveLength(1);
+    expect(ioDouble.records[0]).toEqual({
+      schemaVersion: harmoniseRecordSchemaVersion,
+      repository: "ecoma-io/action-agents",
+      eventName: "workflow_dispatch",
+      sourceLanguage: "en",
+      dryRun: false,
+      outcome: "published",
+      reason: "opened pull request #42 (harmonise/en → main)",
+      pairs: { selected: 1, proposed: 1, unchanged: 0, skipped: 0, failed: 0 },
+      pullRequest: { number: 42, created: true },
+      headSha: forgeDouble.baseSha,
+    });
+    // The record the run built satisfies its own partition — every pair-target
+    // the schedule held landed in exactly one bucket.
+    expect(
+      ioDouble.records[0].pairs.proposed +
+        ioDouble.records[0].pairs.unchanged +
+        ioDouble.records[0].pairs.skipped +
+        ioDouble.records[0].pairs.failed,
+    ).toBe(ioDouble.records[0].pairs.selected);
+  });
+
+  it("a dry run records skip — a null pull request and the counts the schedule held", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = io(forgeDouble);
+
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+
+    expect(ioDouble.records).toHaveLength(1);
+    expect(ioDouble.records[0].outcome).toBe("skip");
+    expect(ioDouble.records[0].dryRun).toBe(true);
+    expect(ioDouble.records[0].pullRequest).toBeNull();
+    expect(ioDouble.records[0].reason).toBe("dry run — nothing was written");
+    expect(ioDouble.records[0].pairs).toEqual({
+      selected: 1,
+      proposed: 1,
+      unchanged: 0,
+      skipped: 0,
+      failed: 0,
+    });
+    // The partition holds on the record the run actually built.
+    expect(
+      ioDouble.records[0].pairs.proposed +
+        ioDouble.records[0].pairs.unchanged +
+        ioDouble.records[0].pairs.skipped +
+        ioDouble.records[0].pairs.failed,
+    ).toBe(ioDouble.records[0].pairs.selected);
+  });
+
+  it("a run that published some pairs and lost others records the partial exit", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(
+      makeRepo({ documents: { "manual/dev.md": "# Dev\n\nFine.\n" } }),
+      makeInventory(["manual/dev.md", "manual/lost.md"]),
+    );
+    const ioDouble = io(forgeDouble);
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, context(), ioDouble),
+    ).rejects.toThrow(/1 pair\(s\) failed/);
+
+    expect(ioDouble.records).toHaveLength(1);
+    expect(ioDouble.records[0].outcome).toBe("partial");
+    expect(ioDouble.records[0].pullRequest).toEqual({ number: 42, created: true });
+    expect(ioDouble.records[0].pairs).toEqual({
+      selected: 2,
+      proposed: 1,
+      unchanged: 0,
+      skipped: 0,
+      failed: 1,
+    });
+    // The partition holds on the record the run actually built — a pair that
+    // failed is still a pair-target the schedule held.
+    expect(
+      ioDouble.records[0].pairs.proposed +
+        ioDouble.records[0].pairs.unchanged +
+        ioDouble.records[0].pairs.skipped +
+        ioDouble.records[0].pairs.failed,
+    ).toBe(ioDouble.records[0].pairs.selected);
+    expect(ioDouble.records[0].reason).toMatch(/^opened pull request #42; 1 pair\(s\) failed/);
+  });
+
+  it("a run with nothing to propose records skip — the unchanged pairs are counted, none proposed", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const published = "# Dev\n\nTraduit.\n";
+    // The record is current — this run's source, policy and version — so the
+    // deterministic gate proves the pair unchanged at zero model calls and
+    // there is nothing to re-pin: no branch, no commit, no pull request.
+    const currentRecord = {
+      schemaVersion: STATE_SCHEMA_VERSION,
+      sourcePath: "manual/dev.md",
+      destinationPath: "manual/vi/dev.md",
+      language: "vi",
+      sourceFingerprint: contentFingerprint("# Dev\n\nProse.\n"),
+      translationFingerprint: contentFingerprint(published),
+      policyFingerprint: POLICY,
+      transformationVersion: TRANSFORMATION_VERSION,
+    };
+    const forgeDouble = forge(
+      makeRepo({
+        documents: { "manual/vi/dev.md": published },
+        state: renderState([currentRecord]),
+      }),
+      makeInventory(["manual/dev.md", "manual/vi/dev.md"]),
+    );
+    const ioDouble = io(forgeDouble);
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, context(), ioDouble),
+    ).resolves.toBeUndefined();
+
+    expect(ioDouble.records[0].outcome).toBe("skip");
+    expect(ioDouble.records[0].pullRequest).toBeNull();
+    expect(ioDouble.records[0].reason).toBe(
+      "nothing to propose — no branch, no commit, no pull request",
+    );
+    expect(ioDouble.records[0].pairs).toEqual({
+      selected: 1,
+      proposed: 0,
+      unchanged: 1,
+      skipped: 0,
+      failed: 0,
+    });
+    // The partition holds on the record the run actually built.
+    expect(
+      ioDouble.records[0].pairs.proposed +
+        ioDouble.records[0].pairs.unchanged +
+        ioDouble.records[0].pairs.skipped +
+        ioDouble.records[0].pairs.failed,
+    ).toBe(ioDouble.records[0].pairs.selected);
+  });
+
+  it("a record-write failure before anything is published is a logged loss — the dry run keeps its verdict (#347)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = io(forgeDouble);
+    ioDouble.writeRecord = () => {
+      throw new Error("the disk is full");
+    };
+
+    // The run's verdict belongs to the pairs, never to the record write:
+    // the loss is logged, the green verdict stands, and nothing pretends a
+    // record exists.
+    await expect(run(readInputs(runner), context(), ioDouble)).resolves.toBeUndefined();
+    expect(logged(log)).toMatch(/the run record was not written: the disk is full/);
+    expect(ioDouble.records).toHaveLength(0);
+  });
+
+  it("a record-write failure after publication is a logged loss, and the run keeps its verdict", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = io(forgeDouble);
+    ioDouble.writeRecord = () => {
+      throw new Error("the disk is full");
+    };
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, context(), ioDouble),
+    ).resolves.toBeUndefined();
+    expect(logged(log)).toMatch(/the run record was not written: the disk is full/);
+    expect(logged(log)).toMatch(/opened pull request #42/);
+  });
+
+  it("the real record write lands one file in the workspace, byte-deterministic (I15)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const ctx = context();
+    const forgeDouble = forge(makeRepo());
+    // No writeRecord double: the run's default write is the real one, and
+    // this is the confinement and naming it actually performs.
+    const ioDouble = /** @type {any} */ ({ forge: forgeDouble, chat: echoingChat(), evidence });
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, ctx, ioDouble),
+    ).resolves.toBeUndefined();
+
+    const file = join(
+      ctx.workspace,
+      ".harmonise-record",
+      `harmonise-record-${forgeDouble.baseSha}.json`,
+    );
+    const bytes = readFileSync(file, "utf8");
+    const record = JSON.parse(bytes);
+    expect(record.outcome).toBe("published");
+    expect(record.headSha).toBe(forgeDouble.baseSha);
+    // Sorted keys, no whitespace, no trailing newline — the serialiser's own
+    // output, and nothing else.
+    expect(bytes).toBe(serialiseHarmoniseRecord(record));
+    expect(bytes).not.toMatch(/\n$/);
+  });
+
+  it("a record-path that escapes the workspace is refused — the ceiling holds for writes too (I7)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const ctx = context();
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = /** @type {any} */ ({ forge: forgeDouble, chat: echoingChat(), evidence });
+
+    // The write never leaves the workspace — the refusal is the ceiling
+    // holding — and the loss is a logged one: the dry run's verdict belongs
+    // to the pairs, the same tier as the publish path (#347).
+    await expect(
+      run(readInputs({ ...runner, "INPUT_RECORD-PATH": "../outside" }), ctx, ioDouble),
+    ).resolves.toBeUndefined();
+    expect(logged(log)).toMatch(/the run record was not written: .*resolves outside the workspace/);
+    expect(forgeDouble.writes.map((/** @type {{ op: string }} */ w) => w.op)).toHaveLength(0);
+  });
+
+  it("a pure-refusal red run records refused, then the original error still fails the step (#344, #347)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(
+      makeRepo({ documents: { "manual/dev.md": "" } }),
+      makeInventory(["manual/dev.md"]),
+    );
+    const ioDouble = io(forgeDouble);
+
+    await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(
+      /every pair skipped[\s\S]*the source document is empty/,
+    );
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    // Every red line is a deterministic refusal — a skipped-to-nothing run
+    // — so the boundary writer records the typed refusal's outcome (#347).
+    expect(record.outcome).toBe("refused");
+    // The thrown message, sanitised and one-lined at the record's build site.
+    expect(record.reason).toMatch(/every pair skipped.*the source document is empty/);
+    expect(record.pairs).toEqual({ selected: 1, proposed: 0, unchanged: 0, skipped: 1, failed: 0 });
+    expect(record.headSha).toBe(forgeDouble.baseSha);
+    expect(record.pullRequest).toBeNull();
+  });
+
+  it("an every-pair-failed red run records the failing lines and stays red (#344)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo(), makeInventory(["manual/dev.md", "manual/vi/dev.md"]));
+    const ioDouble = io(forgeDouble, [new Error("the model refused the pair")]);
+
+    await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(
+      /every pair failed[\s\S]*the model refused the pair/,
+    );
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("failed");
+    expect(record.pairs).toEqual({ selected: 1, proposed: 0, unchanged: 0, skipped: 0, failed: 1 });
+    expect(record.reason).toMatch(/every pair failed.*the model refused the pair/);
+  });
+
+  it("an all-pairs script-gate refusal records refused — the typed class is the outcome (I17)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The model answers in Cyrillic for the `vi` target: the script gate
+    // refuses before restoration, the typed class carries through the retry
+    // policy (a refusal, never re-asked) into the red line's column, and a
+    // red set whose every line is that refusal records `refused`.
+    const forgeDouble = forge(makeRepo(), makeInventory(["manual/dev.md", "manual/vi/dev.md"]));
+    const ioDouble = io(forgeDouble, [proposes("# Разработка\n\nТекст.\n")]);
+
+    const error = await run(readInputs(runner), context(), ioDouble).catch((cause) => cause);
+    expect(error).toBeInstanceOf(DeterministicRefusalError);
+    expect(error.message).toMatch(/every pair failed/);
+    expect(error.message).toMatch(/script gate: target language "vi" requires Latin/);
+    expect(error.message).toMatch(/classified refusal, give-up/);
+    expect(ioDouble.chat.calls()).toBe(1);
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toMatch(/script gate: target language "vi" requires Latin/);
+    expect(record.pairs).toEqual({ selected: 1, proposed: 0, unchanged: 0, skipped: 0, failed: 1 });
+    expect(record.headSha).toBe(forgeDouble.baseSha);
+    expect(record.pullRequest).toBeNull();
+  });
+
+  it("one defect line beside a script-gate refusal still records failed — the worst line decides (I17)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // Two pairs: the first answer is wrong-script (the typed refusal), the
+    // second a provider defect. The script gate's refusal column alone does
+    // not make the run a refusal — one defect line fails the record.
+    const forgeDouble = forge(
+      makeRepo({
+        documents: {
+          "manual/dev.md": "# Dev\n\nProse.\n",
+          "manual/other.md": "# Other\n\nText.\n",
+        },
+      }),
+      makeInventory(["manual/dev.md", "manual/vi/dev.md", "manual/other.md", "manual/vi/other.md"]),
+    );
+    const ioDouble = io(forgeDouble, [
+      proposes("# Разработка\n\nТекст.\n"),
+      new Error("the provider answered junk"),
+    ]);
+
+    const error = await run(readInputs(runner), context(), ioDouble).catch((cause) => cause);
+    expect(error).not.toBeInstanceOf(DeterministicRefusalError);
+    expect(error.message).toMatch(/every pair failed/);
+    expect(error.message).toMatch(/script gate: target language "vi" requires Latin/);
+    expect(error.message).toMatch(/the provider answered junk/);
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("failed");
+    expect(record.pairs).toEqual({ selected: 2, proposed: 0, unchanged: 0, skipped: 0, failed: 2 });
+  });
+
+  it("a protection-refused red run records refused — its one line is a deterministic refusal (#347)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The corrupt state degrades to absent (advisory), so the drifted target
+    // is human work with no record and manual-edit protection refuses the
+    // pair before any model call: the red set's one line is a ceiling
+    // verdict, and the record carries the refusal, not a failure.
+    const forgeDouble = forge(
+      makeRepo({
+        documents: { "manual/dev.md": SOURCE, "manual/vi/dev.md": TRANSLATED },
+        state: "{ this is not json",
+      }),
+    );
+    const ioDouble = io(forgeDouble);
+
+    const error = await run({ ...readInputs(runner), dryRun: false }, context(), ioDouble).catch(
+      (cause) => cause,
+    );
+    expect(error.message).toMatch(/every pair failed[\s\S]*manual-edit protection refused/);
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toMatch(/manual-edit protection refused/);
+    expect(record.pairs).toEqual({ selected: 1, proposed: 0, unchanged: 0, skipped: 0, failed: 1 });
+    expect(record.headSha).toBe(forgeDouble.baseSha);
+  });
+
+  it("one defect line in the red set fails the run's record — the mapping stays a function (#347)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // Two pairs: one manual-edit protection refusal (a deterministic line)
+    // and one model call whose provider answers junk (a defect line). The
+    // worst line decides — a red set carrying any defect records `failed`,
+    // never `refused`.
+    const forgeDouble = forge(
+      makeRepo({
+        documents: {
+          "manual/dev.md": SOURCE,
+          "manual/vi/dev.md": TRANSLATED,
+          "manual/other.md": SOURCE,
+        },
+      }),
+      makeInventory(["manual/dev.md", "manual/vi/dev.md", "manual/other.md"]),
+    );
+    const ioDouble = io(forgeDouble, [new Error("the model refused the pair")]);
+
+    const error = await run({ ...readInputs(runner), dryRun: false }, context(), ioDouble).catch(
+      (cause) => cause,
+    );
+    expect(error.message).toMatch(/every pair failed/);
+    expect(error.message).toMatch(/manual-edit protection refused/);
+    expect(error.message).toMatch(/the model refused the pair/);
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("failed");
+    expect(record.pairs).toEqual({ selected: 2, proposed: 0, unchanged: 0, skipped: 0, failed: 2 });
+  });
+
+  it("an undeclared mid-run defect writes the failed record and propagates the original error (#344)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = io(forgeDouble);
+    ioDouble.forge.getRepository = async () => {
+      throw new TypeError("synthetic mid-run defect");
+    };
+
+    const cause = await run(readInputs(runner), context(), ioDouble).then(
+      () => null,
+      (error) => error,
+    );
+    // The original error, not a replacement: same constructor, same message.
+    expect(cause).toBeInstanceOf(TypeError);
+    expect(/** @type {Error} */ (cause).message).toBe("synthetic mid-run defect");
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("failed");
+    expect(record.headSha).toBe(forgeDouble.baseSha);
+    expect(record.pairs).toBeNull();
+    expect(record.pullRequest).toBeNull();
+    expect(record.reason).toBe("synthetic mid-run defect");
+  });
+
+  it("a record-write failure on the red path is a logged loss, and the original error still fails the step (#344)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const forgeDouble = forge(makeRepo());
+    const ioDouble = io(forgeDouble);
+    ioDouble.forge.getRepository = async () => {
+      throw new TypeError("synthetic mid-run defect");
+    };
+    ioDouble.writeRecord = () => {
+      throw new Error("the disk is full");
+    };
+
+    await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(
+      /synthetic mid-run defect/,
+    );
+    expect(logged(log)).toMatch(/the failed-run record was not written: the disk is full/);
+    expect(ioDouble.records).toHaveLength(0);
+  });
+
+  it("a declared skip record survives a red exit — the boundary never writes twice (#344)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // A dry run with one translatable pair and one vanished source: the
+    // skip record is written at the declared point, then the failed pair
+    // reddens the run — and the failed-run boundary must not overwrite it.
+    const forgeDouble = forge(
+      makeRepo({
+        documents: { "manual/dev.md": "# Dev\n\nFine prose.\n" },
+      }),
+      makeInventory(["manual/dev.md", "manual/lost.md"]),
+    );
+    const ioDouble = io(forgeDouble);
+
+    await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(
+      /1 pair\(s\) failed/,
+    );
+    expect(ioDouble.records).toHaveLength(1);
+    expect(ioDouble.records[0].outcome).toBe("skip");
+    expect(ioDouble.records[0].reason).toBe("dry run — nothing was written");
+  });
+  it("a declared partial record a failed write could not land is what the boundary writes (#347)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // Two pairs, one of which the model fails: the publish path builds the
+    // partial record after the pull request lands. Its write fails once —
+    // and the boundary must re-attempt THAT record, not rebuild the
+    // terminal as `failed` from the throw.
+    const forgeDouble = forge(
+      makeRepo({
+        documents: {
+          "manual/dev.md": "# Dev\n\nProse.\n",
+          "manual/second.md": "# Two\n\nProse.\n",
+        },
+      }),
+      makeInventory(["manual/dev.md", "manual/second.md"]),
+    );
+    const ioDouble = io(forgeDouble);
+    ioDouble.sleep = async () => undefined;
+    const echo = echoingChat();
+    ioDouble.chat = {
+      /** @param {{ model: string, messages: { role: "system" | "user" | "assistant" | "tool", content: string }[] }} request */
+      async complete(request) {
+        const user = request.messages[request.messages.length - 1]?.content ?? "";
+        if (user.includes("# Two")) throw new Error("the model refused the pair");
+        return echo.complete(request);
+      },
+    };
+    let calls = 0;
+    const inner = ioDouble.writeRecord.bind(ioDouble);
+    ioDouble.writeRecord = (/** @type {{ record: any }} */ input) => {
+      calls += 1;
+      if (calls === 1) throw new Error("the disk is full");
+      return inner(input);
+    };
+
+    await expect(
+      run({ ...readInputs(runner), dryRun: false }, context(), ioDouble),
+    ).rejects.toThrow(/1 pair\(s\) failed/);
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("partial");
+    expect(record.pullRequest).toEqual({ number: 42, created: true });
+    expect(record.pairs).toEqual({
+      selected: 2,
+      proposed: 1,
+      unchanged: 0,
+      skipped: 0,
+      failed: 1,
+    });
+    expect(record.reason).toMatch(/opened pull request #42; 1 pair\(s\) failed/);
+  });
+
+  it("a declared skip record a failed write could not land is what a red dry run records (#347)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The vanished-source dry run: the declared skip record's write fails
+    // once, the failed pair reddens the run, and the boundary re-attempts
+    // the stashed skip record — the terminal is never relabelled `failed`.
+    const forgeDouble = forge(
+      makeRepo({ documents: { "manual/dev.md": "# Dev\n\nFine prose.\n" } }),
+      makeInventory(["manual/dev.md", "manual/lost.md"]),
+    );
+    const ioDouble = io(forgeDouble);
+    let calls = 0;
+    const inner = ioDouble.writeRecord.bind(ioDouble);
+    ioDouble.writeRecord = (/** @type {{ record: any }} */ input) => {
+      calls += 1;
+      if (calls === 1) throw new Error("the disk is full");
+      return inner(input);
+    };
+
+    await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(
+      /1 pair\(s\) failed/,
+    );
+    expect(ioDouble.records).toHaveLength(1);
+    expect(ioDouble.records[0].outcome).toBe("skip");
+    expect(ioDouble.records[0].reason).toBe("dry run — nothing was written");
+  });
+
+  it("an astral-plane provider excerpt still leaves the failed run its record (#347)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The provider's excerpt is model text and can be anything: 200 emoji
+    // are 200 code points but 400 UTF-16 units. A reason cap and a validator
+    // that disagreed on the metric made the record's own build throw — run
+    // #344's red left no artifact at all.
+    const forgeDouble = forge(makeRepo(), makeInventory(["manual/dev.md", "manual/vi/dev.md"]));
+    const ioDouble = io(forgeDouble, [new Error("\u{1F600}".repeat(200))]);
+    ioDouble.sleep = async () => undefined;
+
+    await expect(run(readInputs(runner), context(), ioDouble)).rejects.toThrow(/every pair failed/);
+    expect(ioDouble.records).toHaveLength(1);
+    const record = ioDouble.records[0];
+    expect(record.outcome).toBe("failed");
+    expect(record.reason.length).toBeLessThanOrEqual(300);
+    expect(record.reason.endsWith("…[truncated]")).toBe(true);
+  });
+});
+
 describe("main", () => {
   it("turns a refusal into a failed step, not a green one", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -3022,5 +3829,22 @@ describe("main", () => {
 
   it("names itself", () => {
     expect(ACTION).toBe("harmonise");
+  });
+});
+
+describe("the owned-branch guard (#253)", () => {
+  it("accepts exactly the branch the config derives", () => {
+    expect(() => assertOwnedBranch("harmonise/vi", "vi")).not.toThrow();
+  });
+
+  it("refuses a foreign ref name at the write site", () => {
+    expect(() => assertOwnedBranch("translate/vi", "vi")).toThrow(
+      "refusing to publish to a ref outside the owned namespace: 'translate/vi' is not 'harmonise/vi'",
+    );
+  });
+
+  it("the bound is exact, not a prefix — lookalike names are refused", () => {
+    expect(() => assertOwnedBranch("harmonise/en-vi", "vi")).toThrow(/outside the owned namespace/);
+    expect(() => assertOwnedBranch("harmonise/", "vi")).toThrow(/outside the owned namespace/);
   });
 });

@@ -10,14 +10,36 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import * as p from "node:path";
+import { tmpdir } from "node:os";
+
+import { buildTriageRecord, REASON_CHARS, serialiseTriageRecord } from "./run-record.mjs";
+import { decisionWriteOps } from "./decision.mjs";
+import { reasonDigest } from "./verify.mjs";
+import { DeterministicRefusalError } from "./refusal.mjs";
 
 import { createEvidence } from "#core/untrusted.mjs";
+import { PartialMutationError } from "./mutate.mjs";
 import { PastFileCeilingError } from "#core/forge.mjs";
-import { TransportError } from "#core/transport-errors.mjs";
+import { HttpError, TransportError } from "#core/transport-errors.mjs";
 import { readContext } from "#core/runtime.mjs";
 
-import { ACTION, main, readInputs, run } from "./index.mjs";
+import { ACTION, main, readInputs, run, writeRunRecord } from "./index.mjs";
+
+/**
+ * The record write is confined below `GITHUB_WORKSPACE`, so the fixture's
+ * workspace is a real directory: a run that reaches a terminal point leaves
+ * its record here, and the ceiling is exercised against real paths.
+ */
+const WORKSPACE = mkdtempSync(p.join(tmpdir(), "triage-runner-"));
 
 /**
  * A complete runner environment, from which each test removes what it is about.
@@ -30,9 +52,9 @@ const runner = {
   "INPUT_API-KEY": "sk-secret",
   INPUT_MODEL: "gpt-x",
   GITHUB_REPOSITORY: "ecoma-io/action-agents",
-  GITHUB_WORKSPACE: "/work",
+  GITHUB_WORKSPACE: WORKSPACE,
   GITHUB_EVENT_NAME: "issues",
-  GITHUB_EVENT_PATH: "/work/event.json",
+  GITHUB_EVENT_PATH: p.join(WORKSPACE, "event.json"),
 };
 
 /**
@@ -105,6 +127,7 @@ function prEvent(thread = {}) {
  * @param {(query: string) => { items: { number: number, title: string, state: string, url?: string, created_at?: string }[], totalCount: number }} [options.search] the search page in sheet-mode issue tests
  * @param {Error} [options.prReadError] thrown by getPullRequest — the hard read
  * @param {Partial<import("#core/forge.mjs").PullRequestSnapshot>} [options.prSnapshot] merged over the forge's default getPullRequest snapshot
+ * @param {string[]} [options.liveLabels] what the live label read answers — defaults to the event's own labels, so the claim and the live read agree by default
  * @param {{ total: number, byConclusion: Partial<import("#core/forge.mjs").CheckRunsSummary["byConclusion"]> } | Error} [options.checkRuns] the head's check-run rollup, or the error the read throws
  * @param {{ requestedReviewers: string[], reviewers: string[], reviews: { state: string, count: number }[] } | Error} [options.reviewState] the review routing state, or the error the read throws
  */
@@ -147,10 +170,19 @@ function fakeForge(options = {}) {
         mergeableState: "clean",
         title: "",
         body: "",
+        labels: options.liveLabels ?? [],
         head: { ref: "x", sha: "0".repeat(40) },
         base: { ref: "main", sha: "0".repeat(40) },
       };
       return { ...snapshot, ...(options.prSnapshot ?? {}) };
+    },
+    /**
+     * The live label read a mutation is judged against.
+     *
+     * @param {number} _number
+     */
+    async getIssue(_number) {
+      return { labels: options.liveLabels ?? [] };
     },
     /** @param {string} _content */
     async createBlob(_content) {
@@ -273,7 +305,6 @@ function fakeForge(options = {}) {
       const at = comments.findIndex((entry) => entry.id === id);
       if (at !== -1) comments.splice(at, 1);
     },
-    /** The identity comments are written under; the comment-half upsert claims by it. */
     async whoami() {
       if (options.whoamiError) throw options.whoamiError;
       return { login: options.whoamiLogin ?? "action-agents[bot]" };
@@ -283,29 +314,62 @@ function fakeForge(options = {}) {
 
 /**
  * The whole world `run` touches, as literal as it gets: `fakeForge`'s
- * options plus the event and the model seam's answer.
+ * options plus the event, the model seam's answers and — for the opt-in
+ * verification pass — the verify seam's answers, which are the second and
+ * later asks. `request()` stays the decide call; `asks()` is every ask in
+ * order, so a test can pin how many calls a run made. `finishReason` is the
+ * decide call's finish reason — `length` is a provider that cut the answer
+ * short (#448).
  *
  * @param {Parameters<typeof fakeForge>[0] & {
  *   event?: Record<string, unknown>,
  *   answer?: string,
  *   chatFailure?: Error,
+ *   verifyAnswer?: string,
+ *   verifyFailure?: Error,
+ *   finishReason?: string,
  * }} [options]
  */
 function io(options = {}) {
-  const forge = fakeForge(options);
-  /** @type {{ model: string, messages: import("#core/chat.mjs").ChatMessage[], tools?: import("#core/chat.mjs").ChatTool[] } | null} */
-  let request = null;
+  const event = /** @type {Record<string, unknown>} */ (options.event ?? issueEvent());
+  const raw = /** @type {Record<string, unknown> | undefined} */ (
+    event["issue"] ?? event["pull_request"]
+  );
+  const eventLabels = Array.isArray(raw?.["labels"])
+    ? /** @type {{ name: unknown }[]} */ (raw["labels"]).map((entry) => String(entry["name"]))
+    : [];
+  // The live reads default to the event's own labels, so the claim and the
+  // authority agree unless a test breaks the agreement on purpose.
+  const forge = fakeForge({ ...options, liveLabels: options.liveLabels ?? eventLabels });
+  /** @type {{ model: string, messages: import("#core/chat.mjs").ChatMessage[], tools?: import("#core/chat.mjs").ChatTool[] }[]} */
+  const asks = [];
   return {
     forge,
-    request: () => request,
+    request: () => asks[0] ?? null,
+    asks: () => asks,
     chat: {
       /**
        * @param {{ model: string, messages: import("#core/chat.mjs").ChatMessage[], tools?: import("#core/chat.mjs").ChatTool[] }} ask
        */
       async complete(ask) {
+        // The verify ask is what its own contract marks: its user message
+        // restates the plan. Content-keyed, so a world reused across two runs
+        // cannot misread the second run's decide call as a verify call.
+        const isVerify = String(ask.messages[1]?.content ?? "").includes("Proposed operations:");
+        if (isVerify) {
+          // Recorded even when told to fail — the call was made; what the run
+          // does about the failure is the pass's business, not the stub's.
+          asks.push(ask);
+          if (options.verifyFailure) throw options.verifyFailure;
+          return { content: options.verifyAnswer ?? "[]", toolCalls: [], finishReason: undefined };
+        }
         if (options.chatFailure) throw options.chatFailure;
-        request = ask;
-        return { content: options.answer ?? LABELS_ANSWER, toolCalls: [], finishReason: undefined };
+        asks.push(ask);
+        return {
+          content: options.answer ?? LABELS_ANSWER,
+          toolCalls: [],
+          finishReason: options.finishReason,
+        };
       },
     },
     evidence: createEvidence(() => "aaaabbbb"),
@@ -354,8 +418,26 @@ describe("readInputs", () => {
     );
   });
 
-  it("defaults request-timeout-ms to 30000 when the input is absent", () => {
-    expect(readInputs(runner).requestTimeoutMs).toBe(30_000);
+  it("defaults the record-path to .triage-record", () => {
+    expect(readInputs(runner).recordPath).toBe(".triage-record");
+  });
+
+  it("reads a configured record-path", () => {
+    expect(readInputs({ ...runner, "INPUT_RECORD-PATH": "out/records" }).recordPath).toBe(
+      "out/records",
+    );
+  });
+
+  it("defaults verification to off — the pass is opt-in", () => {
+    expect(readInputs(runner).verify).toBe(false);
+  });
+
+  it("reads a configured verify input", () => {
+    expect(readInputs({ ...runner, INPUT_VERIFY: "true" }).verify).toBe(true);
+  });
+
+  it("defaults request-timeout-ms to 120000 when the input is absent", () => {
+    expect(readInputs(runner).requestTimeoutMs).toBe(120_000);
   });
 
   it("refuses a request-timeout-ms that is not a number", () => {
@@ -474,7 +556,15 @@ describe("run — the sheet half", () => {
 
     await run(inputs(), readContext(runner), world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      // The classification also upserts the record comment: the next run's
+      // supersede proof exists before the next drift can.
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
   it("applies a model answer that names a label twice once, not twice", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -482,7 +572,13 @@ describe("run — the sheet half", () => {
 
     await run(inputs(), readContext(runner), world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("adds nothing when the chosen labels are already present", async () => {
@@ -491,6 +587,8 @@ describe("run — the sheet half", () => {
 
     await run(inputs(), readContext(runner), world);
 
+    // The record comment is minted only when a classification-role label
+    // lands, so an idempotent rerun still writes nothing.
     expect(world.forge.writes).toEqual([]);
   });
 
@@ -503,7 +601,13 @@ describe("run — the sheet half", () => {
 
     await run(inputs(), readContext(runner), world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["docs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["docs"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("applies a partly off-sheet answer's on-sheet half and logs the refused rest", async () => {
@@ -514,7 +618,13 @@ describe("run — the sheet half", () => {
 
     await run(inputs(), readContext(runner), world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
     const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
     // size/xl is on the ladder: offered to no model, so a model choosing it
     // is off-sheet like any other unoffered name.
@@ -609,9 +719,16 @@ describe("run — the triage marker", () => {
 
     await run(inputs(), readContext(runner), world);
 
+    // Removals land before additions: a run that dies part-way leaves the
+    // thread missing its category, not missing its queue marker — the
+    // re-derivable half of the plan.
     expect(world.forge.writes).toEqual([
-      { op: "addLabels", args: [7, ["bug"]] },
       { op: "removeLabel", args: [7, "needs triage"] },
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
     ]);
   });
 
@@ -637,9 +754,14 @@ describe("run — the triage marker", () => {
 
     await run(inputs(), readContext(runner), world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
-
   it("does not clear the marker a thread does not carry", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     const world = io({
@@ -650,7 +772,13 @@ describe("run — the triage marker", () => {
 
     await run(inputs(), readContext(runner), world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("names the marker it would clear in a dry run, and writes nothing", async () => {
@@ -707,8 +835,12 @@ describe("run — the event gate (PR-E)", () => {
 
     expect(world.request()).not.toBeNull();
     expect(world.forge.writes).toEqual([
-      { op: "addLabels", args: [7, ["bug"]] },
       { op: "removeLabel", args: [7, "needs triage"] },
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
     ]);
   });
 
@@ -744,6 +876,95 @@ describe("run — the event gate (PR-E)", () => {
     expect(world.forge.writes).toEqual([]);
     expect(log.mock.calls.some((call) => String(call[0]).includes("issues.labeled → skip"))).toBe(
       true,
+    );
+  });
+
+  // The triage race (#480): a template applies its queue marker inside the
+  // `opened` run, that run is cancelled, and the surviving `labeled` run
+  // carries a payload that predates the marker. The skip matrix would call
+  // the thread unqueued and write nothing; the gate arbitrates the claim
+  // against the live thread before the skip becomes final.
+  it("a stale labeled claim that hides a live marker completes the queue lifecycle", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      ...withConfig(),
+      event: labeled("bug", { labels: ["bug"] }),
+      liveLabels: ["needs triage", "bug"],
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    // One arbitrating read, then the ordinary queued-classification
+    // pipeline: one model call, the marker cleared once classified.
+    expect(world.request()).not.toBeNull();
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([{ op: "removeLabel", args: [7, "needs triage"] }]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toContain(
+      "triage: the event's label list was stale — the live thread still carries a queue marker; re-triaged",
+    );
+    expect(lines).not.toContain(
+      "triage: nothing written — the event changed no triage-relevant evidence",
+    );
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("published");
+  });
+
+  it("an already-decided thread is unchanged — a no-marker live read leaves the skip byte-identical", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      ...withConfig(),
+      event: labeled("bug", { labels: ["bug"] }),
+      liveLabels: ["bug"],
+    });
+    // A landed decision is the only code path that removes a marker, so a
+    // live read showing none re-decides nothing: the skip stands with the
+    // grammar's own reason, the arbitrating read being the only new cost.
+
+    await run(inputs(), readContext(runner), world);
+
+    expect(world.request()).toBeNull();
+    expect(world.forge.writes).toEqual([]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).not.toContain("re-triaged");
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("skip");
+    expect(record.reason).toBe(
+      "'bug' is neither a queue marker nor a classification of a queued thread — content evidence is unchanged",
+    );
+  });
+
+  it("records abandoned when the thread moves after arbitration — the marker is gone by the freshness gate", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      ...withConfig(),
+      event: labeled("bug", { labels: ["bug"] }),
+    });
+    // The arbitrating read sees the marker; the mutation's live re-read
+    // sees it already cleared — the thread moved while the run was in
+    // flight, and the freshness gate fences the write.
+    let markerSeen = true;
+    world.forge.getIssue = async () => {
+      const labels = markerSeen ? ["needs triage", "bug"] : ["bug"];
+      markerSeen = false;
+      return { labels };
+    };
+
+    await run(inputs(), readContext(runner), world);
+
+    expect(world.forge.writes).toEqual([]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toContain("nothing written — the thread changed while this run was in flight");
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("abandoned");
+    expect(record.reason).toBe(
+      "the labels are now [bug], not the [needs triage, bug] the event carried",
     );
   });
 
@@ -824,7 +1045,13 @@ describe("run — the event gate (PR-E)", () => {
     const makeEvent = (labels) => ({ action: "opened", ...issueEvent({ labels }) });
 
     await run(inputs(), readContext(runner), { ...world, readEvent: async () => makeEvent([]) });
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
 
     // The second event reflects the thread's real post-first-run state: "bug"
     // is already on it, so the rerun re-derives the same decision and adds
@@ -833,7 +1060,13 @@ describe("run — the event gate (PR-E)", () => {
       ...world,
       readEvent: async () => makeEvent(["bug"]),
     });
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("a rerun never duplicates the classification comment — the upsert updates in place", async () => {
@@ -846,6 +1079,209 @@ describe("run — the event gate (PR-E)", () => {
 
     expect(world.forge.writes.filter((write) => write.op === "createComment")).toHaveLength(1);
     expect(world.forge.writes.filter((write) => write.op === "updateComment")).toHaveLength(1);
+  });
+});
+
+describe("run — a labeled skip on a never-classified thread (issue #496)", () => {
+  // A form-created thread is `opened` and `labeled` in the same second; the
+  // thread-keyed concurrency group cancels the `opened` run and the surviving
+  // `labeled` run carries the only chance to classify. On a sheet that
+  // declares no queue marker the skip matrix cannot see the queue at all —
+  // there is no `workflowMarkers` entry to recognise the form's `needs
+  // triage` — so the #491 arbiter's precondition (a classification-role
+  // changed label) structurally excludes the change that actually happened.
+  // The survivor's payload-premised skip is arbitrated against the live
+  // thread before it becomes final: a live thread carrying no classification
+  // is re-triaged, so the queue marker applied by the cancelled `opened`
+  // run's form is no longer a stranding.
+  /** @param {string} name @param {{ labels?: string[] }} [thread] */
+  const labeled = (name, thread) => ({
+    action: "labeled",
+    label: { name },
+    ...issueEvent(thread),
+  });
+
+  it("a labeled survivor converges when the sheet declares no queue marker — the form marker becomes a classification trigger", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      event: labeled("needs triage", { labels: ["needs triage"] }),
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    // One model call, the ordinary classification pipeline: the marker stays
+    // (the sheet never declared it — the action does not own what it cannot
+    // name), and the thread ends classified, exactly once.
+    expect(world.request()).not.toBeNull();
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      { op: "createComment", args: [7, expect.stringContaining("<!-- action-agents:triage:")] },
+    ]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toContain("→ retriage");
+    expect(lines).not.toContain(
+      "triage: nothing written — the event changed no triage-relevant evidence",
+    );
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("published");
+    expect(record.decision.add).toEqual(["bug"]);
+  });
+
+  it("a labeled survivor whose payload predates the form's marker converges too — the live read is the authority", async () => {
+    const world = io({
+      event: labeled("needs triage", { labels: [] }),
+      liveLabels: ["needs triage"],
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    expect(world.request()).not.toBeNull();
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      { op: "createComment", args: [7, expect.stringContaining("<!-- action-agents:triage:")] },
+    ]);
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("published");
+  });
+
+  it("a labeled event on an already-classified thread stays a skip when no marker is declared", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: labeled("postponed", { labels: ["bug"] }) });
+
+    await run(inputs(), readContext(runner), world);
+
+    // The thread's classification exists; the label change cannot move the
+    // queue lifecycle, so the skip stands with the grammar's own reason.
+    expect(world.request()).toBeNull();
+    expect(world.forge.writes).toEqual([]);
+    expect(log.mock.calls.some((call) => String(call[0]).includes("→ skip"))).toBe(true);
+  });
+});
+
+describe("run — classification-state reconciliation (issues #497, #498)", () => {
+  // The single-valued-role guard's old evaluation surface unioned the
+  // proposal with the thread's labels and refused any pair: a model answer
+  // naming two classifications, or one conflicting with a stale label the
+  // action itself applied on earlier evidence. The reconciliation step
+  // resolves a mixed proposal under the sheet's declared precedence and
+  // judges the thread's existing members by the provenance the action can
+  // verify — its own marker comment carrying the record of what it applied
+  // (the #380 ownership test: the comment's author must be the token's own
+  // login). A member without that proof is never removed; the refusal names
+  // the exact remediation.
+  /** @param {string[]} labels */
+  const recordBlock = (labels) =>
+    `action-agents-record:triage:${Buffer.from(
+      JSON.stringify({ schemaVersion: 1, applied: labels }),
+      "utf8",
+    ).toString("base64")}`;
+  /** @param {string[]} labels */
+  const actionComment = (labels) =>
+    `<!-- action-agents:triage:0badcafe -->\n\n**bug**\n\n> the diff crashed on import\n\n${recordBlock(
+      labels,
+    )}\n\n_Classified by the \`triage\` action._`;
+  const DOCS_ANSWER = '{"labels":["docs"],"rationale":"The diff is documentation only."}';
+
+  // The reconciliation judges single-valued roles, and a role is
+  // single-valued when the sheet declares it in `labels.exclusive` (priority
+  // is inherent) — the real consumer sheet declares
+  // `semantic-classification` there, so these tests declare it too.
+  const EXCLUSIVE_CONFIG = JSON.stringify({
+    ...JSON.parse(CONFIG),
+    labels: { ...JSON.parse(CONFIG).labels, exclusive: ["semantic-classification"] },
+  });
+  const withExclusive = {
+    files: { ".github/action-agents/triage/triage.json5": EXCLUSIVE_CONFIG },
+  };
+
+  it("replaces a classification the action's own record proves it applied — drift converges end to end", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      ...withExclusive,
+      event: issueEvent({ labels: ["bug"] }),
+      comments: [{ login: "action-agents[bot]", body: actionComment(["bug"]) }],
+      answer: DOCS_ANSWER,
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    // The drift (code → docs) converges without human cleanup: the action's
+    // own record proves it applied `bug`, so the later confident
+    // classification supersedes it, and the record comment is updated in
+    // place to name the new classification.
+    expect(world.forge.writes).toEqual([
+      { op: "removeLabel", args: [7, "bug"] },
+      { op: "addLabels", args: [7, ["docs"]] },
+      { op: "updateComment", args: [1, expect.stringContaining(recordBlock(["docs"]))] },
+    ]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toContain("replaced");
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("published");
+    expect(record.decision.remove).toEqual([{ name: "bug", reason: "supersede" }]);
+  });
+
+  it("re-applying the recorded classification is idempotent — no replacement, no churn", async () => {
+    const world = io({
+      ...withExclusive,
+      event: issueEvent({ labels: ["bug"] }),
+      comments: [{ login: "action-agents[bot]", body: actionComment(["bug"]) }],
+    });
+
+    expect(world.forge.writes).toEqual([]);
+    const record = JSON.parse(
+      readFileSync(p.join(WORKSPACE, ".triage-record", "triage-record-issue-7.json"), "utf8"),
+    );
+    expect(record.outcome).toBe("published");
+  });
+
+  it("refuses a conflicting label the action cannot prove, naming the exact remediation", async () => {
+    const world = io({
+      ...withExclusive,
+      event: issueEvent({ labels: ["bug"] }),
+      answer: DOCS_ANSWER,
+    });
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      /remove 'bug' from the thread/,
+    );
+    expect(world.forge.writes).toEqual([]);
+  });
+
+  it("a user-authored marker comment grants no removal rights", async () => {
+    const world = io({
+      ...withExclusive,
+      event: issueEvent({ labels: ["bug"] }),
+      comments: [{ login: "octocat", body: actionComment(["bug"]) }],
+      answer: DOCS_ANSWER,
+    });
+    // The comment carries the exact marker and record syntax; its author is
+    // not the token's own login, so it proves nothing (issue #380's rule).
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      /remove 'bug' from the thread/,
+    );
+    expect(world.forge.writes).toEqual([]);
+  });
+
+  it("fails closed when the token's identity cannot be resolved — no provenance, no replacement", async () => {
+    const world = io({
+      ...withExclusive,
+      event: issueEvent({ labels: ["bug"] }),
+      whoamiError: new Error("rate limited"),
+      answer: DOCS_ANSWER,
+    });
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      /remove 'bug' from the thread/,
+    );
+    expect(world.forge.writes).toEqual([]);
   });
 });
 
@@ -893,8 +1329,12 @@ describe("run — a schema 1 config is migrated, then behaves like schema 2", ()
     await run(inputs(), readContext(runner), world);
 
     expect(world.forge.writes).toEqual([
-      { op: "addLabels", args: [7, ["bug"]] },
       { op: "removeLabel", args: [7, "needs triage"] },
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
     ]);
     const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
     expect(lines).toMatch(/schema 1/);
@@ -934,7 +1374,13 @@ describe("run — the size half", () => {
 
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["breaking", "size/xs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["breaking", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
     const system = world.request()?.messages[0]?.content ?? "";
     expect(system).not.toContain("size/");
   });
@@ -948,9 +1394,16 @@ describe("run — the size half", () => {
 
     await run(inputs(), prContext, world);
 
+    // Removal first here too: the superseded rung comes off before the
+    // measured one lands, so a part-way death never leaves two size rungs
+    // standing — the exact stale-claim state the ordering exists to prevent.
     expect(world.forge.writes).toEqual([
-      { op: "addLabels", args: [8, ["bug", "size/xs"]] },
       { op: "removeLabel", args: [8, "size/xl"] },
+      { op: "addLabels", args: [8, ["bug", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
     ]);
   });
 
@@ -1131,8 +1584,9 @@ describe("run — no sheet, the comment half", () => {
 
   it("cuts the rationale at the 300-char cap without splitting a surrogate pair", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
-    // 287 ASCII, one two-unit emoji, padding: a UTF-16 slice(0, 288) would
-    // cut the emoji in half; the codepoint cap must keep it whole.
+    // 287 ASCII, one two-unit emoji, padding: a naive UTF-16 slice(0, 288)
+    // would cut the emoji in half; the cap backs off one unit and the emoji
+    // is dropped whole — never emitted as a corrupt lone half (#347).
     const answer = JSON.stringify({
       classification: "bug report",
       rationale: `${"a".repeat(287)}\u{1F980}${"b".repeat(25)}`,
@@ -1144,7 +1598,9 @@ describe("run — no sheet, the comment half", () => {
     const write = world.forge.writes[0];
     if (write === undefined) throw new Error("no comment was written");
     const body = String(write.args[1]);
-    expect(body).toContain(`> ${"a".repeat(287)}\u{1F980}…[truncated]`);
+    expect(body).toContain(`> ${"a".repeat(287)}…[truncated]`);
+    // A lone surrogate half would throw here — the no-split rule, pinned.
+    expect(() => encodeURIComponent(body)).not.toThrow();
     expect(body).toContain("**bug report**");
   });
 
@@ -1197,8 +1653,7 @@ describe("run — no sheet, the comment half", () => {
     expect(world.forge.writes.map((write) => write.op)).toEqual(["createComment"]);
   });
 
-  it("falls back to github-actions[bot] when the identity read fails", async () => {
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+  it("red-runs when the identity read fails — it never guesses an identity to write under", async () => {
     const world = io({
       files: {},
       answer: COMMENT_ANSWER,
@@ -1211,11 +1666,16 @@ describe("run — no sheet, the comment half", () => {
       ],
     });
 
-    await run(inputs(), readContext(runner), world);
-
-    // The fallback login is the identity the prior comment carries, so the
-    // upsert still claims it instead of duplicating.
-    expect(world.forge.writes.map((write) => write.op)).toEqual(["updateComment"]);
+    // Intentional behavior change (#249): the old github-actions[bot] fallback
+    // was safe only while the token was a GITHUB_TOKEN. Under any other
+    // identity the guessed set mis-reads the action's own prior comment write
+    // as a stranger's and the upsert duplicates it. A run that cannot
+    // establish which comments are its own does not write at all — the write
+    // now flows through the executor's accounting loop, so the identity-read
+    // failure surfaces as the partial-mutation accounting with the identity
+    // read as its cause.
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(PartialMutationError);
+    expect(world.forge.writes.map((write) => write.op)).toEqual([]);
   });
 });
 
@@ -1259,7 +1719,13 @@ describe("run — the pr evaluators (PR-D)", () => {
     // a human (or a later policy) can weigh; it is not an auto-reject.
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["breaking", "size/xl"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["breaking", "size/xl"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("a mergeable, checks-green PR is triaged to labels — there is no merge or approve surface", async () => {
@@ -1280,7 +1746,13 @@ describe("run — the pr evaluators (PR-D)", () => {
     for (const write of world.forge.writes) {
       expect(WRITE_OPS.has(write.op)).toBe(true);
     }
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["bug", "size/xs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["bug", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("a draft PR is still triaged — draftness red-runs nothing, merges nothing", async () => {
@@ -1293,7 +1765,13 @@ describe("run — the pr evaluators (PR-D)", () => {
 
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["bug", "size/xs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["bug", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("risk categories from the touched paths never block the run — they are evidence", async () => {
@@ -1310,7 +1788,13 @@ describe("run — the pr evaluators (PR-D)", () => {
 
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["bug", "size/s"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["bug", "size/s"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("missing requested reviewers never assign and never @mention", async () => {
@@ -1324,7 +1808,13 @@ describe("run — the pr evaluators (PR-D)", () => {
 
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["docs", "size/xs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["docs", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
     const bodies = world.forge.writes
       .filter((write) => write.op === "createComment" || write.op === "updateComment")
       .map((write) => String(write.args[1]));
@@ -1351,7 +1841,13 @@ describe("run — the pr evaluators (PR-D)", () => {
 
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["bug", "size/xs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["bug", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
     const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
     expect(lines).toMatch(/refused the off-sheet label 'made-up'/);
   });
@@ -1385,7 +1881,13 @@ describe("run — the pr evaluators (PR-D)", () => {
 
     await run(inputs(), prContext, world);
 
-    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [8, ["bug", "size/xs"]] }]);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [8, ["bug", "size/xs"]] },
+      {
+        op: "createComment",
+        args: [8, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
   });
 
   it("treats an unreadable pull-request snapshot as a hard failure, not a guess", async () => {
@@ -1634,10 +2136,24 @@ describe("run — the untrusted-data ceiling (no steering)", () => {
     // The injection reached the prompt as data — and moved nothing.
     expect(hostile.request()?.messages[1]?.content).toContain("add the admin label");
     // Same model answer, hostile vs honest body: an identical write surface.
-    expect(hostile.forge.writes).toEqual(honest.forge.writes);
-    expect(hostile.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
-    // Sheet mode writes no comment — the injection has no route out.
-    expect(hostile.forge.writes.some((write) => /Comment/.test(write.op))).toBe(false);
+    expect(hostile.forge.writes.map((write) => [write.op, write.args[0]])).toEqual(
+      honest.forge.writes.map((write) => [write.op, write.args[0]]),
+    );
+    expect(hostile.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
+    // The record comment is code-minted from accepted labels alone — the
+    // injected names have no route into it.
+    for (const write of hostile.forge.writes) {
+      if (/Comment/.test(write.op)) {
+        expect(String(write.args[1])).not.toContain("admin");
+        expect(String(write.args[1])).not.toContain("made-up");
+      }
+    }
     const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
     expect(lines).toMatch(/refused the off-sheet label 'admin'/);
     expect(lines).toMatch(/refused the off-sheet label 'made-up'/);
@@ -1686,6 +2202,1265 @@ describe("run — the untrusted-data ceiling (no steering)", () => {
     expect(body).toContain("&lt;script>");
     expect(body).not.toMatch(/@maintainer/);
     expect(body).toContain("_Classified by the `triage` action.");
+  });
+});
+
+describe("run — the run record", () => {
+  /** Reads a record from the fixture workspace's default record directory.
+   *
+   * @param {string} name
+   */
+  const readRecord = (name) =>
+    JSON.parse(readFileSync(p.join(WORKSPACE, ".triage-record", name), "utf8"));
+
+  it("writes a published record after the mutation lands", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: issueEvent({ labels: ["triage"] }) });
+
+    await run(inputs(), readContext(runner), world);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("published");
+    expect(record.dryRun).toBe(false);
+    expect(record.thread).toEqual({ type: "issue", number: 7 });
+    expect(record.policy).toEqual({ basis: "default", branch: "main", sha: "0".repeat(40) });
+    expect(record.event).toEqual({ eventName: "issues", action: "" });
+    expect(record.decision).toMatchObject({ kind: "labels", add: ["bug"] });
+    expect(record.reason).toMatch(/labels decision: 1 to add, 0 to remove, 0 refused/u);
+    expect(record.verification).toEqual({ requested: false, answers: [], downgraded: [] });
+  });
+
+  it("writes a skip record for a dry run — the run wrote nothing", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: issueEvent({ labels: ["triage"] }) });
+
+    await run(inputs({ dryRun: true }), readContext(runner), world);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.dryRun).toBe(true);
+    expect(record.outcome).toBe("skip");
+    expect(world.forge.writes).toEqual([]);
+  });
+
+  it("writes a skip record carrying the event gate's reason verbatim", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: { action: "closed", ...issueEvent() } });
+
+    await run(inputs(), readContext(runner), world);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("skip");
+    expect(record.reason).toBe("a closed thread awaits no triage");
+    expect("decision" in record).toBe(false);
+  });
+
+  it("absent default locations are policy-empty — the no-sheet run stays green, its only write the comment (F-02)", async () => {
+    // The policy-empty posture the run contract blesses (#472): no file at
+    // the default locations and no narrowing is no fault at all. The record
+    // carries the resolved policy pin even though no file was read at it,
+    // the decision is the comment kind, and no label write exists to make.
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ files: {}, answer: COMMENT_ANSWER });
+
+    await run(inputs(), readContext(runner), world);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("published");
+    expect(record.policy).toEqual({ basis: "default", branch: "main", sha: "0".repeat(40) });
+    expect(record.decision).toMatchObject({ kind: "comment", add: [], remove: [] });
+    expect(world.forge.writes.map((write) => write.op)).toEqual(["createComment"]);
+
+    // The dry run on the same policy-empty world writes nothing at all, and
+    // its skip record still carries the comment decision.
+    const dry = io({ files: {}, answer: COMMENT_ANSWER });
+
+    await run(inputs({ dryRun: true }), readContext(runner), dry);
+
+    expect(dry.forge.writes).toEqual([]);
+    const skip = readRecord("triage-record-issue-7.json");
+    expect(skip.outcome).toBe("skip");
+    expect(skip.dryRun).toBe(true);
+    expect(skip.decision).toMatchObject({ kind: "comment" });
+  });
+
+  it("writes a failed record when the model call dies, and the original error still surfaces", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ chatFailure: new Error("the provider's response body is not JSON") });
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(/not JSON/u);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.reason).toBe("the provider's response body is not JSON");
+    expect("decision" in record).toBe(false);
+  });
+
+  /**
+   * A decide seam that answers with the given contents in order, carrying the
+   * call's diagnostics the way the real client does (#521) — the world `io()`
+   * builds cannot express them, and these tests are about what the record
+   * does with them.
+   *
+   * @param {string[]} contents
+   * @param {import("#core/chat.mjs").ChatDiagnostics} diagnostics
+   */
+  function reportingChat(contents, diagnostics) {
+    let cursor = 0;
+    return {
+      /**
+       * @param {{ model: string, messages: import("#core/chat.mjs").ChatMessage[] }} _ask
+       */
+      async complete(_ask) {
+        const content = contents[Math.min(cursor, contents.length - 1)] ?? "";
+        cursor += 1;
+        return {
+          content,
+          toolCalls: [],
+          finishReason: "stop",
+          diagnostics,
+        };
+      },
+    };
+  }
+
+  it("records both empty attempts with their facts — the #521 failure, in the record", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = {
+      ...io({ event: issueEvent({ labels: ["triage"] }) }),
+      chat: reportingChat(["", ""], { status: 200, requestBytes: 6401 }),
+    };
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      "the model's answer was empty (after 2 attempts)",
+    );
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.reason).toBe("the model's answer was empty (after 2 attempts)");
+    expect("decision" in record).toBe(false);
+    expect(record.modelAttempts).toEqual([
+      { bytes: 6401, finishReason: "stop", outcome: "empty", status: 200 },
+      { bytes: 6401, finishReason: "stop", outcome: "empty", status: 200 },
+    ]);
+  });
+
+  it("records an unanswered ask with the error's own facts when the seam could not answer", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const refusal = new HttpError("the provider refused", {
+      status: 503,
+      url: "https://api.example/v1/chat/completions",
+    });
+    // The seam attaches its report to the errors it passes through; the
+    // double attaches the same shape the same way.
+    /** @type {{ diagnostics?: unknown }} */ (refusal).diagnostics = {
+      status: 503,
+      requestBytes: 2400,
+    };
+    const world = io({ chatFailure: refusal });
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toBe(refusal);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.modelAttempts).toEqual([
+      { bytes: 2400, finishReason: "", outcome: "unanswered", status: 503 },
+    ]);
+  });
+
+  it("records the ask a green run judged, and honest nulls for a double without diagnostics", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const reporting = {
+      ...io({ event: issueEvent({ labels: ["triage"] }) }),
+      chat: reportingChat([LABELS_ANSWER], { status: 200, requestBytes: 1851 }),
+    };
+
+    await run(inputs(), readContext(runner), reporting);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("published");
+    expect(record.modelAttempts).toEqual([
+      { bytes: 1851, finishReason: "stop", outcome: "answered", status: 200 },
+    ]);
+
+    // The plain `io()` double predates the field: a run it answers records
+    // the honest nulls, never a zero or a guessed status.
+    const plain = io({ event: issueEvent({ labels: ["triage"] }) });
+    await run(inputs(), readContext(runner), plain);
+    const plainRecord = readRecord("triage-record-issue-7.json");
+    expect(plainRecord.outcome).toBe("published");
+    expect(plainRecord.modelAttempts).toEqual([
+      { bytes: null, finishReason: "", outcome: "answered", status: null },
+    ]);
+  });
+
+  it("records the empty list for a run that never asked — the event gate's skip", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: { action: "closed", ...issueEvent() } });
+
+    await run(inputs(), readContext(runner), world);
+
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("skip");
+    expect(record.modelAttempts).toEqual([]);
+  });
+
+  it("writes a thread-less record when the run dies before the payload parses", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: {} });
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      /carries no 'issue' object/u,
+    );
+
+    const record = readRecord("triage-record-issues.json");
+    expect(record.thread).toBeNull();
+    expect(record.policy).toBeNull();
+    expect(record.outcome).toBe("failed");
+    expect(record.reason).toBe("the event payload carries no 'issue' object");
+  });
+
+  it("stays green when the record write fails after the mutation landed, and logs the loss", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: issueEvent({ labels: ["triage"] }) });
+
+    await run(inputs({ recordPath: "../outside" }), readContext(runner), world);
+
+    // The mutate was the run's outcome; the record was the loss.
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toMatch(
+      /the run record was not written: record-path '\.\.\/outside' resolves outside the workspace/u,
+    );
+  });
+
+  it("goes red when the record write fails on the skip path — the record is the skip's whole outcome", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: { action: "closed", ...issueEvent() } });
+
+    await expect(
+      run(inputs({ recordPath: "../outside" }), readContext(runner), world),
+    ).rejects.toThrow(/outside the workspace/u);
+  });
+
+  it("goes red when the record write fails on a dry run — the record is the skip's whole outcome", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: issueEvent({ labels: ["triage"] }) });
+
+    await expect(
+      run(inputs({ dryRun: true, recordPath: "../outside" }), readContext(runner), world),
+    ).rejects.toThrow(/outside the workspace/u);
+    // The dry run landed no mutation either way; the lost record was the
+    // whole outcome, so the loss is the red run, not a logged warning.
+    expect(world.forge.writes).toEqual([]);
+  });
+
+  it("an abandoned record carries the divergence reason sanitised — a hostile label name's marker does not survive", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The divergence reason interpolates the live thread's label names, so a
+    // hostile name rides it exactly as in the #259 corpus. The record build
+    // site sanitises: control characters flattened, length under the cap.
+    const world = io({
+      event: issueEvent({ labels: ["triage"] }),
+      liveLabels: ["bug", "evil\u001b]2;owned\u0007"],
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("abandoned");
+    // No raw control character survives into the record; the stripped form
+    // is what carries.
+    expect(record.reason).not.toContain("\u001b");
+    expect(record.reason).not.toContain("\u0007");
+    expect(record.reason).toContain("evil ]2;owned");
+    expect(record.reason.length).toBeLessThanOrEqual(REASON_CHARS);
+    expect(record.decision).toBeDefined();
+  });
+
+  it("writes an abandoned record when the freshness gate withheld the write", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The live re-read disagrees with the payload's label claim — the same
+    // fixture shape the mutate-level divergence tests pin.
+    const world = io({
+      event: issueEvent({ labels: ["triage"] }),
+      liveLabels: ["bug", "size/l"],
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    // The run resolves green, nothing landed, the warning still logged.
+    expect(world.forge.writes).toEqual([]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toContain("nothing written — the thread changed while this run was in flight");
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("abandoned");
+    expect(record.reason).toBe(
+      "the labels are now [bug, size/l], not the [triage] the event carried",
+    );
+    // The superseded decision stays carried: the record shows what was
+    // decided and that a fresher state superseded it.
+    expect(record.decision).toMatchObject({ kind: "labels", add: ["bug"] });
+  });
+
+  it("goes red when the record write fails on the abandoned path — the record is the run's whole outcome", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      event: issueEvent({ labels: ["triage"] }),
+      liveLabels: ["bug", "size/l"],
+    });
+
+    await expect(
+      run(inputs({ recordPath: "../outside" }), readContext(runner), world),
+    ).rejects.toThrow(/outside the workspace/u);
+    expect(world.forge.writes).toEqual([]);
+  });
+
+  it("delivers under the record-path input, inside the upload glob", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: issueEvent({ labels: ["triage"] }) });
+
+    await run(inputs({ recordPath: "out/records" }), readContext(runner), world);
+
+    const file = p.join(WORKSPACE, "out", "records", "triage-record-issue-7.json");
+    expect(existsSync(file)).toBe(true);
+    expect(p.basename(file)).toMatch(/triage-record-.*\.json/u);
+  });
+
+  it("the dogfood workflow uploads the record glob", () => {
+    const workflow = readFileSync(
+      new URL("../../.github/workflows/triage.yml", import.meta.url),
+      "utf8",
+    );
+    expect(workflow).toContain("name: triage-run-record");
+    expect(workflow).toContain("triage-record-*.json");
+    expect(workflow).toContain("if: always()");
+    expect(workflow).toContain("include-hidden-files: true");
+    expect(workflow).toContain("if-no-files-found: warn");
+  });
+});
+
+/**
+ * Fault-injection pins for the record-at-every-terminal law (issue #469).
+ * Each test injects one fault and holds the pair of facts the run contract
+ * binds: the terminal the step ends in, and the `outcome` word the record on
+ * disk carries. The `refused` word's records are held by the opt-in
+ * verification suite, the off-sheet tests above and the config-refusal pin
+ * below; the `skip` word by the dry-run and event-gate suites. What was
+ * unpinned was the `failed` family's own INPUT→RECORD pair, the event gate's
+ * record trip through the real `main(env)`, and I15's byte-determinism across
+ * two whole runs — the facts #463's correction comment proved in production
+ * and no test held whole.
+ */
+describe("run — fault-injection pins: the record at the red terminals (#469)", () => {
+  /** @param {string} name */
+  const readPinRecord = (name) =>
+    JSON.parse(readFileSync(p.join(WORKSPACE, ".triage-record", name), "utf8"));
+
+  it("an unsupported event name through the real main(env) rejects and still writes its failed record (F-01)", async () => {
+    // Offline by construction: the event gate throws before any transport
+    // read, so the real `run` executes with no fetch, no forge and no model
+    // behind it. The pin's reason to exist is placement: the gate's throw
+    // sits INSIDE run()'s record-writing try, and the catch writes before it
+    // rethrows — a refactor that moves the gate outside that try ships a red
+    // run with no record, and this test fails the moment that happens.
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const workspace = mkdtempSync(p.join(tmpdir(), "triage-pin-gate-"));
+    const env = {
+      ...runner,
+      GITHUB_WORKSPACE: workspace,
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_EVENT_PATH: p.join(workspace, "event.json"),
+    };
+    writeFileSync(env.GITHUB_EVENT_PATH, JSON.stringify({}));
+
+    const result = await main(env);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toBe(
+      "triage runs on 'issues' and 'pull_request' events — this run was 'workflow_dispatch'",
+    );
+    // The record's file names the event, per the run record's naming rule
+    // for a run that died before the thread was known — and it sits inside
+    // the upload glob the workflow's `if: always()` step delivers.
+    const file = p.join(workspace, ".triage-record", "triage-record-workflow_dispatch.json");
+    expect(existsSync(file)).toBe(true);
+    const record = JSON.parse(readFileSync(file, "utf8"));
+    expect(record.outcome).toBe("failed");
+    expect(record.thread).toBeNull();
+    expect(record.policy).toBeNull();
+    expect(record.dryRun).toBe(true);
+    expect(record.event).toEqual({ eventName: "workflow_dispatch", action: "" });
+    expect(record.reason).toBe(result.message);
+    expect("decision" in record).toBe(false);
+  });
+
+  it("that event-gate record is byte-identical across two runs on the same env — no wall-clock anywhere (I15)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const workspace = mkdtempSync(p.join(tmpdir(), "triage-pin-bytes-"));
+    const env = {
+      ...runner,
+      GITHUB_WORKSPACE: workspace,
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_EVENT_PATH: p.join(workspace, "event.json"),
+    };
+    writeFileSync(env.GITHUB_EVENT_PATH, JSON.stringify({}));
+
+    await main(env);
+    const file = p.join(workspace, ".triage-record", "triage-record-workflow_dispatch.json");
+    const first = readFileSync(file, "utf8");
+    await main(env);
+    const second = readFileSync(file, "utf8");
+
+    expect(first).toBe(second);
+    expect(first).not.toBe("");
+    // Compact JSON, keys sorted, no trailing newline — the serialisation
+    // posture I15 names, now held across two whole `main` runs rather than
+    // two builds of one record object.
+    expect(first.endsWith("\n")).toBe(false);
+    const record = JSON.parse(first);
+    expect(Object.keys(record)).toEqual([...Object.keys(record)].sort());
+  });
+
+  it("a provider 5xx fails the run after the declared retries and records failed — never the refused word (F-04)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let calls = 0;
+    /** @type {typeof globalThis.fetch} */
+    const fetchImpl = async () => {
+      calls += 1;
+      return new Response("the gateway is unhappy", { status: 500 });
+    };
+    const forge = fakeForge({});
+    const world = /** @type {any} */ ({ forge, fetchImpl, readEvent: async () => issueEvent() });
+
+    // The transport's declared default: three attempts, then stop — F-04's
+    // "retry with backoff, then stop". The 429 arm shares the retryable set.
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(/HTTP 500/u);
+    expect(calls).toBe(3);
+
+    const record = readPinRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.reason).toMatch(/HTTP 500/u);
+    expect("decision" in record).toBe(false);
+    expect(forge.writes).toEqual([]);
+  }, 30_000);
+
+  it("an auth-class read failure records failed with zero writes and no model call (F-06)", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The transport refuses 401 and 403 outright — no retry — and the run
+    // treats a dead token as the environment break F-06 names: red, a
+    // `failed` record, nothing written, and the model is never asked.
+    for (const status of [401, 403]) {
+      const world = io({});
+      world.forge.listRepositoryLabelsDetailed = async () => {
+        throw new HttpError("the request was refused", {
+          status,
+          url: "https://api.github.com/repos/ecoma-io/action-agents/labels",
+        });
+      };
+
+      await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+        new RegExp(`HTTP ${String(status)}`, "u"),
+      );
+
+      expect(world.forge.writes).toEqual([]);
+      expect(world.asks()).toHaveLength(0);
+      const record = readPinRecord("triage-record-issue-7.json");
+      expect(record.outcome).toBe("failed");
+      expect(record.reason).toMatch(new RegExp(`HTTP ${String(status)}`, "u"));
+    }
+  });
+
+  it("a config that does not validate records refused — the typed startup refusal (F-02), zero writes, no model call", async () => {
+    // Resolved as #472 adjudicated it: a policy present but failing to
+    // validate is a deterministic startup refusal, not a defect — the
+    // validation wrap retypes it DeterministicRefusalError and the catch
+    // reads that class into the record's outcome word.
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ files: { ".github/action-agents/triage/triage.json5": '{"nope": true}' } });
+
+    const running = run(inputs(), readContext(runner), world);
+    await expect(running).rejects.toThrow(DeterministicRefusalError);
+    await expect(running).rejects.toThrow(/unknown config key 'nope'/u);
+
+    expect(world.forge.writes).toEqual([]);
+    expect(world.asks()).toHaveLength(0);
+    const record = readPinRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toContain("unknown config key 'nope'");
+    expect("decision" in record).toBe(false);
+  });
+
+  it("a configured config-path pointing at an absent file records failed — the reader arm (F-02)", async () => {
+    // The reader arm stays failed: the reading call interleaves transport,
+    // so a blanket retype would mislabel a transport break as a policy
+    // refusal — the validation wrap's comment holds the reasoning. The
+    // policy source resolved, so the record pins it, and the run went red
+    // before any model call on a workflow bug: a path the branch lacks.
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ files: {} });
+
+    await expect(
+      run(inputs({ configPath: "policies/absent.json5" }), readContext(runner), world),
+    ).rejects.toThrow(/config-path names 'policies\/absent\.json5', which does not exist/u);
+
+    expect(world.forge.writes).toEqual([]);
+    expect(world.asks()).toHaveLength(0);
+    const record = readPinRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.policy).toEqual({ basis: "default", branch: "main", sha: "0".repeat(40) });
+    expect(record.reason).toBe(
+      `config-path names 'policies/absent.json5', which does not exist on branch 'main' at ` +
+        `${"0".repeat(40)} — the policy source resolved for this run`,
+    );
+    expect("decision" in record).toBe(false);
+  });
+});
+
+/**
+ * A provider that declares its answer truncated (`finish_reason: length`,
+ * issue #448) never gets judged: the run fails naming truncation, one ask —
+ * the shape-failure re-ask cannot help a cut answer — and nothing the model
+ * said is written or recorded as a decision.
+ */
+describe("run — provider truncation (finish_reason: length, #448)", () => {
+  /** Reads a record from the fixture workspace's default record directory.
+   *
+   * @param {string} name
+   */
+  const readRecord = (name) =>
+    JSON.parse(readFileSync(p.join(WORKSPACE, ".triage-record", name), "utf8"));
+
+  it("fails a no-sheet truncated answer — the parseable prefix never becomes the comment", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The object closes, so without the guard the prefix would parse into a
+    // classification and be published as the marker comment.
+    const world = io({
+      files: {},
+      answer: '{"classification":"bug whose rationale was cut"}{"dimen',
+      finishReason: "length",
+    });
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      "the provider truncated its response (finish_reason: length) — " +
+        "the model's output is incomplete and cannot be judged as a triage answer",
+    );
+
+    // Nothing was asked twice, nothing was written, and the record carries the
+    // honest cause rather than any prefix of the answer.
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.reason).toContain("the provider truncated its response");
+    expect("decision" in record).toBe(false);
+  });
+
+  it("fails a sheet-mode truncated JSON5 answer — no doomed re-ask", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The cut lands mid-string, so without the guard the JSON5 parse would
+    // fail as a shape fumble and earn the re-ask that cannot succeed.
+    const world = io({
+      answer: '{"labels":["bug"],"rationale":"the buffer ran out mid-sent',
+      finishReason: "length",
+    });
+
+    await expect(run(inputs(), readContext(runner), world)).rejects.toThrow(
+      /truncated its response \(finish_reason: length\)/u,
+    );
+
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord("triage-record-issue-7.json");
+    expect(record.outcome).toBe("failed");
+    expect(record.reason).toContain("the provider truncated its response");
+    expect("decision" in record).toBe(false);
+  });
+
+  it("keeps the shape-failure re-ask for a non-truncated fumble — stop, not length", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // The control: the same unusable answer with finish_reason stop still
+    // earns its one redelivery, and the run proceeds on the retry's answer.
+    const answers = ["", LABELS_ANSWER];
+    let attempt = 0;
+    const world = io();
+    world.chat = {
+      /**
+       * @param {{ model: string, messages: import("#core/chat.mjs").ChatMessage[] }} ask
+       */
+      complete: async (ask) => {
+        world.asks().push(ask);
+        const content = answers[Math.min(attempt, answers.length - 1)] ?? "";
+        attempt += 1;
+        return { content, toolCalls: [], finishReason: undefined };
+      },
+    };
+
+    await run(inputs(), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
+  });
+});
+
+describe("run — the record and the signal are two independent comments", () => {
+  it("a decision with both a record and a signal writes both, neither clobbering the other", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // labels ["bug"] plus a model-judged incompleteness signal: the plan
+    // carries the record comment AND the signal.
+    const world = io({
+      answer:
+        '{"labels":["bug"],"rationale":"Fails on import.","dimensions":{"quality":{"completeness":"missing-evidence"}}}',
+    });
+
+    await run(inputs(), readContext(runner), world);
+
+    const comments = world.forge.writes.filter((write) => write.op === "createComment");
+    expect(comments).toHaveLength(2);
+    const bodies = comments.map((write) => String(write.args[1]));
+    const recordBody = bodies.find((body) => body.includes("action-agents-record:triage:"));
+    const signalBodyText = bodies.find((body) => body.includes("This issue looks incomplete"));
+    // The record block and the signal text live in two separate comments —
+    // the signal's upsert must never overwrite the record's.
+    expect(recordBody).toBeDefined();
+    expect(signalBodyText).toBeDefined();
+    expect(recordBody).not.toBe(signalBodyText);
+  });
+});
+
+/**
+ * The opt-in verification pass (issue #274), wired into the pipeline: the
+ * decide call answers `LABELS_ANSWER` on the default fixture, so the minted
+ * plan is two ops — `add:bug` and the record comment — and the verify call
+ * is the run's second ask. The marker fixture widens the plan further — the
+ * marker clear first, then the add, then the comment — which is the order
+ * the plan mints them in.
+ */
+describe("run — opt-in verification (issue #274)", () => {
+  /** Reads a record from the fixture workspace's default record directory.
+   *
+   * @param {string} [name]
+   */
+  const readRecord = (name = "triage-record-issue-7.json") =>
+    JSON.parse(readFileSync(p.join(WORKSPACE, ".triage-record", name), "utf8"));
+
+  const CONFIRM_BUG = JSON.stringify([
+    { opId: "add:bug", verdict: "confirmed", reason: "The report is a crash." },
+  ]);
+
+  /** The default plan's full confirmation: the label op and the record comment. */
+  const CONFIRM_RECORD = JSON.stringify([
+    { opId: "add:bug", verdict: "confirmed", reason: "The report is a crash." },
+    {
+      opId: "comment",
+      verdict: "confirmed",
+      reason: "The record names the labels this run applied.",
+    },
+  ]);
+
+  /** A labels answer that also triggers the code-composed signal (model-judged incomplete). */
+  const SIGNAL_ANSWER =
+    '{"labels":["bug"],"rationale":"Fails on import.","dimensions":{"quality":{"completeness":"missing-evidence"}}}';
+  /** The same judgement on an empty verdict: a labels decision carrying only the signal. */
+  const SIGNAL_ONLY_ANSWER =
+    '{"labels":[],"rationale":"Fails on import.","dimensions":{"quality":{"completeness":"missing-evidence"}}}';
+  /** A labels+marker answer that also triggers the signal, for the executor-alignment test. */
+  const SIGNAL_MARKER_ANSWER =
+    '{"labels":["bug","docs"],"rationale":"Fails on import.","dimensions":{"quality":{"completeness":"missing-evidence"}}}';
+
+  it("verify:true, everything confirmed — the decision lands and the block is filled", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ verifyAnswer: CONFIRM_RECORD });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    // Decide first, then verify: two asks, and the second restates the plan
+    // against the same evidence snapshot — no fresh read, no tools.
+    expect(world.asks()).toHaveLength(2);
+    const verifyAsk = world.asks()[1];
+    const prompt = verifyAsk?.messages[1]?.content ?? "";
+    expect(prompt).toContain("Proposed operations:");
+    expect(prompt).toContain("- add:bug: apply the label 'bug'");
+    expect(prompt).toContain("- comment: upsert the classification comment the decision composed");
+    expect(prompt).toContain("[evidence:aaaabbbb");
+    expect(verifyAsk?.messages[0]?.content).toContain('"confirmed"|"refuted"|"uncertain"');
+
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.verification).toEqual({
+      requested: true,
+      answers: [
+        {
+          opId: "add:bug",
+          verdict: "confirmed",
+          reasonDigest: reasonDigest("The report is a crash."),
+        },
+        {
+          opId: "comment",
+          verdict: "confirmed",
+          reasonDigest: reasonDigest("The record names the labels this run applied."),
+        },
+      ],
+      downgraded: [],
+    });
+  });
+
+  it("verify:true, a record comment the answer never judged is downgraded — silence is not confirmation", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ verifyAnswer: CONFIRM_BUG });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    // The label op landed; the record comment the answer never judged is
+    // uncertain, and an uncertain comment means no record write and no
+    // carried record.
+    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.decision.record).toBeUndefined();
+    expect(record.decision.refusals).toContainEqual(
+      expect.stringMatching(/^verification downgraded 'comment' \(uncertain\)/u),
+    );
+    expect(record.verification.downgraded).toEqual(["comment"]);
+  });
+
+  it("verify:true, one op refuted — the survivor lands, the refuted one becomes a refusal", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      files: {
+        ".github/action-agents/triage/triage.json5": JSON.stringify({
+          ...JSON.parse(CONFIG),
+          labels: { ...JSON.parse(CONFIG).labels, workflowMarkers: ["needs triage"] },
+        }),
+      },
+      repoLabels: [...REPO_LABELS, "needs triage"],
+      event: issueEvent({ labels: ["needs triage"] }),
+      verifyAnswer: JSON.stringify([
+        { opId: "add:bug", verdict: "confirmed", reason: "The report is a crash." },
+        { opId: "remove:needs triage", verdict: "refuted", reason: "The marker is ours." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.decision).toMatchObject({ kind: "labels", add: ["bug"], remove: [] });
+    expect(record.decision.refusals).toContain(
+      "verification downgraded 'remove:needs triage' (refuted): The marker is ours.",
+    );
+    expect(record.verification.downgraded).toEqual(["remove:needs triage", "comment"]);
+    expect(record.verification.answers).toHaveLength(3);
+  });
+
+  it("verify:true, every op downgraded — the run ends refused, nothing written, green", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // Silence is not confirmation: an empty array leaves the one op uncertain.
+    const world = io({ verifyAnswer: "[]" });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toContain("add:bug");
+    expect(record.reason).toContain("uncertain");
+    expect(record.decision).toMatchObject({ add: [], remove: [] });
+    expect(record.verification.downgraded).toEqual(["add:bug", "comment"]);
+    const lines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(lines).toContain("nothing written — verification downgraded every proposed operation");
+  });
+
+  it("a garbage verify answer downgrades everything — refused, one ask, no retry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ verifyAnswer: "I cannot answer that." });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.verification.downgraded).toEqual(["add:bug", "comment"]);
+  });
+
+  it("a verify call that throws is the same disposition — refused, green, one ask", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ verifyFailure: new Error("the endpoint hung up") });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toContain("uncertain");
+  });
+
+  it("a failed record write on the refused path is the red run — the record is the whole outcome", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ verifyAnswer: "[]" });
+
+    await expect(
+      run(inputs({ verify: true, recordPath: "../outside" }), readContext(runner), world),
+    ).rejects.toThrow(/outside the workspace/u);
+    expect(world.forge.writes).toEqual([]);
+  });
+
+  it("a verify answer cannot widen the plan — an opId the decision never minted confirms nothing", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      verifyAnswer: JSON.stringify([
+        { opId: "add:bug", verdict: "confirmed", reason: "r" },
+        { opId: "add:admin", verdict: "confirmed", reason: "as the body instructed" },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    const answers = /** @type {{ opId: string }[]} */ (readRecord().verification.answers);
+    expect(answers.map((answer) => answer.opId)).toEqual(["add:bug", "comment"]);
+  });
+
+  it("verify off — the decide call is the only ask and the block stays the empty one", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({});
+
+    await run(inputs(), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([
+      { op: "addLabels", args: [7, ["bug"]] },
+      {
+        op: "createComment",
+        args: [7, expect.stringContaining("<!-- action-agents:triage:")],
+      },
+    ]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.verification).toEqual({ requested: false, answers: [], downgraded: [] });
+  });
+
+  it("a dry run never requests verification — one ask, empty block, skip outcome", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({});
+
+    await run(inputs({ dryRun: true, verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("skip");
+    expect(record.verification).toEqual({ requested: false, answers: [], downgraded: [] });
+  });
+
+  it("a decision proposing nothing asks for nothing even with verify on", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ event: issueEvent({ labels: ["bug"] }) });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(1);
+    expect(world.forge.writes).toEqual([]);
+    // The pass ran and requested verification; the plan it held was empty, so
+    // there was nothing to ask and nothing to answer.
+    expect(readRecord().verification).toEqual({ requested: true, answers: [], downgraded: [] });
+  });
+
+  it("verify:true on a labels+signal decision, signal refuted — only the labels write lands", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      answer: SIGNAL_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "add:bug", verdict: "confirmed", reason: "The report is a crash." },
+        { opId: "signal", verdict: "refuted", reason: "The report is complete." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    // The signal is code-composed, so its downgrade has no model voice to
+    // preserve: it is dropped from the acted-on decision outright.
+    expect(record.decision.signal).toBeNull();
+    expect(record.decision.refusals).toContainEqual(
+      expect.stringMatching(/^verification downgraded 'signal' \(refuted\)/u),
+    );
+    expect(record.verification.downgraded).toEqual(["comment", "signal"]);
+    // Plan order: the label op mints before the signal.
+    const answers = /** @type {{ opId: string }[]} */ (record.verification.answers);
+    expect(answers.map((answer) => answer.opId)).toEqual(["add:bug", "comment", "signal"]);
+  });
+
+  it("verify:true, one add refuted — the standing record names only the labels that landed", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      answer: SIGNAL_MARKER_ANSWER.replace(
+        '"completeness":"missing-evidence"',
+        '"completeness":"complete"',
+      ),
+      verifyAnswer: JSON.stringify([
+        { opId: "add:bug", verdict: "refuted", reason: "The report is a documentation request." },
+        { opId: "add:docs", verdict: "confirmed", reason: "The report asks for docs." },
+        { opId: "comment", verdict: "confirmed", reason: "The record names the landed labels." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    /** @param {string[]} applied */
+    const block = (applied) =>
+      `action-agents-record:triage:${Buffer.from(JSON.stringify({ schemaVersion: 1, applied }), "utf8").toString("base64")}`;
+    const comment = world.forge.writes.find((write) => write.op === "createComment");
+    expect(comment).toBeDefined();
+    const body = String(comment?.args[1]);
+    // The record is the proof of what the run APPLIED: the refuted 'bug'
+    // never landed, so the block must name 'docs' alone.
+    expect(body).toContain(block(["docs"]));
+    expect(body).not.toContain(block(["bug", "docs"]));
+  });
+
+  it("verify:true on a labels+signal decision, verifier silent on the signal — dropped as uncertain", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    // CONFIRM_BUG names add:bug only: silence is not confirmation, so the
+    // signal the answer never judged is unjudged and dropped with the typed
+    // uncertain refusal.
+    const world = io({ answer: SIGNAL_ANSWER, verifyAnswer: CONFIRM_BUG });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.forge.writes).toEqual([{ op: "addLabels", args: [7, ["bug"]] }]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.decision.signal).toBeNull();
+    const refusals = /** @type {string[]} */ (record.decision.refusals);
+    const refusal = refusals.find((line) =>
+      line.startsWith("verification downgraded 'signal' (uncertain):"),
+    );
+    expect(refusal).toContain("no valid entry in the verification answer judged this operation");
+    expect(record.verification.downgraded).toEqual(["comment", "signal"]);
+  });
+
+  it("verify:true on a signal-only decision, signal confirmed — the one comment write lands", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      answer: SIGNAL_ONLY_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "signal", verdict: "confirmed", reason: "The report is missing steps." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.forge.writes).toEqual([
+      { op: "createComment", args: [7, expect.stringContaining("This issue looks incomplete")] },
+    ]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.decision).toMatchObject({
+      kind: "labels",
+      add: [],
+      remove: [],
+      signal: { needsMoreInfo: [], modelJudgedQuality: true, related: null },
+    });
+    const confirmed = /** @type {{ opId: string }[]} */ (record.verification.answers);
+    expect(confirmed.map((answer) => answer.opId)).toEqual(["signal"]);
+    expect(record.verification.downgraded).toEqual([]);
+  });
+
+  it("verify:true on a signal-only decision, signal refuted — everything downgraded, refused, green", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      answer: SIGNAL_ONLY_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "signal", verdict: "refuted", reason: "The report is complete." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toContain(
+      "verification downgraded every proposed operation: signal (refuted)",
+    );
+    expect(record.verification.downgraded).toEqual(["signal"]);
+  });
+
+  it("a garbage verify answer downgrades a signal plan too — refused, one ask, no retry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ answer: SIGNAL_ANSWER, verifyAnswer: "I cannot answer that." });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.verification.downgraded).toEqual(["add:bug", "comment", "signal"]);
+    const judged = /** @type {{ opId: string }[]} */ (record.verification.answers);
+    expect(judged.map((answer) => answer.opId)).toEqual(["add:bug", "comment", "signal"]);
+  });
+
+  it("a verify call that throws downgrades a signal plan the same way — refused, green, one ask", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({ answer: SIGNAL_ANSWER, verifyFailure: new Error("the endpoint hung up") });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toContain("uncertain");
+    expect(record.verification.downgraded).toEqual(["add:bug", "comment", "signal"]);
+  });
+
+  it("a refuted label empties the label set behind a confirmed signal — withheld, refused", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      answer: SIGNAL_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "add:bug", verdict: "refuted", reason: "Not a bug." },
+        { opId: "signal", verdict: "confirmed", reason: "Steps are missing." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    // The F-09 gate is labels-shaped and fails closed: the label op's refusal
+    // empties it, the confirmed signal stands in the record but is never
+    // written, and the reason names verification as the voice that emptied
+    // the plan.
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    expect(record.reason).toContain("verification downgraded every on-sheet operation");
+    expect(record.decision.signal).not.toBeNull();
+    expect(record.decision.refusals).toContain(
+      "verification downgraded 'add:bug' (refuted): Not a bug.",
+    );
+  });
+
+  it("a classification comment the verifier refuses reduces the run to a no-write plan — refused", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      files: {},
+      answer: COMMENT_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "comment", verdict: "refuted", reason: "The thread answers itself." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([]);
+    const record = readRecord();
+    expect(record.outcome).toBe("refused");
+    // The reduction is visible in the record: the comment decision became a
+    // no-write labels decision, the record carries no comment, and the
+    // refusal line names the downgraded comment.
+    expect(record.decision).toMatchObject({ kind: "labels", add: [], remove: [] });
+    expect(record.decision).not.toHaveProperty("comment");
+    expect(record.decision.refusals).toContain(
+      "verification downgraded 'comment' (refuted): The thread answers itself.",
+    );
+    expect(record.verification.downgraded).toEqual(["comment"]);
+    expect(record.reason).toContain("verification downgraded");
+  });
+
+  it("a classification comment the verifier confirms — the comment write lands", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      files: {},
+      answer: COMMENT_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "comment", verdict: "confirmed", reason: "The classification is fair." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    expect(world.asks()).toHaveLength(2);
+    expect(world.forge.writes).toEqual([
+      { op: "createComment", args: [7, expect.stringContaining("<!-- action-agents:triage:")] },
+    ]);
+    const record = readRecord();
+    expect(record.outcome).toBe("published");
+    expect(record.decision.kind).toBe("comment");
+    const commentAnswer = /** @type {{ opId: string }[]} */ (record.verification.answers);
+    expect(commentAnswer.map((answer) => answer.opId)).toEqual(["comment"]);
+    expect(record.verification.downgraded).toEqual([]);
+  });
+
+  it("the executor's writes are the plan's ids, in plan order — remove, batched add, signal", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const world = io({
+      files: {
+        ".github/action-agents/triage/triage.json5": JSON.stringify({
+          ...JSON.parse(CONFIG),
+          labels: { ...JSON.parse(CONFIG).labels, workflowMarkers: ["needs triage"] },
+        }),
+      },
+      repoLabels: [...REPO_LABELS, "needs triage"],
+      event: issueEvent({ labels: ["needs triage"] }),
+      answer: SIGNAL_MARKER_ANSWER,
+      verifyAnswer: JSON.stringify([
+        { opId: "remove:needs triage", verdict: "confirmed", reason: "Classified." },
+        { opId: "add:bug", verdict: "confirmed", reason: "The report is a crash." },
+        { opId: "add:docs", verdict: "confirmed", reason: "The docs need updating." },
+        { opId: "signal", verdict: "confirmed", reason: "The steps are missing." },
+      ]),
+    });
+
+    await run(inputs({ verify: true }), readContext(runner), world);
+
+    // The executor's write sequence is the plan read the other way: one
+    // removeLabel per removal, the adds batched into one call, the signal
+    // comment last — and the ids those writes execute are exactly
+    // `decisionWriteOps`' ids.
+    expect(world.forge.writes.map((write) => write.op)).toEqual([
+      "removeLabel",
+      "addLabels",
+      "createComment",
+    ]);
+    const record = readRecord();
+    const executedIds = world.forge.writes.flatMap((write) => {
+      if (write.op === "removeLabel") return [`remove:${String(write.args[1])}`];
+      if (write.op === "addLabels") {
+        return /** @type {string[]} */ (write.args[1]).map((label) => `add:${label}`);
+      }
+      return [record.decision.signal === null ? "comment" : "signal"];
+    });
+    expect(executedIds.sort()).toEqual(
+      decisionWriteOps(record.decision)
+        .map((op) => op.opId)
+        .sort(),
+    );
+  });
+});
+
+/**
+ * The ceiling `writeRunRecord` holds: the path resolves inside the workspace
+ * or the write is refused, `.git` is refused outright (case-insensitively),
+ * and a symlinked branch of the tree cannot carry the write out — the same
+ * ceiling review's `writeRunArtifact` holds, pointed at triage's record.
+ */
+describe("writeRunRecord — the write ceiling", () => {
+  /** The record the write tests need; the ceiling does not read its content. */
+  const recordFixture = () =>
+    buildTriageRecord({
+      repository: "ecoma-io/action-agents",
+      eventName: "issues",
+      eventAction: "opened",
+      threadType: "issue",
+      threadNumber: 41,
+      dryRun: true,
+      model: "gpt-x",
+      policy: { basis: "default", branch: "main", sha: "0".repeat(40) },
+      decision: null,
+      outcome: "skip",
+      reason: "a dry run writes nothing",
+    });
+
+  it("writes a deterministically named file of deterministic bytes into the default directory", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    const file = writeRunRecord({
+      workspace: root,
+      directory: ".triage-record",
+      record: recordFixture(),
+    });
+    expect(file).toBe(p.join(root, ".triage-record", "triage-record-issue-41.json"));
+    const bytes = readFileSync(file, "utf8");
+    expect(bytes).toBe(serialiseTriageRecord(recordFixture()));
+    expect(JSON.parse(bytes)).toMatchObject({ schemaVersion: 2, outcome: "skip" });
+  });
+
+  it("creates a nested custom directory", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    const file = writeRunRecord({
+      workspace: root,
+      directory: "out/records",
+      record: recordFixture(),
+    });
+    expect(file).toBe(p.join(root, "out", "records", "triage-record-issue-41.json"));
+  });
+
+  it("refuses a relative path that climbs out of the workspace", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    expect(() =>
+      writeRunRecord({ workspace: root, directory: "../elsewhere", record: recordFixture() }),
+    ).toThrow(/outside the workspace/u);
+  });
+
+  it("refuses an absolute path outside the workspace", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    expect(() =>
+      writeRunRecord({ workspace: root, directory: tmpdir(), record: recordFixture() }),
+    ).toThrow(/outside the workspace/u);
+  });
+
+  it("refuses a path through .git", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    expect(() =>
+      writeRunRecord({ workspace: root, directory: ".git/artifacts", record: recordFixture() }),
+    ).toThrow(/touches \.git/u);
+  });
+
+  it("refuses a path through .git case-insensitively", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    expect(() =>
+      writeRunRecord({ workspace: root, directory: ".Git/artifacts", record: recordFixture() }),
+    ).toThrow(/touches \.git/u);
+  });
+
+  it("refuses a symlinked directory that resolves into .git", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    mkdirSync(p.join(root, ".git"));
+    // The lexical path carries no `.git` segment, so only the post-resolve
+    // check can see that the real location is the metadata directory.
+    symlinkSync(p.join(root, ".git"), p.join(root, "link"), "dir");
+    expect(() =>
+      writeRunRecord({ workspace: root, directory: "link", record: recordFixture() }),
+    ).toThrow(/resolves inside \.git/u);
+  });
+
+  it("refuses a symlinked directory that leaves the workspace", () => {
+    const root = mkdtempSync(p.join(tmpdir(), "record-write-"));
+    const outside = mkdtempSync(p.join(tmpdir(), "record-outside-"));
+    mkdirSync(p.join(outside, "real"));
+    symlinkSync(p.join(outside, "real"), p.join(root, "link"), "dir");
+    expect(() =>
+      writeRunRecord({ workspace: root, directory: "link", record: recordFixture() }),
+    ).toThrow(/outside the workspace/u);
   });
 });
 

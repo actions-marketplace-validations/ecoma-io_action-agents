@@ -12,8 +12,10 @@ import {
   LIFECYCLE_OF_VERDICT,
   PUBLISHED_LIFECYCLE_STATES,
   VERDICT_REASON_CHARS,
+  EVIDENCE_EXCERPT_CHARS,
   EXCERPT_LINE_CHARS,
 } from "./verify.mjs";
+import { contentDigest } from "./digest.mjs";
 import { createEvidence, FRAMING } from "#core/untrusted.mjs";
 
 const READS = { "src/a.mjs": "line1\nline2\nline3\n" };
@@ -35,7 +37,14 @@ function makePolicy({ strategy = "standard", lanes = {}, reads = READS } = {}) {
  * @returns {import("./answer.mjs").Finding}
  */
 function finding(over = {}) {
-  return { severity: "concern", file: "src/a.mjs", line: 2, message: "off-by-one", ...over };
+  return {
+    severity: "concern",
+    kind: "correctness",
+    file: "src/a.mjs",
+    line: 2,
+    message: "off-by-one",
+    ...over,
+  };
 }
 
 describe("planVerification", () => {
@@ -122,35 +131,94 @@ describe("planVerification", () => {
     );
     expect(anchorLine?.endsWith("…[truncated]")).toBe(true);
   });
+
+  it("digests the raw window bytes the verifier judged", () => {
+    const lines = Array.from({ length: 10 }, (_, index) => `line${String(index + 1)}`);
+    const content = `${lines.join("\n")}\n`;
+    const plan = planVerification(
+      [finding({ line: 5 })],
+      makePolicy({ reads: { "src/a.mjs": content } }),
+    );
+    const evidence = plan.items[0]?.evidence;
+    if (!evidence) throw new Error("expected the plannable finding to carry evidence");
+    const window = lines.slice(1, 8).join("\n");
+    expect(evidence.digest).toBe(contentDigest(window));
+    expect(evidence.lineStart).toBe(2);
+    expect(evidence.lineEnd).toBe(8);
+  });
+
+  it("bounds the retention excerpt at the declared cap, sanitised — never the numbered prompt excerpt", () => {
+    const lines = ["const first = 1;", "@user look at <b>this</b>", "const third = 3;"];
+    const content = lines.join("\n");
+    const plan = planVerification(
+      [finding({ line: 2 })],
+      makePolicy({ reads: { "src/a.mjs": content } }),
+    );
+    const evidence = plan.items[0]?.evidence;
+    if (!evidence) throw new Error("expected the plannable finding to carry evidence");
+    expect(evidence.retentionExcerpt.length).toBeLessThanOrEqual(EVIDENCE_EXCERPT_CHARS);
+    expect(evidence.retentionExcerpt).toContain("@‌user");
+    expect(evidence.retentionExcerpt).toContain("&lt;b>");
+    expect(evidence.retentionExcerpt).not.toContain("1: ");
+    expect(evidence.retentionExcerpt).not.toBe(evidence.excerpt);
+  });
 });
 
 describe("parseVerdict", () => {
   it("accepts a well-formed verdict", () => {
-    const parsed = parseVerdict('{"verdict":"confirmed","reason":"the line is correct"}');
-    expect(parsed).toEqual({ ok: true, verdict: "confirmed", reason: "the line is correct" });
+    const parsed = parseVerdict(
+      '{"verdict":"confirmed","kind":"correctness","reason":"the line is correct"}',
+    );
+    expect(parsed).toEqual({
+      ok: true,
+      verdict: "confirmed",
+      kind: "correctness",
+      reason: "the line is correct",
+    });
   });
 
   it("accepts a fenced verdict", () => {
-    const parsed = parseVerdict('```json\n{"verdict":"refuted","reason":"no"}\n```');
-    expect(parsed).toEqual({ ok: true, verdict: "refuted", reason: "no" });
+    const parsed = parseVerdict(
+      '```json\n{"verdict":"refuted","kind":"correctness","reason":"no"}\n```',
+    );
+    expect(parsed).toEqual({ ok: true, verdict: "refuted", kind: "correctness", reason: "no" });
   });
 
   it("refuses an unknown key", () => {
-    const parsed = parseVerdict('{"verdict":"confirmed","reason":"ok","confidence":1}');
+    const parsed = parseVerdict(
+      '{"verdict":"confirmed","kind":"correctness","reason":"ok","confidence":1}',
+    );
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.defect).toContain("confidence");
   });
 
   it("refuses a missing reason", () => {
-    const parsed = parseVerdict('{"verdict":"confirmed"}');
+    const parsed = parseVerdict('{"verdict":"confirmed","kind":"correctness"}');
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.defect).toContain("reason");
   });
 
   it("refuses a verdict outside the vocabulary", () => {
-    const parsed = parseVerdict('{"verdict":"partially","reason":"x"}');
+    const parsed = parseVerdict('{"verdict":"partially","kind":"correctness","reason":"x"}');
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.defect).toContain("vocabulary");
+  });
+
+  it("refuses a missing kind — the verifier must state what it judged", () => {
+    const parsed = parseVerdict('{"verdict":"confirmed","reason":"x"}');
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.defect).toContain("kind");
+  });
+
+  it("refuses a kind outside the closed vocabulary", () => {
+    const parsed = parseVerdict('{"verdict":"confirmed","kind":"naming","reason":"x"}');
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.defect).toContain("vocabulary");
+  });
+
+  it("refuses a non-string kind", () => {
+    const parsed = parseVerdict('{"verdict":"confirmed","kind":7,"reason":"x"}');
+    expect(parsed.ok).toBe(false);
   });
 
   it("refuses a non-string verdict", () => {
@@ -159,12 +227,14 @@ describe("parseVerdict", () => {
   });
 
   it("refuses an empty reason", () => {
-    const parsed = parseVerdict('{"verdict":"confirmed","reason":"   "}');
+    const parsed = parseVerdict('{"verdict":"confirmed","kind":"correctness","reason":"   "}');
     expect(parsed.ok).toBe(false);
   });
 
   it("sanitises the reason — mentions broken, tags escaped", () => {
-    const parsed = parseVerdict('{"verdict":"confirmed","reason":"@user said <b>hi</b>"}');
+    const parsed = parseVerdict(
+      '{"verdict":"confirmed","kind":"correctness","reason":"@user said <b>hi</b>"}',
+    );
     expect(parsed.ok).toBe(true);
     if (parsed.ok) {
       expect(parsed.reason).toContain("@\u200Cuser");
@@ -173,7 +243,9 @@ describe("parseVerdict", () => {
   });
 
   it("caps a long reason at the declared bound, marked not silent", () => {
-    const parsed = parseVerdict(`{"verdict":"confirmed","reason":"${"r".repeat(1000)}"}`);
+    const parsed = parseVerdict(
+      `{"verdict":"confirmed","kind":"correctness","reason":"${"r".repeat(1000)}"}`,
+    );
     expect(parsed.ok).toBe(true);
     if (parsed.ok) {
       expect(parsed.reason.length).toBeLessThanOrEqual(
@@ -181,6 +253,59 @@ describe("parseVerdict", () => {
       );
       expect(parsed.reason.endsWith("…[truncated]")).toBe(true);
     }
+  });
+});
+
+describe("verification kind binding", () => {
+  const plannedFinding = finding();
+  const plan = planVerification([plannedFinding], makePolicy());
+
+  it("a verdict naming the claimed kind binds and resolves the finding normally", () => {
+    const applied = applyVerdicts(
+      [plannedFinding],
+      [{ id: "1", verdict: "confirmed", kind: "correctness", reason: "holds" }],
+      plan,
+    );
+    expect(applied.findings[0]).toMatchObject({
+      id: "1",
+      kind: "correctness",
+      lifecycle: "confirmed",
+      verdict: "confirmed",
+    });
+    expect(applied.refusals).toHaveLength(0);
+  });
+
+  it("a claimed/verified kind mismatch demotes the finding — it is not confirmed", () => {
+    const applied = applyVerdicts(
+      [plannedFinding],
+      [{ id: "1", verdict: "confirmed", kind: "style", reason: "judged as naming" }],
+      plan,
+    );
+    expect(applied.findings[0]).toEqual({
+      ...plannedFinding,
+      kind: "style",
+      id: "1",
+      lifecycle: "unresolved",
+      reason: "the answer claimed kind 'correctness' but the verifier judged kind 'style'",
+    });
+    expect(applied.refusals).toEqual([
+      "the verdict for finding 1 names kind 'style' where the answer claimed 'correctness' — " +
+        "refused, never mapped onto a claim it does not name",
+    ]);
+  });
+
+  it("a demoting verdict binds the verified kind and still refuses, for refuted too", () => {
+    const applied = applyVerdicts(
+      [plannedFinding],
+      [{ id: "1", verdict: "refuted", kind: "security", reason: "judged as exposure" }],
+      plan,
+    );
+    expect(applied.findings[0]).toMatchObject({
+      kind: "security",
+      lifecycle: "unresolved",
+    });
+    expect(applied.findings[0]?.verdict).toBeUndefined();
+    expect(applied.refusals).toHaveLength(1);
   });
 });
 
@@ -194,10 +319,39 @@ describe("applyVerdicts", () => {
       [{ id: "1", verdict: "confirmed", reason: "holds" }],
       plan,
     );
+    const evidence = plan.items[0]?.evidence;
+    if (!evidence) throw new Error("expected the planned finding to carry evidence");
     expect(applied.findings).toEqual([
-      { ...plannedFinding, id: "1", lifecycle: "confirmed", verdict: "confirmed", reason: "holds" },
+      {
+        ...plannedFinding,
+        id: "1",
+        lifecycle: "confirmed",
+        verdict: "confirmed",
+        reason: "holds",
+        evidence: { digest: evidence.digest, excerpt: evidence.retentionExcerpt },
+      },
     ]);
     expect(applied.refusals).toHaveLength(0);
+  });
+
+  it("a bound verdict's evidence is the window's digest and its bounded retention excerpt", () => {
+    const applied = applyVerdicts(
+      [plannedFinding],
+      [{ id: "1", verdict: "refuted", reason: "the line is correct" }],
+      plan,
+    );
+    const evidence = plan.items[0]?.evidence;
+    if (!evidence) throw new Error("expected the planned finding to carry evidence");
+    expect(applied.findings[0]?.evidence).toEqual({
+      digest: evidence.digest,
+      excerpt: evidence.retentionExcerpt,
+    });
+    const appliedAgain = applyVerdicts(
+      [plannedFinding],
+      [{ id: "1", verdict: "refuted", reason: "the line is correct" }],
+      plan,
+    );
+    expect(appliedAgain.findings[0]?.evidence).toEqual(applied.findings[0]?.evidence);
   });
 
   it("publishes a refuted finding as refuted, its reason riding along — never deleted", () => {
@@ -206,6 +360,8 @@ describe("applyVerdicts", () => {
       [{ id: "1", verdict: "refuted", reason: "the line is correct" }],
       plan,
     );
+    const evidence = plan.items[0]?.evidence;
+    if (!evidence) throw new Error("expected the planned finding to carry evidence");
     expect(applied.findings).toEqual([
       {
         ...plannedFinding,
@@ -213,6 +369,7 @@ describe("applyVerdicts", () => {
         lifecycle: "refuted",
         verdict: "refuted",
         reason: "the line is correct",
+        evidence: { digest: evidence.digest, excerpt: evidence.retentionExcerpt },
       },
     ]);
   });
@@ -223,6 +380,8 @@ describe("applyVerdicts", () => {
       [{ id: "1", verdict: "uncertain", reason: "cannot decide" }],
       plan,
     );
+    const evidence = plan.items[0]?.evidence;
+    if (!evidence) throw new Error("expected the planned finding to carry evidence");
     expect(applied.findings).toEqual([
       {
         ...plannedFinding,
@@ -230,6 +389,7 @@ describe("applyVerdicts", () => {
         lifecycle: "unresolved",
         verdict: "uncertain",
         reason: "cannot decide",
+        evidence: { digest: evidence.digest, excerpt: evidence.retentionExcerpt },
       },
     ]);
   });
@@ -244,6 +404,7 @@ describe("applyVerdicts", () => {
         reason: "no verdict was recorded for this finding",
       },
     ]);
+    expect(applied.findings[0]).not.toHaveProperty("evidence");
   });
 
   it("a finding the plan could not evidence publishes unresolved with the skip's reason", () => {
@@ -256,6 +417,7 @@ describe("applyVerdicts", () => {
     expect(applied.findings).toEqual([
       { ...unevidenced, lifecycle: "unresolved", reason: skip.reason },
     ]);
+    expect(applied.findings[0]).not.toHaveProperty("evidence");
   });
 
   it("an unplanned finding publishes with no lifecycle at all — verification never applied to it", () => {
@@ -353,6 +515,8 @@ describe("verifierMessages", () => {
         lineStart: 1,
         lineEnd: 3,
         excerpt: "1: line1\n2: line2\n3: line3",
+        digest: contentDigest("line1\nline2\nline3"),
+        retentionExcerpt: "line1\nline2\nline3",
       },
     };
     const messages = verifierMessages(item, evidence);

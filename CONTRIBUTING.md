@@ -48,10 +48,10 @@ harmonise/action.yaml harmonise/src/
 
 Each directory beside `core/` is a whole action: the `action.yaml` a consumer
 names in `uses:`, and the source that runs. A consumer writes
-`ecoma-io/action-agents/review@v0.1`, which is that directory and nothing else.
+`ecoma-io/action-agents/review@v0.11`, which is that directory and nothing else.
 
 The root `action.yml` is a composite stub that always fails with guidance
-pointing to the real actions — it exists so that `ecoma-io/action-agents@v0.1`
+pointing to the real actions — it exists so that `ecoma-io/action-agents@v0.11`
 resolves against a tag (following the
 [github/codeql-action](https://github.com/github/codeql-action) pattern). It is
 not a runnable action and must never become one.
@@ -166,6 +166,7 @@ them — not in anticipation that one might.
 | `pnpm check-docs-links`         | Every markdown link, prose `docs/…` citation, and path named in a `.yml`/`.yaml` resolves                                                               |
 | `pnpm check-anchors`            | Every `(file#fragment)` link resolves against a heading that is really there — duplicate headings included                                              |
 | `pnpm check-uses-refs`          | Every documented `uses: ecoma-io/action-agents/<action>@<ref>` resolves against a tag that exists, and an action that ships at it                       |
+| `pnpm check-action-pins`        | Every pin the covered documents show matches `tools/action-pins.json`, in both directions — an undeclared pin and a stale declaration both fail         |
 | `pnpm check-action-inputs`      | Every `action.yaml` and the code behind it declare and read the same inputs — in both directions                                                        |
 | `pnpm check-workflow-inputs`    | Every workflow under `.github/workflows` passes only inputs the action manifest it runs declares, and passes every required one                         |
 | `pnpm check-release-invariants` | Root stub contract, child manifests, entry points, surprise action detection, version consistency, and the CHANGELOG head matching the version files    |
@@ -177,6 +178,13 @@ them — not in anticipation that one might.
 
 Everything above except `pnpm format` and `pnpm sync-skills` is a gate. Run them
 before you push; a shorter local run just moves the red to the pull request.
+
+One gate on that list reads git: `pnpm check-uses-refs` resolves its refs
+against the repository's real tags, so a local clone needs
+`git fetch --tags --force` before a green run means anything — CI's
+full-history checkout already fetches them, which is why that gate runs in CI
+and not in pre-commit. `pnpm check-action-pins` reads no git at all, which is
+what makes it safe to run in pre-commit.
 
 Notice what is **not** on that list: there is no `build`, and no step that
 produces an artifact. That is the point of the previous two sections.
@@ -285,11 +293,13 @@ commitlint.
 the layer under them, and the things around both:
 
 `core`, `triage`, `review`, `harmonise`, `docs`, `workspace`,
-`deps`, `ci`.
+`evaluation`, `deps`, `ci`.
 
 `deps` and `ci` are on that list because Renovate writes them, and a scope list
 without them would fail commitlint on every dependency update. `workspace` is on
-it because release-please's release pull request uses it.
+it because release-please's release pull request uses it. `evaluation` covers
+the offline corpus and evaluator under `evaluation/`, which serve every action
+and none in particular.
 
 ```text
 feat(review): read the diff one file at a time instead of seeding all of it
@@ -355,6 +365,16 @@ contain a root `action.yml` so that `ecoma-io/action-agents@<tag>` resolves.
 The root action is a composite stub that fails with guidance — it is not a
 runnable action. Release validation checks its contract: `runs.using: composite`,
 no `main:` entry point, required metadata present.
+
+**The certification bar is the pre-release check.** Cutting a release claims
+the actions did not get worse, and the claim is checked, not remembered:
+archkeep verdicts green (`pnpm arch`), all gates green, the adversarial corpus
+green (`pnpm security`), and the offline thresholds met (`pnpm eval`) — the bar
+stated in full in [docs/evaluation.md](docs/evaluation.md). CI's evaluation job
+is advisory, so the last of the four is verified by hand when the release pull
+request is reviewed: it becomes a required check only after wall-clock is
+measured and the thresholds have calibration history, and it is not mechanically
+enforced until that advisory job has history.
 
 Two things about the release pull request that are not obvious:
 
@@ -464,6 +484,38 @@ the job list does not.
    Writing "none" is fine when it is true; leaving it blank is not.
 4. Keep it focused. Unrelated cleanup found along the way is welcome as its own
    pull request — mixed into this one it makes the real change unreviewable.
+
+### Keeping a change reviewable
+
+A change that this repository's review action can review **completely** is the
+practical target — not a line budget to hit or stay under. `review`'s
+`maxDiffLines` is a resource budget on what a single run will read, and the
+`applicability` size guard is an eligibility decision, so **neither is a PR-size
+rule** ([the run contract](docs/run-contract.md#the-semantics-are-frozen)). The
+guidance here is about structuring work:
+
+- prefer the **smallest coherent, independently verifiable change**; a reviewer
+  should be able to hold the whole diff in one judgement;
+- keep generated output, lockfiles and vendored files out of the diff where the
+  repository already ignores them — they are not review content;
+- when a change genuinely is large, split it along the seams a reviewer can
+  verify one at a time, rather than leaving the action to refuse or truncate;
+- a diff past `maxDiffLines` is **refused**, red, declared as capacity — it is
+  never "skipped" by default; only an _eligibility_ `run: false` decision (a bot
+  attestation or an explicit policy rule) ends green as a recorded skip, never a
+  size rule reclassifying the refusal. That is the action being honest, not a bug.
+
+**How you know a diff is the honest size** — no number hunting. The
+repository's own budget is generous for a whole small pull request:
+`maxDiffLines: 3000` is counted over the **post-ignore** universe, and the
+`ignore` set drops the lockfile, generated output and agent tooling. If the
+`review` job (`.github/workflows/review.yml`) is green, the pull request was
+**completely** reviewable — being under the budget is definitional, not
+aspirational. If the run refuses, split the pull request along reviewable
+seams rather than raising or reclassifying; a refusal is the contract
+declining to half-review, and a `refused` run is the honest, visible outcome
+(the `maxDiffLines` refusal is pinned in the semantic-boundary tests and
+raised in `review/src/run.mjs`).
 
 ### How a pull request lands
 

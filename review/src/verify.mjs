@@ -30,9 +30,18 @@
 import { oneLine } from "#core/one-line.mjs";
 import { extractObject, findingIdentity, stripFences } from "./answer.mjs";
 import { normaliseReadPath } from "./coverage.mjs";
+import { contentDigest } from "./digest.mjs";
 import { json5Parse } from "#core/json5-parse.mjs";
 import { sanitiseCommentText } from "#core/sanitise.mjs";
 import { createEvidence } from "#core/untrusted.mjs";
+import {
+  FINDING_KINDS,
+  PUBLISHED_LIFECYCLE_STATES,
+  VERDICTS,
+  isFindingKind,
+} from "./vocabulary.mjs";
+
+export { PUBLISHED_LIFECYCLE_STATES, VERDICTS };
 
 /** @typedef {import("./answer.mjs").Finding} Finding */
 /** @typedef {import("./config.mjs").Strategy} Strategy */
@@ -48,6 +57,9 @@ export const EXCERPT_LINE_CHARS = 200;
 /** The verdict reason's cap, in the sanitiser's own marking posture. */
 export const VERDICT_REASON_CHARS = 300;
 
+/** The artifact-retention cap for a bound verdict's evidence excerpt — issue #271's ≤300-char retention. */
+export const EVIDENCE_EXCERPT_CHARS = 300;
+
 /** The verifier's own tool-call ceiling, per finding — fixed in code, not an input. */
 export const VERIFIER_MAX_TOOL_CALLS = 40;
 
@@ -55,8 +67,6 @@ export const VERIFIER_MAX_TOOL_CALLS = 40;
 export const VERIFIER_MAX_EVIDENCE_BYTES = 128 * 2 ** 10;
 
 const EXCERPT_CUT = "…[truncated]";
-
-export const VERDICTS = /** @type {const} */ (["confirmed", "refuted", "uncertain"]);
 
 /**
  * @typedef {"confirmed" | "refuted" | "uncertain"} Verdict
@@ -76,13 +86,18 @@ export const VERDICTS = /** @type {const} */ (["confirmed", "refuted", "uncertai
 
 /**
  * The captured evidence one planned finding is judged against — cut by code
- * from the recorded read, never composed by a model.
+ * from the recorded read, never composed by a model. The digest makes the
+ * window content-checkable: sha256 over the window's raw lines (uncapped,
+ * unnumbered) joined with "\n" — the bytes the run judged, restatable by
+ * whoever re-reads the path at the recorded head.
  *
  * @typedef {object} VerificationEvidence
  * @property {string} path the recorded read's path, inventory spelling
  * @property {number} lineStart first excerpt line, 1-based, inclusive
  * @property {number} lineEnd last excerpt line, 1-based, inclusive
  * @property {string} excerpt the captured lines, numbered and capped
+ * @property {string} digest sha256 (lowercase hex) of the window's raw lines joined with "\n"
+ * @property {string} retentionExcerpt the window's raw text, sanitiser-stripped and capped at EVIDENCE_EXCERPT_CHARS — the artifact's evidence.excerpt
  */
 
 /**
@@ -114,11 +129,10 @@ export const VERDICTS = /** @type {const} */ (["confirmed", "refuted", "uncertai
  * One verdict bound to a finding by id — the id attached by code from the
  * plan, never read out of the model's answer.
  *
- * @typedef {object} VerdictEntry
  * @property {string} id
  * @property {Verdict} verdict
  * @property {string} reason sanitised and capped
- */
+ * @property {import("./vocabulary.mjs").FindingKind} [kind] the kind the answer stated — present whenever an answer survived parsing, undefined when the verdict is a wire defect, a refusal, or a transport failure
 
 /**
  * The finding lifecycle. `candidate` is a validated finding awaiting its
@@ -150,25 +164,21 @@ export const LIFECYCLE_OF_VERDICT = Object.freeze({
   uncertain: "unresolved",
 });
 
-/** The lifecycle vocabulary an artifact may record — a candidate never publishes. */
-export const PUBLISHED_LIFECYCLE_STATES = /** @type {const} */ ([
-  "confirmed",
-  "refuted",
-  "unresolved",
-]);
-
 /**
  * One finding after the pass — the validated finding untouched, its
  * verification outcome attached flat, the way provenance attaches. `id` and
  * `lifecycle` are present iff the plan scheduled the finding; a finding
  * below the strategy's threshold was never a verification candidate and
- * publishes without them, byte for byte as it arrived.
+ * publishes without them, byte for byte as it arrived. A bound verdict
+ * carries `evidence`: the content-checkable digest and bounded retention
+ * excerpt of the window the verifier judged.
  *
  * @typedef {Finding & {
  *   id?: string,
  *   lifecycle?: PublishedLifecycle,
  *   verdict?: Verdict,
  *   reason?: string,
+ *   evidence?: { digest: string, excerpt: string },
  * }} VerifiedFinding
  */
 
@@ -179,10 +189,21 @@ export const PUBLISHED_LIFECYCLE_STATES = /** @type {const} */ ([
  */
 
 /**
- * @typedef {{ ok: true, verdict: Verdict, reason: string }} ParsedVerdict
- * @typedef {{ ok: false, defect: string }} RefusedVerdict
+ * One recorded verdict keyed to a plan id. `kind` is present only when an
+ * answer survived parsing — the kind the verifier judged; its absence keeps
+ * the pre-kind shape so a legacy record still applies.
+ *
+ * @typedef {object} VerdictEntry
+ * @property {string} id the plan item the verdict binds to
+ * @property {Verdict} verdict the verifier's disposition
+ * @property {import("./vocabulary.mjs").FindingKind} [kind] the kind the verifier judged
+ * @property {string} reason the verifier's bounded, sanitised reason
  */
 
+/**
+ * @typedef {{ ok: true, verdict: Verdict, kind: import("./vocabulary.mjs").FindingKind, reason: string }} ParsedVerdict
+ * @typedef {{ ok: false, defect: string }} RefusedVerdict
+ */
 /**
  * Selects the deterministic subset of findings that must be verified before
  * publication. Pure: the plan is a function of the findings' order, the
@@ -236,8 +257,11 @@ export function planVerification(findings, policy) {
  * Cuts the captured window around one anchor line. The window is the anchor
  * plus `EXCERPT_CONTEXT_LINES` on each side, clamped to what the read
  * actually captured; each line is numbered and capped so a hostile long line
- * cannot flood the verifier's prompt. `null` when the capture ends before
- * the anchor — evidence that does not exist is not shown.
+ * cannot flood the verifier's prompt. The window's raw lines (uncapped,
+ * unnumbered, joined with "\n") are digest-hashed as the content check — the
+ * bytes the run judged, restatable from the file at the recorded head.
+ * `null` when the capture ends before the anchor — evidence that does not
+ * exist is not shown.
  *
  * @param {string} content the recorded read's raw bytes
  * @param {number} line the finding's 1-based anchor
@@ -249,6 +273,7 @@ function excerptAround(content, line) {
   if (line > lines.length) return null;
   const lineStart = Math.max(1, line - EXCERPT_CONTEXT_LINES);
   const lineEnd = Math.min(lines.length, line + EXCERPT_CONTEXT_LINES);
+  const window = lines.slice(lineStart - 1, lineEnd).join("\n");
   /** @type {string[]} */
   const excerpt = [];
   for (let n = lineStart; n <= lineEnd; n++) {
@@ -256,7 +281,13 @@ function excerptAround(content, line) {
     if (text.length > EXCERPT_LINE_CHARS) text = text.slice(0, EXCERPT_LINE_CHARS) + EXCERPT_CUT;
     excerpt.push(`${String(n)}: ${text}`);
   }
-  return { lineStart, lineEnd, excerpt: excerpt.join("\n") };
+  return {
+    lineStart,
+    lineEnd,
+    excerpt: excerpt.join("\n"),
+    digest: contentDigest(window),
+    retentionExcerpt: sanitiseCommentText(window, { maxChars: EVIDENCE_EXCERPT_CHARS }).text,
+  };
 }
 
 /**
@@ -274,6 +305,7 @@ export function verifierMessages(item, evidence = createEvidence()) {
   const claim =
     `finding id: ${item.id}\n` +
     `severity: ${item.finding.severity}\n` +
+    `claimed kind: ${item.finding.kind}\n` +
     `location: ${item.evidence.path}:${String(item.evidence.lineStart)}-${String(item.evidence.lineEnd)}` +
     ` (the finding anchors at line ${String(item.finding.line)})\n` +
     `claim: ${item.finding.message}`;
@@ -302,14 +334,18 @@ const VERIFIER_CONTRACT =
   '- "confirmed": the evidence you gathered supports the claim.\n' +
   '- "refuted": the evidence you gathered contradicts the claim — name what contradicts it.\n' +
   '- "uncertain": the evidence is insufficient to decide — name what is missing.\n' +
+  "Also state the finding's kind — the domain the claim belongs to, judged from the evidence, " +
+  "not copied from the claim's wording. The vocabulary is closed: correctness, security, " +
+  "performance, api-misuse, resource-safety, style, test-gap, documentation.\n" +
   "Answer with only this JSON object and no prose around it: " +
-  '{"verdict":"confirmed"|"refuted"|"uncertain","reason":"<one sentence>"}';
+  '{"verdict":"confirmed"|"refuted"|"uncertain","kind":"<kind>","reason":"<one sentence>"}';
 
 /**
- * Parses one verifier answer against the strict contract. The exact two keys,
- * the exact vocabulary, a non-empty string reason — everything else is
- * refused, never coerced. The reason is sanitised and capped here, so a
- * refused-then-logged reason carries the same posture as any comment text.
+ * Parses one verifier answer against the strict contract. The exact three
+ * keys, the exact verdict vocabulary, a kind from the closed finding-kind
+ * vocabulary, a non-empty string reason — everything else is refused, never
+ * coerced. The reason is sanitised and capped here, so a refused-then-logged
+ * reason carries the same posture as any comment text.
  *
  * @param {string} text the answer's content
  * @returns {ParsedVerdict | RefusedVerdict}
@@ -329,19 +365,27 @@ export function parseVerdict(text) {
   }
   const record = /** @type {Record<string, unknown>} */ (value);
   const keys = Object.keys(record);
-  const unknown = keys.filter((key) => key !== "verdict" && key !== "reason");
+  const unknown = keys.filter((key) => key !== "verdict" && key !== "kind" && key !== "reason");
   if (unknown.length > 0) {
     return { ok: false, defect: `the answer holds unknown key '${unknown[0]}'` };
   }
   if (record["verdict"] === undefined)
     return { ok: false, defect: "the answer is missing 'verdict'" };
+  if (record["kind"] === undefined) return { ok: false, defect: "the answer is missing 'kind'" };
   if (record["reason"] === undefined)
     return { ok: false, defect: "the answer is missing 'reason'" };
   const verdict = record["verdict"];
   if (verdict !== "confirmed" && verdict !== "refuted" && verdict !== "uncertain") {
     return {
       ok: false,
-      defect: `'${oneLine(String(verdict), { maxChars: 120 })}' is outside the verdict vocabulary`,
+      defect: `'${oneLine(String(verdict), { maxChars: 120, stripControlChars: true })}' is outside the verdict vocabulary`,
+    };
+  }
+  const rawKind = record["kind"];
+  if (!isFindingKind(rawKind)) {
+    return {
+      ok: false,
+      defect: `'${oneLine(String(rawKind), { maxChars: 120, stripControlChars: true })}' is outside the finding-kind vocabulary`,
     };
   }
   const rawReason = record["reason"];
@@ -349,7 +393,12 @@ export function parseVerdict(text) {
     return { ok: false, defect: "the answer's reason is empty or not a string" };
   }
   const reason = sanitiseCommentText(rawReason, { maxChars: VERDICT_REASON_CHARS }).text;
-  return { ok: true, verdict, reason };
+  return {
+    ok: true,
+    verdict,
+    kind: /** @type {import("./vocabulary.mjs").FindingKind} */ (rawKind),
+    reason,
+  };
 }
 
 /**
@@ -360,7 +409,11 @@ export function parseVerdict(text) {
  * finding shows, `uncertain` publishes as unresolved. A planned finding with
  * no recorded verdict — a crash, a lost record — fails closed to
  * `unresolved`, never to silence. A verdict naming an id outside the plan is
- * refused fail-closed — it never maps onto a finding by guess. Pure: the
+ * refused fail-closed — it never maps onto a finding by guess. A verdict
+ * naming a kind other than the claim's own never confirms either: the
+ * verified kind is bound into the finding and the finding is demoted to
+ * `unresolved` — the answer did not confirm the claim as made, and code
+ * never remaps one domain onto another to make it confirm. Pure: the
  * same findings, verdicts and plan always yield the same states in the same
  * order, and no model-authored text can move a state — only a parsed verdict
  * in the closed vocabulary can.
@@ -379,13 +432,19 @@ export function applyVerdicts(findings, verdicts, plan) {
   for (const entry of verdicts) {
     if (typeof entry?.id !== "string" || !byId.has(entry.id)) {
       refusals.push(
-        `a verdict names finding id '${oneLine(String(entry?.id), { maxChars: 120 })}', which is not in the plan — ` +
+        `a verdict names finding id '${oneLine(String(entry?.id), { maxChars: 120, stripControlChars: true })}', which is not in the plan — ` +
           `refused, never mapped by guess`,
       );
       continue;
     }
     if (!VERDICTS.includes(entry.verdict)) {
       refusals.push(`the verdict for finding ${entry.id} is outside the vocabulary — refused`);
+      continue;
+    }
+    if (entry.kind !== undefined && !FINDING_KINDS.includes(entry.kind)) {
+      refusals.push(
+        `the verdict for finding ${entry.id} names a kind outside the vocabulary — refused`,
+      );
       continue;
     }
     decided.set(entry.id, entry);
@@ -408,12 +467,32 @@ export function applyVerdicts(findings, verdicts, plan) {
         });
         continue;
       }
+      if (entry.kind !== undefined && entry.kind !== finding.kind) {
+        refusals.push(
+          `the verdict for finding ${entry.id} names kind '${entry.kind}' where the answer claimed '${finding.kind}' — ` +
+            `refused, never mapped onto a claim it does not name`,
+        );
+        published.push({
+          ...finding,
+          kind: entry.kind,
+          id,
+          lifecycle: "unresolved",
+          reason: `the answer claimed kind '${finding.kind}' but the verifier judged kind '${entry.kind}'`,
+        });
+        continue;
+      }
       published.push({
         ...finding,
         id,
         lifecycle: LIFECYCLE_OF_VERDICT[entry.verdict],
         verdict: entry.verdict,
         reason: entry.reason,
+        evidence: {
+          digest: /** @type {import("./verify.mjs").VerificationItem} */ (byId.get(id)).evidence
+            .digest,
+          excerpt: /** @type {import("./verify.mjs").VerificationItem} */ (byId.get(id)).evidence
+            .retentionExcerpt,
+        },
       });
       continue;
     }

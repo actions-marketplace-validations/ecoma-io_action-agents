@@ -1,0 +1,578 @@
+# Run contract
+
+What a run of any action here is: one subject, one policy pin, a bounded model
+call, a decision the code owns, and a terminal state from a closed vocabulary.
+This page is the durable home of that vocabulary, the failure taxonomy, the
+concurrency discipline, the state-separation rule, and the seventeen invariants
+the architecture is judged on.
+
+Recorded 2026-09-03; amended 2026-09-13 (#529 — architecture evidence at
+runtime: the recipe laws, the architecture gate and family, the reason
+taxonomy, the waiver-time sentence; #521 — each model ask's facts in triage's
+record: the `modelAttempts` field, its per-attempt outcome vocabulary, and
+the status-and-bytes facts that ride it; #516 — F-09's review arm names the
+no-JSON bounded retry and its `refusal-class` cue); owned by the repository
+maintainers; revisit when an action's outcome vocabulary, gate set, or write
+surface changes.
+
+## Terminal states and verdicts
+
+Every run ends in exactly one terminal state:
+
+| State       | What it means                                                                                                                                                        |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `published` | the run did what it set out to do and its writes landed                                                                                                              |
+| `partial`   | some of the run's operations applied before the run stopped — recorded, never replayed                                                                               |
+| `refused`   | the action's own ceilings declined to act — off-sheet answer, a typed deterministic refusal, a capacity ceiling                                                      |
+| `abandoned` | a fresher state superseded this one — a newer run, or the thread changed while this run was in flight; abandonment can follow a write, so state alone proves nothing |
+| `skip`      | the run had nothing to do — event out of scope, dry-run, nothing to review, an eligibility rule matched with `run: false`                                            |
+| `failed`    | a defect or an environment break; the class below names which                                                                                                        |
+
+And every run carries a verdict: `pass`, `fail`, or `unknown`.
+
+- `unknown` never passes. A run that could not fully read the world it judged
+  has no verdict, and a hollow verdict — a pass over facts nobody checked — is
+  a defect, not a degraded pass.
+- `fail` is the ceilings' verdict: a review that could not complete within its ceilings — a partial review — publishes what it concluded and stops there, its verdict records the incompleteness, and no surface of review mistakes it for a clean review. The verdict is a recording, never an enforcement; what a verdict may block, a repository decides in its own merge-protection surfaces ([ADR 006](adr/006-code-scanning-merge-enforcement.md)), not in this action.
+- `refused` is not `failed`. A refusal is the ceilings working; `failed` is a
+  defect or an environment break. Conflating them is how red herrings enter
+  dashboards.
+- Terminal state alone is never write evidence: `abandoned` and `skip` can
+  still have written, so a record carries what applied, not just how it ended.
+
+### The semantics are frozen
+
+The applicability-vs-capacity line is a contract law for every action, and the
+closed vocabulary above is the only one a run ends in:
+
+- **Eligibility and scope are independent axes.** Eligibility (the
+  `applicability` key) answers "should this review run at all?" — a matching
+  `run: false` rule ends green as `skip`, before diff accounting and before any
+  model call. Scope (`ignore`, `maxDiffLines`, path-scoped rules) answers "what
+  should the reviewer inspect once it does?" — exceeding the diff-line budget is
+  a **capacity refusal**, terminal `refused`, red. The two never borrow each
+  other's outcomes: a scope refusal stays `refused`, an eligibility skip stays
+  `skip`.
+- **`cannot review` is never encoded as `not applicable`.** Capacity exhaustion
+  — the diff past `maxDiffLines` (#355), the prompt past its headroom — ends the
+  run `refused`, loudly. It is never reclassified into a green eligibility
+  `skip`. A repository that wants huge changes reviewed refuses them honestly,
+  as capacity, as a `refused` record; only a policy decision ("we will not
+  review this class of change") is a `skip`, and it is recorded with the rule
+  and its measured numbers, so an intentional skip is never mistaken for "no
+  review needed."
+- **`refused` is not `failed`**, and `skip` is neither (state table above). A
+  dashboard that collapses the three cannot tell "the policy decided not to
+  review" from "the budget could not fit the diff" from "a defect or an
+  environment break" — three operationally different outcomes.
+
+## What today's outcomes map to
+
+| Action      | Today's outcome                                                                                                 | Contract state                                                                                                                                                                                     |
+| ----------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `triage`    | green run with writes                                                                                           | `published`                                                                                                                                                                                        |
+| `triage`    | dry-run, event-gate exit                                                                                        | `skip`                                                                                                                                                                                             |
+| `triage`    | red run                                                                                                         | `failed` or `refused` per the class                                                                                                                                                                |
+| `triage`    | a red run whose throw carries the typed deterministic refusal — a policy present but failing to validate (#472) | a `refused` record, then the red error — `run`'s catch reads the class                                                                                                                             |
+| `triage`    | the write withheld — the thread changed while the run was in flight                                             | `abandoned`                                                                                                                                                                                        |
+| `review`    | `nothing-to-review`                                                                                             | `published` (the marker-clearing write still happens; when that write loses the newer-head guard, the run ends `abandoned` and no skip record is written)                                          |
+| `review`    | `published`                                                                                                     | `published` — a Partial review publishes here too: its incompleteness rides the verdict (`fail`), never the state                                                                                  |
+| `review`    | `published-without-artifact`                                                                                    | `published` (the verdict stands; the archive's absence is a logged delivery loss, never a verdict)                                                                                                 |
+| `review`    | `dry-run`                                                                                                       | `skip`                                                                                                                                                                                             |
+| `review`    | an applicability rule matched with `run: false` (bot attestation, size guard)                                   | `skip`                                                                                                                                                                                             |
+| `review`    | `abandoned`                                                                                                     | `abandoned`                                                                                                                                                                                        |
+| `review`    | a typed deterministic refusal — its own ceilings declining to act (#355)                                        | a `refused` record, then the red error — the boundary writer reads the class                                                                                                                       |
+| `review`    | any other throw the run did not declare                                                                         | a `failed` record for the throws the boundary sees, then the red error — the boundary writer pins F-15; the entrypoint's input and context reads stay unrecorded                                   |
+| `harmonise` | commit + pull request                                                                                           | `published`                                                                                                                                                                                        |
+| `harmonise` | some pairs applied, run stopped                                                                                 | `partial`                                                                                                                                                                                          |
+| `harmonise` | dry run, or every pair already in step                                                                          | `skip`                                                                                                                                                                                             |
+| `harmonise` | a pair the run refuses — preparation or protection (#356, #358)                                                 | `partial` when other pairs published; otherwise a `refused` record when every skipped line is a refusal, a `failed` record when a defect line joins the skipped lines — the red error follows each |
+| `harmonise` | every pair refused by the script gate — arriving candidates in the wrong script (I17)                           | `partial` when other pairs published; otherwise a `refused` record when every line is the typed refusal, a `failed` record when a defect line joins — the red error follows each                   |
+| `harmonise` | a typed deterministic refusal — its own ceilings declining to act (#347)                                        | a `refused` record, then the red error — the boundary writer reads the class                                                                                                                       |
+| `harmonise` | any other throw the run did not declare                                                                         | a `failed` record, then the red error — the boundary writer pins F-15                                                                                                                              |
+
+## Failure taxonomy
+
+Fifteen classes; the class names the outcome, so the mapping is a function:
+
+| #     | Class                     | Outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | The rule it pins                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ----- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F-01  | event-name-unsupported    | `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | an unsupported event name is a defect or misconfiguration — review/triage throw                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| F-01a | event-action-unsupported  | review `failed`; triage re-triages                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | review's event gate throws — a red refusal, no artifact; triage decides an unlisted action from live state and never silently skips it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| F-02  | config-invalid/absent     | two arms, uniform per action: the validation arm — a policy present but failing to validate, pure over the parsed file — is `refused` everywhere, retyped once at the boundary (review #355, harmonise #347, triage #472); the reader arm — a configured path absent, a policy declared twice, a foreign schema major, a file that does not parse, a file past the byte cap — is `failed` for triage and review, the `failed` tier, because the reading call interleaves transport breaks a blanket retype would mislabel; harmonise's loader retypes its readers too (#347); the architecture report joins both arms (#529): absent-though-configured and past the reader's byte cap are the reader arm — `failed`, red — while an envelope that parses but disagrees with the frozen shape — a foreign schema major, the wrong tool or command, an incoherent status↔exit↔coverage table, a manifest exit the bytes contradict — is the validation arm, the typed refusal | a policy that cannot be read or does not validate is red before any model call; absent default locations are policy-empty for triage and review — no sheet, no label writes; harmonise refuses them (#347); the architecture report is read the same way — configured but unusable is red, never blind (#529)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| F-03  | policy-source-unavailable | `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | the pin must resolve before anything reads it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| F-04  | transport-5xx/429         | `failed` after retries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | retry with backoff, then stop                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| F-05  | transport-timeout         | `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | reads may retry; non-idempotent writes are pinned to one attempt                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| F-06  | auth (401/403)            | `failed`, zero writes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | a bad token is an environment break                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| F-07  | not-found-mid-write       | treated as applied                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | a 404 on delete means already gone; the thread-existence inference is named                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| F-08  | rate-limit-exhausted      | `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | backoff, then stop                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| F-09  | provider-invalid-answer   | `refused` or `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | off-sheet (deterministic) refuses; junk fails — the mapping stays a function; review's twice-failed output contract is the off-sheet arm and records `refused` (#355) — twice-failed on a shaped defect, while the no-JSON class — an answer holding no object at all — earns one bounded retry behind backoff before the third failure, and that refusal alone publishes the `refusal-class` output `model-output-unusable`, the cue a caller re-runs on (#516); in harmonise a junk answer is a defect line: it fails the run's record; of the protection layer's verdicts only the order one is not junk: a candidate that does not preserve its placeholders' order records the typed refusal (#351, #358), while the unknown-token and count-mismatch verdicts stay plain errors — the junk arm; a wrong-script candidate records it too (I17) |
+| F-10  | provider-refusal          | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | reserved, unused: no action can distinguish a refusal from junk yet                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| F-11  | ceiling-exceeded          | typed refusal, else `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | budgets exist to be enforced, not reported; harmonise's chunk budget and per-chunk payload bound raise the typed refusal — a source larger than one chunk is accepted and partitioned, never refused for size (#506); review's diff-line budget and prompt-headroom ceilings raise it too (#355)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| F-12  | subject-moved             | `abandoned` (triage, review); harmonise: `failed` — the boundary records the throw                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | head/base moved between read and write — the write is refused loudly, never hidden; triage and review record `abandoned` and stay green, harmonise's optimistic lock throws undeclared and the boundary writes the `failed` record — still red, now recorded                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| F-13  | partial-mutation          | `failed` (triage); `partial` (harmonise)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | records as `failed` with per-op accounting in the reason; harmonise's partial exit writes `partial` — some pairs published, the run stopped; a re-run re-derives from live state, never replays                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| F-14  | artifact-write-failure    | the run's own terminal verdict stands                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | the write is the logged loss: review's comment stands with verdict `unknown` on the archive; harmonise's declared points keep their verdict and stash the built record for a red boundary (#347); where the record write is the run's only outcome — a triage dry run — the loss is the red run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| F-15  | internal-unknown          | `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | an unhandled throw is a bug, and the record says so                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+A connection-level failure — the request ends before any status exists, surfacing as the `fetch failed` transport error — is F-04's class: retried under the same backoff, `failed` after retries, exactly as a 5xx (#488).
+
+## Run records
+
+Every run leaves one machine-readable record behind — a local file inside the
+runner's workspace, delivered by the workflow's upload step — so a run's
+account outlives the runner log. The contract's rules for every record:
+
+- **One record per run, at every terminal point the action declares.** A
+  landed mutation, a dry run, a terminal with nothing to write: each ends in a record. A
+  failure's posture is per action — triage records at its own terminal
+  points, failures included; harmonise's red terminals are declared too:
+  any throw its run did not declare — a config refusal, a transport break,
+  a mid-run defect — reaches the boundary writer, which records the class
+  the throw carries and lets the original error fail the step, so the
+  record never masks the throw it records: a typed deterministic refusal —
+  the action's own ceilings declining to act (F-02, F-11, a protection
+  verdict) — records `refused` (#347); every other undeclared throw records
+  `failed` (F-15). An every-pair red set is judged by its worst line, so
+  the mapping stays a function: every line a deterministic refusal records
+  `refused`, and one defect line — a transport break, a junk model answer —
+  records `failed`. Only a run that dies before it holds the facts a record
+  is built from — the entrypoint's input and context reads — and a run whose
+  record write itself fails — red at the boundary, or green at a declared
+  point under the logged-loss tier below — stay unrecorded; the upload's
+  `if-no-files-found: warn` keeps the green ones green and the miss loud —
+  a declared write that lands nowhere is never green over nothing (#378).
+  Review's failure-record path is closed: every red terminal — `refused`,
+  `failed`, `abandoned` — writes its reduced record, and the skip/dry-run
+  families are its recorded-not-enforcing twins.
+- **Byte-deterministic (I15).** No wall-clock fields; the same run facts
+  build the same bytes. Keys sorted, compact JSON, no trailing newline.
+- **Fail-closed.** The module that owns a record family validates it before
+  serialising; a shape it did not specify is refused, not coerced, and a
+  validation failure is a code bug that fails at build.
+- **Sanitised at the build sites (I14, I16).** Model or repository text a
+  record carries passes the comment sanitiser and honours its retention class
+  and cap — [ADR 003](adr/003-evidence-retention.md) states the classes.
+- **The `outcome` speaks the terminal-state vocabulary above, whole.** A word
+  outside it is a word the contract has not defined — triage and harmonise
+  write their records' `outcome` from it, and review's artifact speaks the
+  classification vocabulary its own shapes declare, mapped onto it by the
+  outcome column of the table above.
+- **Contained before it mutates; observable when it lands.** A record write
+  validates its path inside the workspace's containment boundary before any
+  filesystem mutation — no symlinked segment is traversed, `.git` never, and
+  the write's namespace cleanup runs only on the validated path (review's
+  `writeRunArtifact` holds the law; every family's write ceiling is judged
+  by it). A declared write publishes the exact file it wrote as the
+  `artifact-file` action output — on green runs and on the red boundary's
+  record alike — so an observer reads where the record landed without
+  guessing (#378).
+
+Three families exist today:
+
+| Family             | Module                         | `schemaVersion`             | Delivery glob             | Written at                                                                                                                                                                                                      |
+| ------------------ | ------------------------------ | --------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| review's artifact  | `review/src/artifact.mjs`      | 5; 6 (applicability family) | `review-artifact-*.json`  | a published comment writes the full artifact; abandonment and a dry run write their reduced artifacts; a draft run writes its skip                                                                              |
+| triage's record    | `triage/src/run-record.mjs`    | 2                           | `triage-record-*.json`    | every terminal point                                                                                                                                                                                            |
+| harmonise's record | `harmonise/src/run-record.mjs` | 3                           | `harmonise-record-*.json` | every terminal point: publication, partial exit, all-in-step skip, dry run — and the red terminals, where the boundary writer records `refused` for a typed deterministic refusal and `failed` otherwise (#347) |
+
+Triage's record fields, version 2: `schemaVersion`, `repository`, `event`
+(`eventName`, `action`), `thread` (`type`, `number`, or `null` for a run that
+died before the payload parsed), `dryRun`, `model`, `modelAttempts` (the
+facts of each model ask, version 2's addition (#521): at most the retry
+contract's two entries — one ask, one re-ask — each carrying the code-owned
+`outcome` word (`answered`, `empty`, `no-object`, `unparseable`,
+`truncated`, `unanswered`), the HTTP `status` the transport saw or the null
+of a request that never produced a response, the request body's `bytes` as
+the seam measured them or the null of a seam that reported none, and the
+provider-declared, capped `finishReason`; the empty list when the run never
+asked the model. Sizes and statuses are facts of the attempt — recorded when
+observed, never recomputed — so a run that fails on an empty answer says
+what each attempt saw, not just that it failed), `policy` (`basis`,
+`branch`, `sha`, or `null` before the source resolved), `decision` (present
+iff the run reached one: `kind`, `add`, `remove` with their code-owned
+reasons, `refusals`, sanitised capped `rationale`, `signal` with its
+sanitised related title and its capped, sanitised missing-required names),
+`outcome`, `reason`, `verification` (the block
+issue #274 froze — present, typed, validated; filled by the opt-in
+verification pass when it ran, the empty block otherwise).
+
+Triage's removal reasons are a closed code-owned vocabulary: `size` (a
+measured rung replaced), `marker` (the queue marker cleared on
+classification), `owned` (a triage-owned priority label the severity ladder
+re-derives), and `supersede` — a prior classification this run replaces on
+the proof of the action's own classification comment, the marker comment
+whose body carries a version-1 record block (`action-agents-record:triage:`
+plus base64 `{schemaVersion, applied}`) naming the labels the action applied
+when it classified. The record block is evidence, never instruction: only a
+comment authored by the token's own login counts, a malformed block is
+ignored, and an identity or listing read that cannot be resolved leaves the
+provenance empty — the run then refuses a conflicting single-valued member
+with the remediation to remove it by hand, never removes what it cannot
+prove it applied. A sheet-mode classification that applies or resolves at
+least one classification-role label upserts this comment — resolving a
+single-valued member it does not add (superseding in place) refreshes the
+block too, so the proof never names a member the thread no longer carries —
+and the record names only the labels that landed: a verification pass that
+refutes an add removes it from the block. The code-composed signal comment
+upserts under its own marker namespace (`action-agents:triage-signal:`), so
+the signal and the classification record coexist as two independent
+comments and neither's upsert can overwrite the other's.
+
+Harmonise's record fields, version 3: `schemaVersion`, `repository`,
+`eventName`, `sourceLanguage`, `dryRun`, `outcome`, a sanitised and capped
+`reason`, `pairs`
+(`selected`, `proposed`, `unchanged`, `skipped`, `failed` — the five total
+the selected schedule; `null` when the run died before its accounting was
+finalised), `pullRequest` (`number`, `created`, or `null` when the run wrote
+none), `headSha` (the base commit every read pinned to; `null` before the
+run resolved one).
+
+Review's artifact shapes, version 5 (the applicability family's shapes are
+version 6): the full published shape carries the twelve-fact body the
+builder validates; the reduced abandonment shape carries the run identity,
+the outcome sentence, and — when a comment was published before the subject
+moved — the comment id under `provenance`; the reduced dry-run shape carries
+the run identity and the outcome sentence only. The reduced red shape the
+boundary writer builds (#355) carries the run identity, the outcome sentence
+— sanitised and capped, the one review reason that interpolates a thrown
+message — and the classification the throw's class decides: `refused` for a
+typed deterministic refusal, `failed` otherwise; its `headRef` is the honest
+`null` of a run that died before the snapshot read, its `provenance` names
+the comment when one stands — on a `failed` record only; a `refused` record never
+names one — and a run with no head to name writes `no-head` in the file name's
+place. The reduced shapes name the
+execution context under `applicability` when the policy was active, and
+neither carries a policy section — nothing was read beyond the
+classification. Every shape's file name names its outcome:
+`review-artifact-`, `review-artifact-abandoned-`, `review-artifact-dry-run-`,
+`review-artifact-skip-`.
+
+The two-tier posture a record write is judged by. Where the run's own outcome
+has landed — review's comment published, triage's mutation applied,
+harmonise's pull request opened, and, since #347, harmonise's declared skip
+points (a dry run, nothing to propose) too — a failed record write is a
+logged loss, and the run keeps its verdict: review's
+`published-without-artifact` maps to `published` with verdict `unknown` on
+the archive (F-14). Where the record write is the run's only outcome — a
+triage dry run, whose skip record is the whole of what the run did — the
+loss is the red run. A harmonise record a failed write could not land is
+stashed: a red exit re-attempts that record at the boundary writer, exactly
+as it was built, so the write's failure never relabels the terminal it was
+written for — and a failure's record never masks the original error it
+records.
+Delivery is part of the same posture: the written file is published as the
+`artifact-file` action output at every terminal that declares a record, and
+a terminal that declares none logs that it did, so a missing output reads as
+"declared nothing" next to the logged loss above — never as silence (#378).
+
+## Concurrency: read-then-write, never compare-and-swap
+
+GitHub offers no compare-and-swap for labels or comments, so the discipline is
+read-then-write with windows narrowed to what the API allows — and the four
+windows that remain are named, not implied away:
+
+1. **Comment upsert** — the newer-head guard judges a snapshot taken at upsert
+   start; two runs that both list before either writes both pass the guard.
+   Same-head concurrent runs are exempt by design.
+2. **Labels** — the write diffs against a live read; the residual window is
+   that one round trip.
+3. **Harmonise publication** — own-branch writes carry a pre-write re-read and
+   a post-write verification, so a lost write is refused loudly; the base tip
+   is the remaining full-run window.
+4. **Cancellation** — `cancel-in-progress` kills a run at an arbitrary
+   operation boundary; the re-run re-derives from live state, never replays
+   the plan (the F-13 rule). The event gate joins the discipline: a skip
+   premised on the payload's label claim is arbitrated against the live
+   thread before it is written, so a marker applied in the delivery window
+   re-derives a re-triage instead of stranding the thread.
+   A sheet that declares no queue marker cannot see the queue through the
+   payload at all, so the same arbitration covers it: a surviving `labeled`
+   event whose live thread carries no classification is re-triaged — the
+   label change is the queue's only visible evidence — while a classified
+   thread's label event stays a skip (#496).
+
+Records carry the subject head so a stale record is detectable instead of
+authoritative, and every shape that carries a policy section — review's full
+and skip shapes, triage's record — pins its SHA beside it.
+
+## State separation
+
+A field carries exactly one of three state models: **epistemic** (what the
+run judged), **policy** (what the configuration allows), **human-workflow**
+(what a person is doing with the thread). Two rules keep them apart:
+
+- Never add a fourth meaning to a field that already carries one.
+- Markers stay code-only, lifecycles stay publication-scoped, the sheet stays
+  policy-only; new epistemic state gets its own fields.
+
+## The canonical review result
+
+A review's verified publication set is canonical: one shape, built once by
+`createCanonicalResult`, that the comment, the run artifact and the
+SARIF/Code Scanning projection all project from
+([ADR 004](adr/004-canonical-review-result.md),
+[ADR 006](adr/006-code-scanning-merge-enforcement.md)). Five rules
+give the shape its authority:
+
+- **Finding identity is content, not position.** A finding's fingerprint is a
+  versioned digest over its normalized path, its claim kind — a closed,
+  code-validated vocabulary the verification pass binds from evidence, as
+  epistemic as the verdicts themselves — and the full code span the reviewed bytes
+  carry at its anchor, captured by the integration boundary that reads the
+  snapshot (the canonical constructor verifies a stored fingerprint against
+  the recomputed tuple; it never reads files). The span is hashed in full —
+  truncation is a display choice, never an identity input. The tuple's
+  version moves with the identity scheme, and a stored record verifies under
+  the scheme its own version spells: pre-hardening v1 records still parse
+  and reconcile, through one documented churn at the migration — never a
+  silent invalidation. Line moves, message rewrites and severity re-grades
+  keep the identity; a rewritten span, a new file or a reclassified claim is
+  a new finding — churn reconciliation records, never enforcement drift:
+  every consumer reads the current set. Claims sharing the full key in one
+  run collapse to the first, recorded on the result.
+- **Reconciliation is code, and incomplete runs resolve nothing.** The
+  `new | persisting | moved | resolved | unresolved` vocabulary is computed
+  from artifacts; a run that could not complete its coverage never declares a
+  previous finding `resolved`. The published comment embeds the record the
+  next run reconciles against — the comment, not the artifact file, is what
+  survives between runs.
+  Recovery reads only a comment this action's own token authored — the same
+  ownership test the write applies, with the token's logins resolved before
+  the thread is read — never the newest comment carrying the marker syntax.
+- **Consequences are code, and no projection is read back as input.**
+  `unknown` and `fail` never pass — an unanswered or incomplete review is no
+  pass; an abandoned or refused run does not pass. What a repository does
+  with a confirmed finding — enforce it at merge through Code Scanning
+  protection rules, or let it stand as commentary — is the repository's
+  decision, made in its own rulesets and never in this action
+  ([ADR 006](adr/006-code-scanning-merge-enforcement.md)). The model
+  names no consequence, and no projection — comment or SARIF — is ever read
+  back as input. The one carve-out runs the other way: the published comment
+  embeds the record it projected, the next run recovers it to render the
+  cross-run labels as comment prose, and a missing or unreadable record
+  reconciles as a first run — never a consequence.
+- **Evidence is captured, never claimed.** Before publication, code reads the
+  reviewed bytes at each finding's (file, line) anchor and stores the digest
+  and capped excerpt the fingerprint is recomputable from — the capture
+  boundary the constructor's no-I/O rule leaves outside it. A capture the
+  tree cannot honour — file unreadable or outside the workspace, line out of
+  range, an empty file — refuses the finding's evidence and with it the run:
+  a `refused` record and the red error, naming file and line, never a
+  skip-and-continue that publishes a finding whose digest confirms nothing.
+  A capture the tree honours but whose span certifies nothing — the anchor
+  line is blank or whitespace-only — withholds the finding instead, through
+  the quarantine channel: counted and named in the log, rendered in the
+  comment's withheld sentence when nothing else publishes, never part of
+  the canonical result, never run-fatal — the run proceeds to the terminal
+  its gates already determined, carrying only the surviving findings. A
+  span the tree honours is still not the claim itself: before the
+  verification pass, a finding whose message quotes evidence — a span in
+  backticks or single or double quotes — must find at least one quoted
+  span inside the anchor's window (the anchor line and
+  `EXCERPT_CONTEXT_LINES` on each side, cut from the same reviewed bytes
+  the capture boundary reads, one bounded read per anchor). Quoted
+  evidence that appears nowhere in that window withholds the finding
+  through the same quarantine channel — counted and named in the log,
+  rendered in the same withheld sentence, never part of the canonical
+  result, never run-fatal, and no model call spent on it — at every
+  severity, anchor-scoped; a message that quotes nothing passes
+  vacuously, there being no quoted evidence to judge. Quotes are read at
+  word boundaries, on both ends and twice over: a quote mark flanked by
+  word characters is an apostrophe in a word, not an evidence delimiter,
+  and a quoted span counts as present only where the characters flanking
+  the match are non-word or the window's edge — `run` does not certify
+  `runTime`, `line1` does not certify `line10`. The gate stays a
+  best-effort precision filter against the honest wrong-anchor class,
+  not an adversarial one, and its residual is named: a finding that
+  quotes a word-boundary token genuinely present near whatever anchor it
+  cites passes the gate. And
+  the birth site that
+  binds the record retypes a record its own shapes reject as a typed
+  refusal (`refused`, the red error), never an undeclared crash: a terminal
+  the run has already determined is not destroyed by its record.
+- **The canonical verdict lands as recorded surfaces, and none of them is
+  the job's exit.** The verdict is `pass`, `fail` or `unknown`, and it is
+  recorded — in the run artifact, in the comment's record block, in the
+  reduced shapes the red boundary writes — never rendered as a merge
+  consequence: an incomplete review publishes its `fail` and stays green,
+  because review's surfaces record and never enforce
+  ([ADR 006](adr/006-code-scanning-merge-enforcement.md)). The SARIF
+  projection is written under `runner.temp`
+  — never the workspace — byte-identical for the same record, surfaced
+  through `sarif-path`; the upload is the consumer's step, gated on
+  `sarif-path` — only a published run uploads, so every other terminal
+  leaves the Code Scanning column empty. A result's identity is the
+  finding's fingerprint (`identity.mjs`): one string, two consumers — the
+  comment's record block anchors on it, and the projection emits it under
+  `partialFingerprints["primaryLocationLineHash"]`, the one key GitHub Code
+  Scanning consults when deduplicating alerts across uploads, beside the
+  review's own `reviewFindingFingerprint/v2` slot. Each surface is a
+  logged loss on its own failure (F-14's posture): a SARIF write
+  that does not land is reported, never a red run, and never a disguise.
+
+## Architecture evidence at runtime
+
+Amendment of 2026-09-13 (#529), recorded ahead of the code that will emit
+it — the contracts-first rule of the Archkeep runtime-integration plan
+(#518, [the design record](development/archkeep-integration-analysis.md)):
+docs name every new word before code spells it. Architecture evidence
+enters a run as a report file the consumer's workflow produced before any
+model call; the action reads it, records it, and never enforces it.
+
+**Who runs Archkeep: the consumer's workflow, never the action.** The
+action neither spawns, installs nor imports Archkeep — the
+zero-runtime-dependency law is untouched, and no new retry surface enters
+the run contract: the evidence steps are workflow steps, outside it. The
+recipe that produces the evidence lives in the consumer's workflow file,
+and five of its lines are normative here — the words a consumer's copy is
+judged against:
+
+1. **Clear, then delete.** The evidence directory is cleared before
+   capture, and the report file is deleted on any delta exit outside
+   `{1, 3}` — on `1` and `3` the envelope is the verdict carrier and
+   stays, because the reader pins the verdict to the manifest's recorded
+   exit beside the envelope's bytes, and a report deleted there would
+   land every findings run in the report-absent `incomplete` lane and
+   make the established-`fail` state unreachable. (The P0 wording of
+   this law said "any nonzero delta exit"; corrected against the landed
+   recipe in #560 — the shipped guide, the dogfood workflow and the
+   reader all landed the tolerated-exit shape.) Archkeep leaves
+   `--output` files untouched when a run dies before building an
+   envelope, so a pull-request-planted report would otherwise survive a
+   failed delta and be read as Archkeep's verdict — the one channel that
+   makes the report bytes PR-supplied. The exit file is append-only, so
+   a plant can only ever contribute a nonzero exit line: plants can make
+   evidence look worse, never better.
+2. **Tolerate exactly {1, 3}.** Exit 1 (verdict: fail) and exit 3 (no
+   verdict) are recorded, not red. Exit 2 — a usage error, a mis-wiring,
+   not a verdict — and everything else redden the step.
+3. **Capture steps never `||`, never `continue-on-error`.** A failed
+   capture is a red run: evidence absent, review never starts.
+   `continue-on-error` is not a degradation mechanism — it reopens the
+   planted-file channel of law 1 and still lands in the
+   absent-though-configured arm below.
+4. **The baseline commit is the live merge-base, fetched.** Never the
+   payload's `base.sha` alone — it can be stale, and a moved base makes
+   the delta attribute other people's merged changes to this pull request
+   as `introduced`: loud but wrong. The fetch strategy must make the
+   commit resolvable — `fetch-depth: 0` or an explicit fetch; a
+   `fetch-depth: 1` checkout makes the worktree step dead on arrival.
+5. **The manifest is freshly written** from the append-only exit file,
+   overwriting any plant, at the end of the evidence steps.
+
+**The architecture family, and its gate.** An architecture-aware run — one
+whose `architecture-report` input names a report — emits a new
+schemaVersion family of review's artifact: a six-gate table,
+`architecture` appended after `verification`, carrying the architecture
+section whose retention [ADR 003](adr/003-evidence-retention.md) states.
+Architecture-blind runs — the input unset — are byte-identical to today:
+the bare and the applicability families, every shape, every byte. The gate
+couples to the family, never to the input: a conditional gate row is
+unimplementable against the frozen-table law (I11), and a `passed: true`
+for an unrun gate would be a missing fact reading as a pass. The family's
+schemaVersion stamps are frozen at 7 bare, 8 with an applicability fact,
+decided above both of today's numbers with the design record corrected
+(#533), ahead of the code that emits it. The grounds are the lockstep law
+of `review/src/artifact.mjs`: the bare and applicability constants stamp
+the same artifact in two conditions — one numbering space, so no number
+may mean two shapes — and a 6 for the aware bare family would collide with
+today's blind-plus-applicability 6; the next free number is 7, and the
+lockstep pushes the aware applicability stamp to 8. Architecture-blind
+runs stay byte-identical on today's 5 and 6.
+
+The gate predicate: the `architecture` gate passes iff
+**evidence-established** — verdict ∈ {pass, fail} ∧ head pinned ∧ not
+stale. Never `verdict === pass`: Archkeep's `fail` (introduced violations
+exist) leaves review's verdict untouched while the artifact records it —
+review's `fail` keeps its "could not complete" meaning exactly because the
+predicate is not "found problems". `unknown` (stale or incomplete) fails
+the gate, so an architecture-aware review can never publish `pass` over
+unestablished architecture facts. The artifact records `coverage.complete`
+beside the verdict so a `fail` is never mistaken for "fully read" —
+findings are certain regardless of unread remainder; the reverse does not
+hold. Enforcement stays the consumer's — the action records, GitHub
+disposes ([ADR 006](adr/006-code-scanning-merge-enforcement.md)):
+architecture violations do not become review findings, do not enter SARIF,
+do not flip review's verdict semantics.
+
+**What absent evidence means — one taxonomy, four states.** `stale` — the
+head-side provenance commit the report pins mismatches the run's head.
+`incomplete` — exit 3, a no-verdict envelope, a report unparseable
+alongside a nonzero recorded exit. Both carry Archkeep's verdict
+`unknown`, fail the architecture gate, and publish the review as Partial
+with the reason named — neither a failure class nor a refusal: no ceiling
+declined, and a typed refusal would destroy the review for a
+wiring-quality problem; both stay reachable only through untrusted
+evidence. The third state, `absent-though-configured` — the input set and
+no report arrives — is F-02's reader arm, red, a distinct path: with the
+input configured, an absent report is deliberately never architecture-blind
+and never `unknown`. The fourth, architecture-blind — the input unset — is
+not an unknown state at all: the run of today, byte-identical.
+Exit-evidence precedence: any nonzero exit recorded in the manifest wins
+over the report's self-description — verdict `unknown` regardless of
+bytes — and the envelope's exit code must equal the manifest's recorded
+exit, a mismatch being the typed refusal: a coin-flip read is not
+admissible.
+
+**Rename pairs.** Archkeep's delta does no rename matching — a project or
+target rename reads as one introduced entry at the new name plus one
+resolved entry at the old, over identical sites — so the reader's
+normalization derives that pairing from recorded facts and carries it
+beside the raw buckets, both of which keep every entry: a move is one
+reviewable item, never an introduced/resolved wash, and never netted
+against the envelope's own arithmetic.
+
+**Cross-run waiver time.** The architecture verdict is a fact about
+(base, head, law, now), re-judged per run; the same head can legitimately
+flip verdicts across runs when a waiver expires — a semantic,
+time-dependent flip, never textual drift, and the one legitimate
+time-dependence a record carries: the architecture section stays
+byte-deterministic given the report bytes (I15). The basis fields are the
+explanation: reconciliation treats a waiver-state change between runs as
+an explicit note, not drift, and architecture facts stay out of the
+`new | persisting | moved | resolved | unresolved` vocabulary. Report
+bytes are untrusted data under the third ceiling: they enter records only
+through sanitised, capped, digest-anchored fields (I14, I16 unchanged) and
+prompts only through the framing seam.
+
+## The seventeen invariants
+
+Each names one authority: **A** architectural (archkeep-enforced), **D**
+deterministic tooling (repo-local scripts in CI), **R** runtime safety
+(app code + tests), **E** epistemic (bounded machinery + human). archkeep
+judges static facts only — it owns the A rows and none of the others.
+
+- **I1 — No action imports another; `core/` imports no action.** A —
+  `pnpm arch` (boundary rows + intent), transitively closed.
+- **I2 — Raw HTTP appears only in `core/transport/*`.** D — the HTTP-monopoly
+  script in CI.
+- **I3 — GitHub writes are issued by the forge alone.** D — the forge-monopoly
+  script plus the frozen op-list manifest, in CI.
+- **I4 — Model output never composes an API call.** R — closed sheets and
+  typed op arguments by construction; sanitiser-bounded bodies; corpus-proven.
+- **I5 — A model-picked value outside the effective sheet is refused, never
+  coerced.** R — `pnpm test`.
+- **I6 — Policy is SHA-pinned; payload SHAs never drive reads.** R.
+- **I7 — File access is confined to `GITHUB_WORKSPACE`.** R.
+- **I8 — No runtime dependencies, no build, no `dist/`; the entry points at
+  `src/index.mjs`.** D — the action-shape script plus the release-invariants
+  gate, in CI.
+- **I9 — The run artifact is byte-deterministic and fail-closed.** R.
+- **I10 — Run verdicts use the frozen vocabulary; `unknown` and `fail` never pass.** R.
+- **I11 — Review's declared gate table (conclusion, bound, coverage, provenance, verification — the architecture family appends `architecture`, after `verification`) yields a recorded verdict for each, in declared order; a missing fact is a typed refusal, never a pass. Triage and harmonise satisfy the same law without a declared gate table — typed refusals enforced sequentially, a missing fact never passes.** R.
+- **I12 — The architecture is under architecture-intent: required projects
+  exist and forbidden transitive dependencies stay absent.** A — `pnpm arch`.
+- **I13 — The boundary canary proves why it refused.** D — the canary
+  asserts the refusal names the constraint row.
+- **I14 — No record field carries content beyond its declared retention class
+  and cap.** R — the classes are ADR 003's to state.
+- **I15 — Records are byte-deterministic given the run's inputs.** R.
+- **I16 — Thread, diff and repository text enters only through the untrusted
+  framing or the sanitiser — never as instruction.** R.
+- **I17 — A published pair's translatable prose carries the configured target
+  language's script; a violation is a deterministic refusal of the pair.** R —
+  the script gate in `judgeAnswer`; `pnpm test`.
+
+The boundary law this sits on: [Doctrine](doctrine.md) and
+[ADR 001](adr/001-core-boundary.md). What a record may keep of what a run
+saw: [ADR 003](adr/003-evidence-retention.md).

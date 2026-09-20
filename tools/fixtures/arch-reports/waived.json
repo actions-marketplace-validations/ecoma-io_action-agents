@@ -1,0 +1,153 @@
+{
+  "captureExit": 0,
+  "exitCode": 0,
+  "stdoutBytes": 3047,
+  "stderrDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "repeatable": true,
+  "envelope": {
+    "schemaVersion": 2,
+    "tool": {
+      "name": "@ecoma-io/archkeep",
+      "version": "@version@"
+    },
+    "command": "delta",
+    "workspace": {
+      "root": "@tree@",
+      "provider": "native",
+      "marker": "archkeep.json",
+      "provenance": {
+        "commit": "@head-commit@",
+        "remote": null,
+        "dirty": false
+      }
+    },
+    "status": "ok",
+    "exitCode": 0,
+    "coverage": {
+      "complete": true,
+      "projects": 2,
+      "analyzedFiles": 2,
+      "imports": 1,
+      "notAnalyzed": [],
+      "blindSpots": [],
+      "notes": []
+    },
+    "result": {
+      "baseline": {
+        "path": "@tree@/base.json",
+        "tool": {
+          "name": "@ecoma-io/archkeep",
+          "version": "@version@"
+        },
+        "provider": "native",
+        "provenance": {
+          "commit": "@base-commit@",
+          "dirty": false,
+          "remote": null
+        },
+        "policyFingerprint": "c62cc2075a1a7046385536212988f8e0c0204008e46439b51b3e402313e1a2b0",
+        "records": 0,
+        "projects": 2
+      },
+      "head": {
+        "provenance": {
+          "commit": "@head-commit@",
+          "remote": null,
+          "dirty": false
+        },
+        "policyFingerprint": "c62cc2075a1a7046385536212988f8e0c0204008e46439b51b3e402313e1a2b0",
+        "records": 1,
+        "projects": 2
+      },
+      "policyChanged": false,
+      "summary": {
+        "introduced": 1,
+        "introducedWaived": 1,
+        "resolved": 0,
+        "unchanged": 0,
+        "unknown": 0,
+        "unresolvable": {
+          "introduced": 0,
+          "resolved": 0,
+          "unchanged": 0,
+          "unknown": 0
+        }
+      },
+      "violations": {
+        "introduced": [
+          {
+            "classification": "introduced",
+            "messageId": "noRelativeOrAbsoluteImportsAcrossLibraries",
+            "sourceProject": "b-lib",
+            "target": "a-lib",
+            "targetIsSpecifier": false,
+            "constraint": null,
+            "baseCount": 0,
+            "headCount": 1,
+            "baseSites": [],
+            "headSites": [
+              {
+                "file": "b-lib/src/index.mjs",
+                "line": 1,
+                "column": 19,
+                "specifier": "../../a-lib/src/index.mjs",
+                "kind": "static"
+              }
+            ],
+            "reason": "absent at base",
+            "waived": true,
+            "waivedBy": {
+              "path": "b-lib/src/index.mjs",
+              "messageId": "noRelativeOrAbsoluteImportsAcrossLibraries",
+              "reason": "accepted while the split lands",
+              "expiresAt": "2999-01-01T00:00:00Z"
+            }
+          }
+        ],
+        "resolved": [],
+        "unchanged": [],
+        "unknown": []
+      },
+      "unresolvable": {
+        "introduced": [],
+        "resolved": [],
+        "unchanged": [],
+        "unknown": []
+      },
+      "classifications": [
+        "CHANGE"
+      ],
+      "affected": {
+        "projects": [],
+        "boundaries": [
+          "b-lib>a-lib:static"
+        ],
+        "constraints": [],
+        "decisions": []
+      }
+    },
+    "decision": {
+      "verdict": "pass"
+    }
+  },
+  "reader": {
+    "verdict": "pass",
+    "stale": false,
+    "incompleteness": null,
+    "counts": {
+      "introduced": 1,
+      "introducedWaived": 1,
+      "resolved": 0,
+      "unchanged": 0,
+      "renamePairs": 0,
+      "occurrencesReduced": 0,
+      "customFindings": null,
+      "unresolvable": {
+        "introduced": 0,
+        "resolved": 0,
+        "unchanged": 0,
+        "unknown": 0
+      }
+    }
+  }
+}
